@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="NewtBuilder">
+  <rect width="64" height="64" rx="12" fill="#20382c"/>
+  <path d="M15 39c6-16 20-25 34-18-3 3-4 6-4 10 0 10-8 18-19 18-5 0-9-2-11-10Z" fill="#6dd0a5"/>
+  <circle cx="39" cy="26" r="4" fill="#161613"/>
+  <path d="M18 41c7 2 15 0 22-7" fill="none" stroke="#f3f0e8" stroke-width="3" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,29 @@
+.DS_Store
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules
+node_modules/
+dist/
+
+# Runtime logs, generated media, and user uploads
+.newtbuilder_logs/
+uploads/
+outputs/
+server/data/
+server/__pycache__/
+*.pyc
+
+# Show-specific/private working materials
+Show_Assets/
+Show_Documents/
+backups/
+
+# Editor/system files
+.vscode/
+.idea/
+*.swp
