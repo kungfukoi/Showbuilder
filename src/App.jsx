@@ -4,6 +4,7 @@ import {
   BadgeCheck,
   Bot,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   Clapperboard,
@@ -14,6 +15,7 @@ import {
   Gauge,
   Image,
   ListChecks,
+  Lock,
   MonitorUp,
   Music,
   Pause,
@@ -26,6 +28,7 @@ import {
   Sparkles,
   Trash2,
   Undo2,
+  Unlock,
   Upload,
   WandSparkles,
   X,
@@ -36,6 +39,25 @@ const API = import.meta.env.VITE_API_URL || "";
 const INSERT_TRIM_DEFAULT_SECONDS = 2;
 const AUTOSAVE_DELAY_MS = 4000;
 const MASK_PREVIEW_ALPHA = 118;
+const LIPSYNC_INPUT_PROMPT_MAX_LENGTH = 2400;
+const LIPSYNC_FULL_PROMPT_MAX_LENGTH = 3600;
+
+const formatResolutionOptions = {
+  "9:16": [
+    { value: "540x960", label: "540 x 960" },
+    { value: "720x1280", label: "720 x 1280" },
+    { value: "1080x1920", label: "1080 x 1920" },
+    { value: "1440x2560", label: "1440 x 2560" },
+    { value: "2160x3840", label: "2160 x 3840" }
+  ],
+  "16:9": [
+    { value: "960x540", label: "960 x 540" },
+    { value: "1280x720", label: "1280 x 720" },
+    { value: "1920x1080", label: "1920 x 1080" },
+    { value: "2560x1440", label: "2560 x 1440" },
+    { value: "3840x2160", label: "3840 x 2160" }
+  ]
+};
 
 const automationControls = [
   {
@@ -171,6 +193,18 @@ const integrationSetupRows = [
     env: "FAL_KEY"
   },
   {
+    key: "infinitalkLocal",
+    label: "Local InfiniteTalk",
+    purpose: "Local InfiniteTalk video generation backend.",
+    env: "LOCAL_INFINITALK_REPO_DIR"
+  },
+  {
+    key: "infinitalkComfyUi",
+    label: "ComfyUI InfiniteTalk",
+    purpose: "ComfyUI Desktop InfiniteTalk video generation backend.",
+    env: "COMFYUI_BASE_URL, COMFYUI_ROOT_DIR, COMFYUI_INFINITALK_WORKFLOW"
+  },
+  {
     key: "openai",
     label: "OpenAI",
     purpose: "Reserved for future script, metadata, and campaign intelligence.",
@@ -211,10 +245,24 @@ const shotAssetTypes = [
   }
 ];
 
+const lipSyncModelOptions = [
+  { value: "fabric", label: "Fabric" },
+  { value: "aurora", label: "Creatify Aurora" },
+  { value: "infinitalk", label: "InfiniteTalk" },
+  { value: "kling", label: "Kling" }
+];
+
+const infiniteTalkBackendOptions = [
+  { value: "fal", label: "Fal" },
+  { value: "comfyui", label: "ComfyUI" },
+  { value: "local", label: "Direct Local" }
+];
+
 const targetTabs = [
   { key: "studio", label: "Studio", icon: Clapperboard },
   { key: "approvals", label: "Approvals", icon: ListChecks }
 ];
+const workspaceTabKeys = new Set([...targetTabs.map((tab) => tab.key), "settings"]);
 
 const youtubeHandoffDefaults = {
   titleReady: false,
@@ -248,6 +296,18 @@ function clampCopy(text, limit) {
   const clean = String(text || "").trim();
   if (!limit || clean.length <= limit) return clean;
   return `${clean.slice(0, Math.max(0, limit - 3)).trim()}...`;
+}
+
+function compactText(text, limit = 900) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!limit || clean.length <= limit) return clean;
+  return `${clean.slice(0, Math.max(0, limit - 3)).trim()}...`;
+}
+
+function cacheBustedUrl(url, token) {
+  if (!url) return "";
+  const separator = String(url).includes("?") ? "&" : "?";
+  return `${url}${separator}v=${encodeURIComponent(token || "fresh")}`;
 }
 
 function firstDescriptionLine(description) {
@@ -290,6 +350,199 @@ function formatSeconds(seconds = 0) {
   const mins = Math.floor(safe / 60);
   const secs = Math.round(safe % 60);
   return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatDimensions(format = {}) {
+  const explicitWidth = Number(format.width);
+  const explicitHeight = Number(format.height);
+  if (Number.isFinite(explicitWidth) && explicitWidth > 0 && Number.isFinite(explicitHeight) && explicitHeight > 0) {
+    return {
+      width: Math.round(explicitWidth),
+      height: Math.round(explicitHeight)
+    };
+  }
+  const match = String(format.resolution || "").match(/^(\d+)x(\d+)$/);
+  if (match) {
+    return {
+      width: Number(match[1]),
+      height: Number(match[2])
+    };
+  }
+  return format.aspectRatio === "16:9"
+    ? { width: 1920, height: 1080 }
+    : { width: 1080, height: 1920 };
+}
+
+function mediaDimensions(media = {}) {
+  if (!media || typeof media !== "object") return null;
+  const explicitWidth = Number(media.width);
+  const explicitHeight = Number(media.height);
+  if (Number.isFinite(explicitWidth) && explicitWidth > 0 && Number.isFinite(explicitHeight) && explicitHeight > 0) {
+    return {
+      width: Math.round(explicitWidth),
+      height: Math.round(explicitHeight)
+    };
+  }
+  const match = String(media.resolution || "").match(/^(\d+)x(\d+)$/);
+  if (!match) return null;
+  return {
+    width: Number(match[1]),
+    height: Number(match[2])
+  };
+}
+
+function mediaAspectStyle(media = {}) {
+  const dimensions = mediaDimensions(media);
+  if (dimensions) return { aspectRatio: `${dimensions.width} / ${dimensions.height}` };
+  const aspectMatch = String(media.aspectRatio || "").match(/^(\d+(?:\.\d+)?)\s*(?::|\/)\s*(\d+(?:\.\d+)?)$/);
+  return aspectMatch ? { aspectRatio: `${aspectMatch[1]} / ${aspectMatch[2]}` } : undefined;
+}
+
+function mediaDimensionLabel(media = {}) {
+  const dimensions = mediaDimensions(media);
+  return dimensions ? `${dimensions.width} x ${dimensions.height}` : "";
+}
+
+function videoTakeKey(take = {}) {
+  const safeTake = take && typeof take === "object" ? take : {};
+  return String(safeTake.id || safeTake.localUrl || safeTake.proxyLocalUrl || safeTake.fileName || "").trim();
+}
+
+function lineVideoTakeOptions(line = {}) {
+  const options = [];
+  const seen = new Set();
+  const sourceTakes = Array.isArray(line.videoTakes) ? line.videoTakes : [];
+  for (const candidate of [...sourceTakes, line.videoTake]) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const key = videoTakeKey(candidate);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    options.push(candidate);
+  }
+  return options;
+}
+
+function parseJsonObject(value) {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function outputRenderId(output = {}) {
+  const id = String(output.id || "");
+  const knownSuffixes = ["-final-video", "-final-manifest", "-video", "-manifest"];
+  for (const suffix of knownSuffixes) {
+    if (id.endsWith(suffix)) return id.slice(0, -suffix.length);
+  }
+  const text = String(output.name || output.fileName || output.localUrl || "");
+  const uuidMatch = text.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-final)?\.(?:mp4|json)/i);
+  return uuidMatch?.[1] || "";
+}
+
+function outputCreatedAtValue(output = {}) {
+  const parsed = Date.parse(output.createdAt || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function finalVideoForReviewOutput(output, finalOutputs = []) {
+  if (!output) return null;
+  if (output.type === "finished_master" && output.sourceFinalVideoId) {
+    return finalOutputs.find((candidate) => candidate.id === output.sourceFinalVideoId) || output;
+  }
+  return output;
+}
+
+function finalManifestForReviewOutput(output, finalOutputs = [], finalManifestOutputs = []) {
+  const finalVideo = finalVideoForReviewOutput(output, finalOutputs);
+  if (!finalVideo) return null;
+  const renderId = outputRenderId(finalVideo);
+  return (
+    finalManifestOutputs.find((manifest) => outputRenderId(manifest) === renderId) ||
+    finalManifestOutputs.find((manifest) => manifest.createdAt && manifest.createdAt === finalVideo.createdAt) ||
+    null
+  );
+}
+
+function lipSyncProviderLabel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized.includes("infinitalk") || normalized.includes("infinite")) return "InfiniteTalk";
+  if (normalized.includes("aurora") || normalized.includes("creatify")) return "Creatify Aurora";
+  if (normalized.includes("kling")) return "Kling";
+  if (normalized.includes("fabric")) return "Fabric";
+  if (normalized.includes("still")) return "Still/source media";
+  return String(value || "").trim() || "Source media";
+}
+
+function providerOptionsLabel(options = {}) {
+  const parts = [];
+  if (options.backend) parts.push(`${String(options.backend)} backend`);
+  if (options.numFrames) parts.push(`${options.numFrames} frames`);
+  if (options.resolution) parts.push(String(options.resolution));
+  if (options.acceleration) parts.push(`${options.acceleration} acceleration`);
+  if (options.seed !== undefined && options.seed !== null) parts.push(`seed ${options.seed}`);
+  return parts.join(" - ");
+}
+
+function lineGenerationDetail(line = {}) {
+  const take = line.lipSyncTake || line.videoTake || null;
+  const signature = parseJsonObject(take?.signature) || {};
+  const provider = signature.provider || line.lipSyncModel || take?.source || "";
+  const model = take?.model || take?.modelId || signature.model || signature.modelId || "";
+  const providerLabel = lipSyncProviderLabel(provider || model || take?.source);
+  const prompt = signature.prompt || take?.prompt || line.videoPrompt || "";
+  const generatedClip = Boolean(take?.localUrl || take?.remoteUrl || take?.fileName);
+  return {
+    index: line.index || "",
+    speaker: line.speaker || line.character || "",
+    text: line.text || "",
+    shotRole: line.shotRole || line.lineType || "",
+    imageName: line.image?.fileName || line.endImage?.fileName || "",
+    providerLabel: generatedClip ? providerLabel : "Still/source media",
+    model,
+    source: take?.source || "",
+    prompt,
+    providerOptions: providerOptionsLabel(signature.providerOptions),
+    warning: take?.warning || "",
+    generatedAt: take?.generatedAt || "",
+    generatedClip
+  };
+}
+
+function renderGenerationSummary(manifest) {
+  if (!manifest) return null;
+  const lines = Array.isArray(manifest.lines) ? manifest.lines.map(lineGenerationDetail) : [];
+  const modelLabels = lines
+    .map((line) => line.model ? `${line.providerLabel} (${line.model})` : line.providerLabel)
+    .filter(Boolean);
+  const uniqueModelLabels = [...new Set(modelLabels)];
+  const manifestModels = Array.isArray(manifest.lipSync?.models)
+    ? manifest.lipSync.models.map(lipSyncProviderLabel)
+    : [];
+  const modelSummary = uniqueModelLabels.length
+    ? uniqueModelLabels.join(", ")
+    : manifestModels.length
+      ? [...new Set(manifestModels)].join(", ")
+      : "Source media";
+  const warnings = [
+    ...(Array.isArray(manifest.lipSync?.warnings) ? manifest.lipSync.warnings : []),
+    ...(Array.isArray(manifest.audio?.warnings) ? manifest.audio.warnings : []),
+    ...lines.map((line) => line.warning).filter(Boolean)
+  ];
+  const format = manifest.format || {};
+  return {
+    id: manifest.id || "",
+    createdAt: manifest.createdAt || "",
+    modelSummary,
+    formatLabel: `${format.resolution || `${format.width || "?"}x${format.height || "?"}`} - ${format.fps || "?"} fps`,
+    audioLabel: `${manifest.audio?.mode || "audio"}${manifest.audio?.durationSeconds ? ` - ${formatSeconds(manifest.audio.durationSeconds)}` : ""}`,
+    totalLabel: formatSeconds(manifest.totalSeconds || manifest.video?.durationSeconds || 0),
+    warnings,
+    lines
+  };
 }
 
 function statusTone(status) {
@@ -352,6 +605,7 @@ function buildRenderReadiness({
   audioOutput,
   previewOutput,
   renderReviewApproved,
+  dialogueClipRequired = false,
   selectedFormat = {},
   plan = {}
 }) {
@@ -370,6 +624,7 @@ function buildRenderReadiness({
     if (!line.videoTake?.localUrl && !line.videoTake?.proxyLocalUrl) return false;
     return Number(line.videoOutSeconds || 0) <= Number(line.videoInSeconds || 0);
   });
+  const missingDialogueVideos = dialogueLines.filter((line) => !line.videoTake?.localUrl || line.videoStatus === "failed");
   const requiredApprovalIds = ["script_plan", "voice_audio"];
   const pendingPreRenderApprovals = requiredApprovalIds.filter((id) => {
     const gate = approvals.find((item) => item.id === id);
@@ -408,19 +663,19 @@ function buildRenderReadiness({
     readinessCheck(
       "insert_clips",
       "Insert clips",
-      missingInsertVideos.length === 0 && missingInsertTrims.length === 0,
+      true,
       insertLines.length
         ? `${insertLines.length - missingInsertVideos.length}/${insertLines.length} inserts generated${
             missingInsertTrims.length ? `, ${missingInsertTrims.length} need trim points` : ""
-          }`
+          }; missing inserts render from their assigned still image`
         : "No insert lines in this script"
     ),
     readinessCheck(
       "approvals",
-      "Required approvals",
-      pendingPreRenderApprovals.length === 0,
+      "Approvals",
+      true,
       pendingPreRenderApprovals.length
-        ? `${pendingPreRenderApprovals.length} required approvals still need attention`
+        ? `${pendingPreRenderApprovals.length} approval gate${pendingPreRenderApprovals.length === 1 ? "" : "s"} pending; Render Final can still run`
         : "Script Plan and Voice & Audio are approved"
     ),
     readinessCheck(
@@ -444,31 +699,41 @@ function buildRenderReadiness({
       "review"
     ),
     readinessCheck(
+      "dialogue_shot_clips",
+      "Shot video previews",
+      true,
+      dialogueClipRequired
+        ? `${dialogueLines.length - missingDialogueVideos.length}/${dialogueLines.length} dialogue shots generated; Rebuild Final reuses them, Render Final regenerates them`
+        : "Shot video previews are optional without generated lip-sync",
+      "warning",
+      "review"
+    ),
+    readinessCheck(
       "preview_video",
       "Preview video",
-      Boolean(previewOutput?.localUrl),
-      previewOutput?.localUrl ? "Local preview is available" : "Build Preview before final render",
+      true,
+      previewOutput?.localUrl ? "Local preview is available" : "Preview is optional before Render Final",
       "warning",
       "review"
     ),
     readinessCheck(
       "render_review",
       "Preview approval",
-      Boolean(renderReviewApproved),
-      renderReviewApproved ? "Episode Render gate is approved" : "Approve Episode Render after watching the preview",
+      true,
+      renderReviewApproved ? "Episode Render gate is approved" : "Approval is optional before Render Final",
       "warning",
       "review"
     )
   ];
 
   const setupReady = setupChecks.every((check) => check.status !== "fail");
-  const finalReady = setupReady && reviewChecks.every((check) => check.status === "pass");
+  const finalReady = setupReady;
   return {
     checks: [...setupChecks, ...reviewChecks],
     setupReady,
     finalReady,
-    tone: finalReady ? "good" : setupReady ? "warn" : "danger",
-    label: finalReady ? "Ready for final render" : setupReady ? "Ready for preview" : "Needs setup"
+    tone: finalReady ? "good" : "danger",
+    label: finalReady ? "Ready for final render" : "Needs setup"
   };
 }
 
@@ -482,7 +747,163 @@ function voiceStatusText({ count, source, elevenLabsConnected }) {
 }
 
 function lipSyncModelForLine(line) {
-  return String(line?.lipSyncModel || "").trim().toLowerCase() === "kling" ? "kling" : "fabric";
+  const value = String(line?.lipSyncModel || "").trim().toLowerCase();
+  if (value === "kling") return "kling";
+  if (["aurora", "creatify", "creatify-aurora", "fal-ai/creatify/aurora"].includes(value)) return "aurora";
+  if (["infinitalk", "infinite-talk", "infinite talk", "fal-ai/infinitalk"].includes(value)) return "infinitalk";
+  return "fabric";
+}
+
+function optionalLipSyncModel(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || ["default", "inherit", "visual-default", "cast-default", "none"].includes(raw)) return "";
+  return lipSyncModelForLine({ lipSyncModel: raw });
+}
+
+function lipSyncModelLabel(value) {
+  const option = lipSyncModelOptions.find((item) => item.value === lipSyncModelForLine({ lipSyncModel: value }));
+  return option?.label || "Fabric";
+}
+
+function assetLipSyncModel(asset) {
+  return optionalLipSyncModel(asset?.metadata?.lipSyncModel);
+}
+
+function assetLipSyncPrompt(asset) {
+  return compactText(String(asset?.metadata?.lipSyncPrompt || "").trim(), LIPSYNC_INPUT_PROMPT_MAX_LENGTH);
+}
+
+function lineLipSyncInputPromptOverride(line) {
+  return compactText(String(line?.lipSyncInputPromptOverride || "").trim(), LIPSYNC_INPUT_PROMPT_MAX_LENGTH);
+}
+
+function lineLipSyncInputPrompt(line, asset) {
+  return lineLipSyncInputPromptOverride(line) || assetLipSyncPrompt(asset);
+}
+
+function lineLipSyncOverrideModel(line) {
+  return optionalLipSyncModel(line?.lipSyncModelOverride || line?.lipSyncModel);
+}
+
+function resolvedLipSyncModelForLine(line, asset, show) {
+  return (
+    lineLipSyncOverrideModel(line) ||
+    assetLipSyncModel(asset) ||
+    optionalLipSyncModel(show?.production?.defaultLipSyncModel) ||
+    "fabric"
+  );
+}
+
+function plainSpeechText(line) {
+  return String(line?.text || "").replace(/^\s*(?:\[[^\]\r\n]{1,60}\]\s*)+/, "").trim() || " ";
+}
+
+function visualReferencePromptForLine(line, asset) {
+  const prompt = lineLipSyncInputPrompt(line, asset);
+  return prompt ? `Visual reference: ${prompt}` : "";
+}
+
+function sanitizeInfiniteTalkPositivePromptText(value) {
+  let text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  text = text
+    .replace(/\blarge expressive black eye disks?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\blarge expressive black eyes holes?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\bexpressive black eye disks?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\bblack eye disks?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\bblack eyes holes?\b/gi, "flat matte black painted eye shapes")
+    .replace(
+      /\bthe eye (?:disks?|shapes?) may squint, blink, compress, stretch, or change shape for expression, but must always remain solid black painted eye (?:disks?|shapes?)\.?/gi,
+      "The painted eye shapes remain flat, matte, black, and unchanged."
+    );
+  const blockedPositiveTerms =
+    /\b(pupils?|irises?|eyeballs?|sclera|human eyes?|realistic eyes?|cg eyes?|3d eyes?|cartoon eyes?|animated eyes?|anime eyes?|cute eyes?|eye whites?|catchlights?|eye reflections?|glass eyes?|eyelids?)\b/i;
+  const blockedEyeActions = /\b(squint|blink|compress|stretch|change shape)\b/i;
+  const sentences = text.match(/[^.!?]+[.!?]?/g) || [text];
+  return sentences
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && !blockedPositiveTerms.test(sentence))
+    .filter((sentence) => !(sentence.toLowerCase().includes("eye") && blockedEyeActions.test(sentence)))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function infiniteTalkVisualReferencePromptForLine(line, asset) {
+  const prompt = sanitizeInfiniteTalkPositivePromptText(lineLipSyncInputPrompt(line, asset));
+  return prompt ? `Visual reference: ${compactText(prompt, LIPSYNC_INPUT_PROMPT_MAX_LENGTH)}` : "";
+}
+
+function generatedKlingPromptForLine(line, asset) {
+  const minimalMotionPrompt = "Keep the character body, hand, and arm motions very minimal.";
+  const expressiveBodyPrompt =
+    "Allow natural expressive upper-body motion only when it supports the dialogue, while preserving the original character design and shot composition.";
+  const shotPrompt = String(line.videoPrompt || "").trim();
+  const visualPrompt = visualReferencePromptForLine(line, asset);
+  return compactText(
+    [
+      "Create a polished lip-sync avatar animation for this cartoon episode shot.",
+      visualPrompt,
+      `Speaker: ${String(line.speaker || "character").trim()}.`,
+      `Dialogue: ${plainSpeechText(line)}`,
+      shotPrompt ? `Shot direction: ${shotPrompt}` : "",
+      "Preserve the uploaded image composition, character identity, lighting, wardrobe, background, and camera framing.",
+      "Keep facial motion natural and speech-synced. Avoid changing the character design, adding text, or changing the camera.",
+      line.expressiveBodyMotion ? expressiveBodyPrompt : minimalMotionPrompt
+    ].filter(Boolean).join(" "),
+    LIPSYNC_FULL_PROMPT_MAX_LENGTH
+  );
+}
+
+function generatedAuroraPromptForLine(line, asset) {
+  const shotPrompt = String(line.videoPrompt || "").trim();
+  const visualPrompt = visualReferencePromptForLine(line, asset);
+  const basePrompt =
+    "Create a polished studio-quality avatar lip-sync animation. Preserve the uploaded image composition, character identity, background, lighting, wardrobe, and camera framing.";
+  const motionPrompt = line.expressiveBodyMotion
+    ? "Allow restrained, natural facial and upper-body motion only when it supports the dialogue."
+    : "Keep the body, hands, arms, and camera very still; prioritize stable facial lip-sync.";
+  return compactText(
+    [
+      basePrompt,
+      visualPrompt,
+      `Speaker: ${String(line.speaker || "character").trim()}.`,
+      `Dialogue: ${plainSpeechText(line)}`,
+      shotPrompt ? `Shot direction: ${shotPrompt}` : "",
+      "Do not add text overlays or change the character design.",
+      motionPrompt
+    ].filter(Boolean).join(" "),
+    LIPSYNC_FULL_PROMPT_MAX_LENGTH
+  );
+}
+
+function generatedInfiniteTalkPromptForLine(line, asset) {
+  const shotPrompt = String(line.videoPrompt || "").trim();
+  const visualPrompt = infiniteTalkVisualReferencePromptForLine(line, asset);
+  const basePrompt = "Animate the uploaded stylized puppet character speaking the dialogue while preserving the source image design.";
+  const motionPrompt = line.expressiveBodyMotion
+    ? "Use controlled puppet-style mouth movement, small head bobs, and restrained upper-body gestures when they support the dialogue; keep the painted eye shapes flat and unchanged."
+    : "Keep the body, camera, background, and painted eye shapes stable; focus motion on puppet-style mouth movement synced to speech.";
+  return compactText(
+    [
+      basePrompt,
+      visualPrompt,
+      `Speaker: ${String(line.speaker || "character").trim()}.`,
+      `Dialogue: ${plainSpeechText(line)}`,
+      shotPrompt ? `Shot direction: ${shotPrompt}` : "",
+      "Preserve the uploaded image composition, character identity, style, clothing, lighting, and background.",
+      "Do not add captions, logos, or text overlays.",
+      motionPrompt
+    ].filter(Boolean).join(" "),
+    LIPSYNC_FULL_PROMPT_MAX_LENGTH
+  );
+}
+
+function generatedLipSyncPromptForLine(line, provider = lipSyncModelForLine(line), asset = null) {
+  if (provider === "kling") return generatedKlingPromptForLine(line, asset);
+  if (provider === "aurora") return generatedAuroraPromptForLine(line, asset);
+  if (provider === "infinitalk") return generatedInfiniteTalkPromptForLine(line, asset);
+  return "";
 }
 
 function Toggle({ checked, onChange, label, icon: Icon, disabled = false, locked = false }) {
@@ -712,7 +1133,8 @@ function ShowDashboard({
   onCreateEpisode,
   onOpenEpisode,
   onOpenEpisodeReview,
-  onRenameEpisode
+  onRenameEpisode,
+  onDuplicateEpisode
 }) {
   const latestTime = newestTimestamp(episodes);
   const renderedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "final_video").length).length;
@@ -780,6 +1202,16 @@ function ShowDashboard({
                     </button>
                     <button className="secondaryButton" type="button" onClick={() => onOpenEpisodeReview(episode.id)} disabled={busy}>
                       Open Review
+                    </button>
+                    <button
+                      className="secondaryButton"
+                      type="button"
+                      onClick={() => onDuplicateEpisode(episode)}
+                      disabled={busy}
+                      title="Duplicate setup for the next episode"
+                    >
+                      <Copy size={16} />
+                      Duplicate
                     </button>
                     <button className="iconButton" type="button" onClick={() => onRenameEpisode(episode)} disabled={busy} title="Rename episode">
                       <Pencil size={16} />
@@ -1187,6 +1619,27 @@ export default function App() {
     }
   }
 
+  async function duplicateEpisode(episodeToDuplicate = activeEpisode) {
+    if (!episodeToDuplicate) return;
+    setBusy(true);
+    try {
+      const episode = await request(`/api/episodes/${episodeToDuplicate.id}/duplicate`, {
+        method: "POST"
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setAllEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setActiveEpisodeId(episode.id);
+      setEpisodeDraft(structuredClone(episode));
+      setAppView("episode");
+      setActiveTab("studio");
+      setStatus(`Duplicated setup as ${episode.title}. Add the new script and build the plan.`);
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function ensureEpisodeForUpload() {
     if (episodeDraft) return episodeDraft;
     if (activeEpisode) return activeEpisode;
@@ -1233,11 +1686,12 @@ export default function App() {
     try {
       const episode = await request(`/api/episodes/${episodeDraft.id}/build-plan`, {
         method: "POST",
-        body: JSON.stringify({ scriptText: episodeDraft.scriptText, format: activeShow?.shortFormat || episodeDraft.format })
+        body: JSON.stringify({ scriptText: episodeDraft.scriptText, format: episodeDraft.format || activeShow?.shortFormat })
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setActiveEpisodeId(episode.id);
       setEpisodeDraft(structuredClone(episode));
+      setActiveTab("studio");
       setStatus("Script plan refreshed.");
     } catch (error) {
       setStatus(error.message);
@@ -1276,14 +1730,32 @@ export default function App() {
     }
   }
 
-  async function renderFinalEpisode() {
+  async function renderFinalEpisode({ regenerateVideos = true } = {}) {
     if (!activeEpisode) return;
-    setBusyAction("render-final");
+    setBusyAction(regenerateVideos ? "render-final" : "rebuild-final");
     setBusy(true);
     try {
-      const { episode, job } = await request(`/api/episodes/${activeEpisode.id}/final-render`, {
+      let episodeForRender = activeEpisode;
+      if (episodeDraft?.id === activeEpisode.id) {
+        episodeForRender = await request(`/api/episodes/${activeEpisode.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            title: episodeDraft.title,
+            scriptText: episodeDraft.scriptText,
+            format: episodeDraft.format,
+            productionMap: episodeDraft.productionMap,
+            productionMapEditedAt: episodeDraft.productionMapEditedAt,
+            drafts: episodeDraft.drafts,
+            automation: episodeDraft.automation
+          })
+        });
+        setEpisodes((prev) => [episodeForRender, ...prev.filter((item) => item.id !== episodeForRender.id)]);
+        setEpisodeDraft(structuredClone(episodeForRender));
+      }
+
+      const { episode, job } = await request(`/api/episodes/${episodeForRender.id}/final-render`, {
         method: "POST",
-        body: JSON.stringify({})
+        body: JSON.stringify({ regenerateVideos })
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setEpisodeDraft(structuredClone(episode));
@@ -1386,6 +1858,66 @@ export default function App() {
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setEpisodeDraft(structuredClone(episode));
       setStatus(`Generated music layer: ${layer?.fileName || "ElevenLabs music bed"}.`);
+    } catch (error) {
+      if (error.payload?.episode) {
+        const episode = error.payload.episode;
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function generateFinishingLaughTrack(laughTrackBrief) {
+    if (!activeEpisode) return;
+    setBusyAction("finishing-laugh-track");
+    setBusy(true);
+    try {
+      const { episode, layer, layers } = await request(`/api/episodes/${activeEpisode.id}/finishing/laugh-track`, {
+        method: "POST",
+        body: JSON.stringify(laughTrackBrief || {})
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      const cueCount = Array.isArray(layers) ? layers.length : layer ? 1 : 0;
+      setStatus(
+        cueCount > 1
+          ? `Generated laugh track and placed ${cueCount} cues: ${layer?.fileName || "ElevenLabs laugh track"}.`
+          : `Generated laugh track layer: ${layer?.fileName || "ElevenLabs laugh track"}.`
+      );
+    } catch (error) {
+      if (error.payload?.episode) {
+        const episode = error.payload.episode;
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function generateFinishingApplauseTrack(applauseTrackBrief) {
+    if (!activeEpisode) return;
+    setBusyAction("finishing-applause-track");
+    setBusy(true);
+    try {
+      const { episode, layer, layers } = await request(`/api/episodes/${activeEpisode.id}/finishing/applause-track`, {
+        method: "POST",
+        body: JSON.stringify(applauseTrackBrief || {})
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      const cueCount = Array.isArray(layers) ? layers.length : layer ? 1 : 0;
+      setStatus(
+        cueCount > 1
+          ? `Generated applause track and placed ${cueCount} cues: ${layer?.fileName || "ElevenLabs applause track"}.`
+          : `Generated applause track layer: ${layer?.fileName || "ElevenLabs applause track"}.`
+      );
     } catch (error) {
       if (error.payload?.episode) {
         const episode = error.payload.episode;
@@ -1528,20 +2060,28 @@ export default function App() {
     const existingUpload = (activeEpisode.outputs || []).find((output) => output.type === "youtube_upload" && output.videoId);
     const ok = globalThis.confirm?.(
       existingUpload?.videoId
-        ? `Upload a new private YouTube draft? The existing draft ${existingUpload.videoId} will stay on YouTube.`
+        ? `Republish as a new private YouTube draft? YouTube does not allow replacing the video file on an existing upload, so ${existingUpload.videoId} will stay on YouTube until you remove it in Studio.`
         : "Upload this episode to YouTube as a private draft? This sends the final video and thumbnail to YouTube, but it will not publish publicly."
     );
     if (!ok) return;
     setBusyAction("youtube-upload");
     setBusy(true);
     try {
+      const shortsThumbnailRequested = Boolean(nextDrafts?.youtube?.shortsThumbnail);
       const { episode, job, upload } = await request(`/api/episodes/${activeEpisode.id}/youtube/upload-draft`, {
         method: "POST",
         body: JSON.stringify(nextDrafts ? { drafts: nextDrafts } : {})
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setEpisodeDraft(structuredClone(episode));
-      setStatus(`${job.summary}${upload?.thumbnailWarning ? ` ${upload.thumbnailWarning}` : ""}`);
+      const shortsThumbnailStatus = shortsThumbnailRequested
+        ? upload?.shortsThumbnailApplied
+          ? ` Shorts thumbnail frame added to upload (${upload.shortsThumbnailFrameSeconds || 0.75}s).`
+          : " Shorts thumbnail was requested, but the upload did not confirm the appended frame. Restart the NewtBuilder API and republish."
+        : "";
+      setStatus(
+        `${job.summary}${shortsThumbnailStatus}${upload?.thumbnailWarning ? ` ${upload.thumbnailWarning}` : ""}`
+      );
     } catch (error) {
       setStatus(youtubeAuthStatusMessage(error.message));
     } finally {
@@ -1675,6 +2215,96 @@ export default function App() {
       setEpisodeDraft(structuredClone(episode));
       setStatus(`Insert video generated for line ${line.index}.`);
     } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function generateDialogueVideo(line) {
+    if (!activeEpisode || !line?.id) return;
+    setBusyAction(`dialogue-video:${line.id}`);
+    setBusy(true);
+    setStatus(`Starting shot video generation for line ${line.index}...`);
+    try {
+      const { episode } = await request(`/api/episodes/${activeEpisode.id}/dialogue-lines/${line.id}/generate-video`, {
+        method: "POST",
+        body: JSON.stringify({ line })
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus(`Shot video generated for line ${line.index}. Rebuild Final will use the latest shot clips.`);
+    } catch (error) {
+      const episode = error.payload?.episode;
+      if (episode) {
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function selectDialogueVideoTake(line, take) {
+    if (!activeEpisode || !line?.id || !take) return;
+    setBusyAction(`dialogue-video-take:${line.id}`);
+    setBusy(true);
+    try {
+      const { episode } = await request(`/api/episodes/${activeEpisode.id}/dialogue-lines/${line.id}/video-take`, {
+        method: "PATCH",
+        body: JSON.stringify({ takeId: take.id || "", localUrl: take.localUrl || take.proxyLocalUrl || take.fileName || "" })
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus(`Selected shot video take for line ${line.index}. Rebuild Final will use this clip.`);
+    } catch (error) {
+      const episode = error.payload?.episode;
+      if (episode) {
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function generateMissingDialogueVideos() {
+    if (!activeEpisode) return;
+    let workingEpisode = episodeDraft?.id === activeEpisode.id ? structuredClone(episodeDraft) : structuredClone(activeEpisode);
+    const targets = (workingEpisode.productionMap || []).filter(
+      (line) => line.lineType !== "insert" && line.audioTake?.localUrl && !line.videoTake?.localUrl
+    );
+    if (!targets.length) {
+      setStatus("No missing dialogue shot videos with ready audio.");
+      return;
+    }
+
+    setBusy(true);
+    try {
+      for (const target of targets) {
+        const line = (workingEpisode.productionMap || []).find((item) => item.id === target.id) || target;
+        setBusyAction(`dialogue-video:${line.id}`);
+        setStatus(`Generating shot video for line ${line.index}...`);
+        const { episode } = await request(`/api/episodes/${workingEpisode.id}/dialogue-lines/${line.id}/generate-video`, {
+          method: "POST",
+          body: JSON.stringify({ line })
+        });
+        workingEpisode = episode;
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
+      setStatus(`Generated ${targets.length} shot video${targets.length === 1 ? "" : "s"}. Rebuild Final will use the latest shot clips.`);
+    } catch (error) {
+      const episode = error.payload?.episode;
+      if (episode) {
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
       setStatus(error.message);
     } finally {
       setBusyAction("");
@@ -1826,15 +2456,70 @@ export default function App() {
     }
   }
 
+  async function updateAssetLipSyncDefaults(assetId, patch) {
+    if (!assetId || !activeEpisode) return;
+    try {
+      const episode = await request(`/api/episodes/${activeEpisode.id}/assets/${assetId}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus("Cast Visual defaults saved.");
+    } catch (error) {
+      setStatus(error.message);
+    }
+  }
+
+  async function generateAssetLipSyncPrompt(assetId, provider = "") {
+    if (!assetId || !activeEpisode) return;
+    setBusyAction(`asset-prompt:${assetId}`);
+    setBusy(true);
+    try {
+      const { episode } = await request(`/api/episodes/${activeEpisode.id}/assets/${assetId}/lipsync-prompt`, {
+        method: "POST",
+        body: JSON.stringify({ provider })
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus(`Cast Visual prompt generated for ${lipSyncModelLabel(provider)}.`);
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  function resetDraftRenderApproval(next, note = "Production changed after render review.") {
+    if (!next?.approvals?.length) return;
+    next.approvals = next.approvals.map((gate) =>
+      gate.id === "render_preview"
+        ? {
+            ...gate,
+            status: "pending",
+            approvedAt: "",
+            note
+          }
+        : gate
+    );
+  }
+
   function updateProductionLine(lineId, patch) {
     setEpisodeDraft((prev) => {
       if (!prev) return prev;
       const next = structuredClone(prev);
+      const clearsVideoTake =
+        Object.prototype.hasOwnProperty.call(patch, "videoTake") &&
+        patch.videoTake === null &&
+        !Object.prototype.hasOwnProperty.call(patch, "videoTakes");
+      const effectivePatch = clearsVideoTake ? { ...patch, videoTakes: [] } : patch;
       const patchedMap = (next.productionMap || []).map((line) =>
-        line.id === lineId ? { ...line, ...patch } : line
+        line.id === lineId ? { ...line, ...effectivePatch } : line
       );
       next.productionMap = applyStoredSpeakerMasksToLines(patchedMap, next.assets || []);
       next.productionMapEditedAt = new Date().toISOString();
+      resetDraftRenderApproval(next);
       return next;
     });
   }
@@ -1845,6 +2530,7 @@ export default function App() {
       const next = structuredClone(prev);
       next.productionMap = reindexProductionMap((next.productionMap || []).filter((line) => line.id !== lineId));
       next.productionMapEditedAt = new Date().toISOString();
+      resetDraftRenderApproval(next);
       return next;
     });
     setStatus("Production row removed. Script source text was not changed.");
@@ -1865,6 +2551,7 @@ export default function App() {
       lines.splice(insertIndex, 0, moved);
       next.productionMap = reindexProductionMap(lines);
       next.productionMapEditedAt = new Date().toISOString();
+      resetDraftRenderApproval(next);
       return next;
     });
     setStatus("Production map order updated. Script source text was not changed.");
@@ -1905,6 +2592,7 @@ export default function App() {
           : line
       );
       next.productionMapEditedAt = new Date().toISOString();
+      resetDraftRenderApproval(next);
       return next;
     });
     setStatus("Production rows grouped. Script source text was not changed.");
@@ -1920,6 +2608,7 @@ export default function App() {
         ids.has(line.id) ? { ...line, groupId: "", groupTitle: "" } : line
       );
       next.productionMapEditedAt = new Date().toISOString();
+      resetDraftRenderApproval(next);
       return next;
     });
     setStatus("Selected production rows ungrouped.");
@@ -1929,7 +2618,11 @@ export default function App() {
     const character = (activeShow?.characters || []).find((item) => item.id === characterId);
     updateProductionLine(lineId, {
       characterId,
-      voiceId: character?.voiceId || ""
+      voiceId: character?.voiceId || "",
+      audioStatus: "pending",
+      audioTake: null,
+      videoStatus: "pending",
+      videoTake: null
     });
   }
 
@@ -1985,6 +2678,10 @@ export default function App() {
     }));
   }
 
+  function setShowResolution(resolution) {
+    updateShowDraft(["shortFormat", "resolution"], resolution);
+  }
+
   function setEpisodeAspect(aspectRatio) {
     const resolution = aspectRatio === "16:9" ? "1920x1080" : "1080x1920";
     setEpisodeDraft((prev) => ({
@@ -2034,9 +2731,12 @@ export default function App() {
   const integrations = health?.integrations || {};
   const safety = health?.safety || { publishingEnabled: false, mode: "local-test-only" };
   const youtubeAuth = health?.youtube || {};
-  const selectedFormat = activeShow?.shortFormat || episodeDraft?.format || {};
+  const selectedFormat = episodeDraft?.format || activeEpisode?.format || activeShow?.shortFormat || {};
   const plan = episodeDraft?.plan || activeEpisode?.plan || {};
-  const approvals = activeEpisode?.approvals || [];
+  const approvals =
+    episodeDraft?.id === activeEpisode?.id
+      ? episodeDraft?.approvals || activeEpisode?.approvals || []
+      : activeEpisode?.approvals || [];
   const preRenderApprovalIds = new Set(["script_plan", "voice_audio"]);
   const preRenderGates = approvals.filter((gate) => preRenderApprovalIds.has(gate.id));
   const preRenderApprovalsReady =
@@ -2060,7 +2760,9 @@ export default function App() {
   const baseFinalOutput = finalOutputs[0] || null;
   const finishedMasterOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "finished_master");
   const finishedMasterOutput = finishedMasterOutputs[0] || null;
-  const finalOutput = finishedMasterOutput || baseFinalOutput;
+  const finalOutput =
+    [...finishedMasterOutputs, ...finalOutputs].sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a))[0] ||
+    null;
   const manifestOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "render_manifest");
   const finalManifestOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "final_render_manifest");
   const audioOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "audio_mix");
@@ -2081,6 +2783,7 @@ export default function App() {
     audioOutput,
     previewOutput,
     renderReviewApproved,
+    dialogueClipRequired: true,
     selectedFormat,
     plan
   });
@@ -2120,10 +2823,43 @@ export default function App() {
   const maskEditorLine = productionMap.find((line) => line.id === maskEditorLineId) || null;
   const maskEditorImage = maskEditorLine ? visualAssets.find((asset) => asset.id === maskEditorLine.assetId) || null : null;
   const maskEditorMask = maskEditorLine ? maskAssets.find((asset) => asset.id === maskEditorLine.maskAssetId) || null : null;
+  const productionMapPanelProps = {
+    productionMap,
+    show: activeShow,
+    format: selectedFormat,
+    characters: activeShow?.characters || [],
+    voices,
+    shotTypes: productionShotTypes,
+    visualAssets,
+    maskAssets,
+    onUpdate: updateProductionLine,
+    onSetCharacter: setProductionCharacter,
+    onDeleteLine: deleteProductionLine,
+    onReorderLine: reorderProductionLine,
+    onGroupLines: groupProductionLines,
+    onUngroupLines: ungroupProductionLines,
+    onRegenerateAudio: regenerateLineAudio,
+    onSetAudioStatus: setLineAudioStatus,
+    onOpenMaskEditor: setMaskEditorLineId,
+    onGenerateDialogueVideo: generateDialogueVideo,
+    onSelectDialogueVideoTake: selectDialogueVideoTake,
+    onGenerateMissingDialogueVideos: generateMissingDialogueVideos,
+    onGenerateInsertVideo: generateInsertVideo,
+    onUploadInsertVideo: uploadInsertVideo,
+    busy,
+    busyAction
+  };
   const currentShowEpisodes = episodes.filter((episode) => !activeShowId || episode.showId === activeShowId);
   const libraryView = appView === "library";
   const showDashboardView = appView === "show";
   const workspaceView = appView === "episode";
+
+  useEffect(() => {
+    if (workspaceView && !workspaceTabKeys.has(activeTab)) {
+      setActiveTab("studio");
+    }
+  }, [activeTab, workspaceView]);
+
   const headerTitle = libraryView ? "NewtBuilder" : activeShow?.name || "Show";
   const headerSubtitle = libraryView
     ? "Show Library"
@@ -2242,6 +2978,7 @@ export default function App() {
             onOpenEpisode={openEpisode}
             onOpenEpisodeReview={openEpisodeReview}
             onRenameEpisode={renameEpisode}
+            onDuplicateEpisode={duplicateEpisode}
           />
         )}
 
@@ -2360,6 +3097,10 @@ export default function App() {
                   onUpload={uploadAssets}
                   onDelete={deleteAsset}
                   onUpdateTags={updateAssetTags}
+                  onUpdateLipSyncDefaults={updateAssetLipSyncDefaults}
+                  onGenerateLipSyncPrompt={generateAssetLipSyncPrompt}
+                  showDefaultLipSyncModel={showDraft.production?.defaultLipSyncModel || "fabric"}
+                  busyAction={busyAction}
                 />
               </CollapsiblePanel>
             )}
@@ -2404,27 +3145,7 @@ export default function App() {
               </div>
             </CollapsiblePanel>
 
-            <ProductionMapPanel
-              productionMap={productionMap}
-              characters={activeShow?.characters || []}
-              voices={voices}
-              shotTypes={productionShotTypes}
-              visualAssets={visualAssets}
-              maskAssets={maskAssets}
-              onUpdate={updateProductionLine}
-              onSetCharacter={setProductionCharacter}
-              onDeleteLine={deleteProductionLine}
-              onReorderLine={reorderProductionLine}
-              onGroupLines={groupProductionLines}
-              onUngroupLines={ungroupProductionLines}
-              onRegenerateAudio={regenerateLineAudio}
-              onSetAudioStatus={setLineAudioStatus}
-              onOpenMaskEditor={setMaskEditorLineId}
-              onGenerateInsertVideo={generateInsertVideo}
-              onUploadInsertVideo={uploadInsertVideo}
-              busy={busy}
-              busyAction={busyAction}
-            />
+            <ProductionMapPanel {...productionMapPanelProps} />
 
           </div>
         )}
@@ -2468,7 +3189,16 @@ export default function App() {
                     </Field>
                     <div className="twoColumn">
                       <Field label="Resolution">
-                        <input value={showDraft.shortFormat.resolution} readOnly />
+                        <select
+                          value={showDraft.shortFormat.resolution}
+                          onChange={(event) => setShowResolution(event.target.value)}
+                        >
+                          {(formatResolutionOptions[showDraft.shortFormat.aspectRatio] || formatResolutionOptions["9:16"]).map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
                       </Field>
                       <Field label="WPM">
                         <input
@@ -2500,8 +3230,23 @@ export default function App() {
                           value={showDraft.production?.defaultLipSyncModel || "fabric"}
                           onChange={(event) => updateShowDraft(["production", "defaultLipSyncModel"], event.target.value)}
                         >
-                          <option value="fabric">Fabric</option>
-                          <option value="kling">Kling</option>
+                          {lipSyncModelOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label="InfiniteTalk backend">
+                        <select
+                          value={showDraft.production?.infiniteTalkBackend || "fal"}
+                          onChange={(event) => updateShowDraft(["production", "infiniteTalkBackend"], event.target.value)}
+                        >
+                          {infiniteTalkBackendOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
                         </select>
                       </Field>
                       <Field label="Insert trim seconds">
@@ -2519,11 +3264,21 @@ export default function App() {
                     <Toggle
                       checked={Boolean(showDraft.production?.defaultExpressiveBodyMotion)}
                       onChange={(checked) => updateShowDraft(["production", "defaultExpressiveBodyMotion"], checked)}
-                      label="Kling expressive body default"
+                      label="Expressive body default"
                       icon={Activity}
                     />
+                    {showDraft.production?.infiniteTalkBackend === "local" && !integrations.infinitalkLocal ? (
+                      <div className="manualPublishNotice warning">
+                        Local InfiniteTalk needs LOCAL_INFINITALK_REPO_DIR in .env before shot videos can render locally.
+                      </div>
+                    ) : null}
+                    {showDraft.production?.infiniteTalkBackend === "comfyui" && !integrations.infinitalkComfyUi ? (
+                      <div className="manualPublishNotice warning">
+                        ComfyUI InfiniteTalk needs ComfyUI running and COMFYUI_INFINITALK_WORKFLOW set to an API-format workflow.
+                      </div>
+                    ) : null}
                     <div className="manualPublishNotice">
-                      These defaults apply when a new script plan is built. Existing mapped lines keep their current per-shot settings.
+                      Model defaults apply when a new script plan is built. The InfiniteTalk backend applies to InfiniteTalk shots at render time.
                     </div>
                   </div>
                 </div>
@@ -2766,11 +3521,14 @@ export default function App() {
               busyAction={busyAction}
               onRebuildAudio={rebuildAudioMix}
               onBuildPreview={runPipeline}
+              onRebuildFinal={() => renderFinalEpisode({ regenerateVideos: false })}
               onRenderFinal={renderFinalEpisode}
               onUploadFinishingLayers={uploadFinishingLayerFiles}
               onSaveFinishingLayers={saveFinishingLayers}
               onExportFinishedMaster={exportFinishedMaster}
               onGenerateFinishingMusic={generateFinishingMusic}
+              onGenerateFinishingLaughTrack={generateFinishingLaughTrack}
+              onGenerateFinishingApplauseTrack={generateFinishingApplauseTrack}
               onGenerateThumbnails={generateThumbnails}
               onSelectThumbnail={selectThumbnail}
               onSavePublishingDraft={savePublishingDraft}
@@ -2959,6 +3717,129 @@ function AutomationRunbookPanel({ automation = {}, safety = {} }) {
   );
 }
 
+function RenderGenerationPanel({ manifestOutput, manifestEntry }) {
+  if (!manifestOutput) {
+    return (
+      <details className="renderGenerationPanel">
+        <summary className="renderGenerationSummary">
+          <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
+          <div className="renderGenerationTitle">
+            <span className="eyebrow">Generation Used</span>
+            <strong>No final manifest found</strong>
+          </div>
+          <Pill tone="warn">missing</Pill>
+        </summary>
+        <p>No render manifest is linked to this final video.</p>
+      </details>
+    );
+  }
+
+  if (!manifestEntry || manifestEntry.status === "loading") {
+    return (
+      <details className="renderGenerationPanel">
+        <summary className="renderGenerationSummary">
+          <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
+          <div className="renderGenerationTitle">
+            <span className="eyebrow">Generation Used</span>
+            <strong>Loading render manifest</strong>
+          </div>
+          <RefreshCw className="spin renderRunningIcon" size={16} aria-label="Loading render manifest" />
+        </summary>
+      </details>
+    );
+  }
+
+  if (manifestEntry.status === "error") {
+    return (
+      <details className="renderGenerationPanel">
+        <summary className="renderGenerationSummary">
+          <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
+          <div className="renderGenerationTitle">
+            <span className="eyebrow">Generation Used</span>
+            <strong>Manifest unavailable</strong>
+          </div>
+          <Pill tone="warn">error</Pill>
+        </summary>
+        <p>{manifestEntry.error || "Unable to load this render manifest."}</p>
+      </details>
+    );
+  }
+
+  const summary = renderGenerationSummary(manifestEntry.manifest);
+  if (!summary) return null;
+
+  return (
+    <details className="renderGenerationPanel">
+      <summary className="renderGenerationSummary">
+        <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
+        <div className="renderGenerationTitle">
+          <span className="eyebrow">Generation Used</span>
+          <strong>{summary.modelSummary}</strong>
+        </div>
+        <Pill tone={summary.warnings.length ? "warn" : "good"}>
+          {summary.warnings.length ? `${summary.warnings.length} warning${summary.warnings.length === 1 ? "" : "s"}` : "recorded"}
+        </Pill>
+      </summary>
+      <div className="renderGenerationBody">
+        <div className="renderGenerationStats">
+          <span>
+            <strong>Format</strong>
+            {summary.formatLabel}
+          </span>
+          <span>
+            <strong>Audio</strong>
+            {summary.audioLabel}
+          </span>
+          <span>
+            <strong>Runtime</strong>
+            {summary.totalLabel}
+          </span>
+          <span>
+            <strong>Created</strong>
+            {dateTimeLabel(summary.createdAt)}
+          </span>
+        </div>
+        <div className="renderLineModelGrid">
+          {summary.lines.map((line) => (
+            <article key={`${line.index}-${line.providerLabel}-${line.model}`} className="renderLineModel">
+              <div className="renderLineModelHeader">
+                <strong>Line {line.index}{line.speaker ? ` - ${line.speaker}` : ""}</strong>
+                <Pill tone={line.generatedClip ? "good" : "neutral"}>{line.providerLabel}</Pill>
+              </div>
+              <p>{line.model || line.source || "No generated model clip recorded"}</p>
+              <span>{[line.shotRole, line.imageName].filter(Boolean).join(" - ") || "No source asset recorded"}</span>
+              {line.providerOptions ? <span>{line.providerOptions}</span> : null}
+              {line.generatedAt ? <span>Generated {dateTimeLabel(line.generatedAt)}</span> : null}
+              {line.prompt ? <small>{clampCopy(line.prompt, 260)}</small> : null}
+              {line.warning ? <small className="warningText">{line.warning}</small> : null}
+            </article>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function FinalOutputLink({ video, index, finalOutputs, finalManifestOutputs, manifestCache }) {
+  const manifestOutput = finalManifestForReviewOutput(video, finalOutputs, finalManifestOutputs);
+  const manifestEntry = manifestOutput?.localUrl ? manifestCache[manifestOutput.localUrl] : null;
+  const summary = renderGenerationSummary(manifestEntry?.manifest);
+  const summaryText =
+    summary?.modelSummary ||
+    (manifestEntry?.status === "loading" ? "Loading generation details" : "No generation details");
+
+  return (
+    <a className="outputLinkWithMeta" href={video.localUrl} target="_blank" rel="noreferrer">
+      <Film size={16} />
+      <span>
+        <strong>Final #{index + 1}</strong>
+        <small>{video.name}</small>
+        <em>{summaryText}</em>
+      </span>
+    </a>
+  );
+}
+
 function FinalReviewPanel({
   audioOutput,
   previewOutput,
@@ -2991,11 +3872,14 @@ function FinalReviewPanel({
   busyAction,
   onRebuildAudio,
   onBuildPreview,
+  onRebuildFinal,
   onRenderFinal,
   onUploadFinishingLayers,
   onSaveFinishingLayers,
   onExportFinishedMaster,
   onGenerateFinishingMusic,
+  onGenerateFinishingLaughTrack,
+  onGenerateFinishingApplauseTrack,
   onGenerateThumbnails,
   onSelectThumbnail,
   onSavePublishingDraft,
@@ -3030,8 +3914,11 @@ function FinalReviewPanel({
     youtubeUploadOutputs.length +
     thumbnailOutputs.length +
     reportOutputs.length;
-  const reviewVideo = finalOutput || previewOutput;
-  const renderBusy = busyAction === "rebuild-audio" || busyAction === "build-preview" || busyAction === "render-final";
+  const renderBusy =
+    busyAction === "rebuild-audio" ||
+    busyAction === "build-preview" ||
+    busyAction === "rebuild-final" ||
+    busyAction === "render-final";
   const thumbnailBusy = busyAction === "thumbnails";
   const selectedThumbnailId = drafts.selectedThumbnailOutputId || thumbnailOutputs.find((thumb) => thumb.isSelected)?.id || "";
   const selectedThumbnail = thumbnailOutputs.find((thumb) => thumb.id === selectedThumbnailId) || null;
@@ -3043,14 +3930,180 @@ function FinalReviewPanel({
     [drafts, selectedFormat.aspectRatio]
   );
   const [thumbnailBrief, setThumbnailBrief] = useState(thumbnailBriefDefaults);
+  const [reviewVideoMode, setReviewVideoMode] = useState("auto");
+  const [reviewRefreshToken, setReviewRefreshToken] = useState(0);
+  const [finalReviewIndex, setFinalReviewIndex] = useState(0);
+  const [loadedReviewDimensions, setLoadedReviewDimensions] = useState(null);
+  const [finalManifestCache, setFinalManifestCache] = useState({});
+
+  const finalReviewOutputs = useMemo(
+    () => [...finishedMasterOutputs, ...finalOutputs].sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a)),
+    [finishedMasterOutputs, finalOutputs]
+  );
+  const finalManifestKey = useMemo(
+    () => finalManifestOutputs.map((output) => output.localUrl).filter(Boolean).join("|"),
+    [finalManifestOutputs]
+  );
+  const maxFinalReviewIndex = Math.max(0, finalReviewOutputs.length - 1);
+  const selectedFinalIndex = Math.min(finalReviewIndex, maxFinalReviewIndex);
+  const selectedFinalOutput = finalReviewOutputs[selectedFinalIndex] || finalOutput;
+
+  const selectedReviewMode =
+    reviewVideoMode === "preview" && previewOutput
+      ? "preview"
+      : reviewVideoMode === "final" && selectedFinalOutput
+        ? "final"
+        : selectedFinalOutput
+          ? "final"
+          : previewOutput
+            ? "preview"
+            : "none";
+  const reviewVideo = selectedReviewMode === "preview" ? previewOutput : selectedReviewMode === "final" ? selectedFinalOutput : null;
+  const reviewVideoToken = [selectedReviewMode, reviewVideo?.id, reviewVideo?.createdAt, reviewRefreshToken]
+    .filter(Boolean)
+    .join("-");
+  const reviewVideoUrl = cacheBustedUrl(reviewVideo?.localUrl, reviewVideoToken);
+  const reviewDimensionFormat = {
+    ...selectedFormat,
+    aspectRatio: reviewVideo?.aspectRatio || selectedFormat.aspectRatio,
+    resolution: reviewVideo?.resolution || selectedFormat.resolution,
+    width: Number(reviewVideo?.width) > 0 ? reviewVideo.width : selectedFormat.width,
+    height: Number(reviewVideo?.height) > 0 ? reviewVideo.height : selectedFormat.height
+  };
+  const metadataDimensions = loadedReviewDimensions?.token === reviewVideoToken ? loadedReviewDimensions : null;
+  const reviewDimensions = formatDimensions({
+    ...reviewDimensionFormat,
+    width: metadataDimensions?.width || reviewDimensionFormat.width,
+    height: metadataDimensions?.height || reviewDimensionFormat.height
+  });
+  const reviewDisplayScale = 0.5;
+  const reviewDisplayDimensions = {
+    width: Math.max(1, Math.round(reviewDimensions.width * reviewDisplayScale)),
+    height: Math.max(1, Math.round(reviewDimensions.height * reviewDisplayScale))
+  };
+  const reviewDimensionLabel = `${reviewDisplayDimensions.width} x ${reviewDisplayDimensions.height} (50% of ${reviewDimensions.width} x ${reviewDimensions.height})`;
+  const reviewVideoStyle = {
+    width: `${reviewDisplayDimensions.width}px`,
+    height: `${reviewDisplayDimensions.height}px`,
+    maxWidth: "none",
+    maxHeight: "none",
+    aspectRatio: `${reviewDisplayDimensions.width} / ${reviewDisplayDimensions.height}`
+  };
+  const reviewViewportStyle = {
+    width: `${reviewDisplayDimensions.width}px`,
+    height: `${reviewDisplayDimensions.height}px`,
+    minWidth: `${reviewDisplayDimensions.width}px`,
+    minHeight: `${reviewDisplayDimensions.height}px`,
+    maxWidth: "none",
+    maxHeight: "none",
+    aspectRatio: `${reviewDisplayDimensions.width} / ${reviewDisplayDimensions.height}`
+  };
+  const finalReviewCountLabel =
+    selectedReviewMode === "final" && finalReviewOutputs.length > 1
+      ? ` - final ${selectedFinalIndex + 1}/${finalReviewOutputs.length}`
+      : "";
+  const selectedReviewManifestOutput =
+    selectedReviewMode === "final"
+      ? finalManifestForReviewOutput(selectedFinalOutput, finalOutputs, finalManifestOutputs)
+      : null;
+  const selectedReviewManifestEntry = selectedReviewManifestOutput?.localUrl
+    ? finalManifestCache[selectedReviewManifestOutput.localUrl]
+    : null;
 
   useEffect(() => {
     setThumbnailBrief(thumbnailBriefDefaults);
   }, [thumbnailBriefDefaults]);
 
+  useEffect(() => {
+    const urls = finalManifestOutputs.map((output) => output.localUrl).filter(Boolean);
+    if (!urls.length) return undefined;
+    let cancelled = false;
+
+    setFinalManifestCache((prev) => {
+      const next = { ...prev };
+      for (const url of urls) {
+        if (!next[url]?.manifest) next[url] = { status: "loading", manifest: null, error: "" };
+      }
+      return next;
+    });
+
+    Promise.all(
+      urls.map(async (url) => {
+        try {
+          const response = await fetch(`${API}${url}`);
+          if (!response.ok) throw new Error(`Manifest request failed: ${response.status}`);
+          return [url, { status: "ready", manifest: await response.json(), error: "" }];
+        } catch (error) {
+          return [url, { status: "error", manifest: null, error: error?.message || "Unable to load manifest." }];
+        }
+      })
+    ).then((entries) => {
+      if (cancelled) return;
+      setFinalManifestCache((prev) => {
+        const next = { ...prev };
+        for (const [url, entry] of entries) next[url] = entry;
+        return next;
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [finalManifestKey]);
+
+  useEffect(() => {
+    setFinalReviewIndex((index) => Math.min(index, Math.max(0, finalReviewOutputs.length - 1)));
+  }, [finalReviewOutputs.length]);
+
+  useEffect(() => {
+    setLoadedReviewDimensions(null);
+  }, [reviewVideoToken]);
+
+  useEffect(() => {
+    if (reviewVideoMode === "preview" && !previewOutput) setReviewVideoMode("auto");
+    if (reviewVideoMode === "final" && !selectedFinalOutput) setReviewVideoMode("auto");
+  }, [selectedFinalOutput, previewOutput, reviewVideoMode]);
+
   const updateThumbnailBrief = (key, value) => {
     setThumbnailBrief((prev) => ({ ...prev, [key]: value }));
   };
+
+  async function handleBuildPreview() {
+    setReviewVideoMode("preview");
+    setReviewRefreshToken((value) => value + 1);
+    await onBuildPreview();
+    setReviewRefreshToken((value) => value + 1);
+  }
+
+  async function handleRenderFinal() {
+    setReviewVideoMode("final");
+    setFinalReviewIndex(0);
+    setReviewRefreshToken((value) => value + 1);
+    await onRenderFinal({ regenerateVideos: true });
+    setFinalReviewIndex(0);
+    setReviewRefreshToken((value) => value + 1);
+  }
+
+  async function handleRebuildFinal() {
+    setReviewVideoMode("final");
+    setFinalReviewIndex(0);
+    setReviewRefreshToken((value) => value + 1);
+    await onRebuildFinal();
+    setFinalReviewIndex(0);
+    setReviewRefreshToken((value) => value + 1);
+  }
+
+  function handleReviewVideoMetadata(event) {
+    const width = Number(event.currentTarget.videoWidth);
+    const height = Number(event.currentTarget.videoHeight);
+    if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+      setLoadedReviewDimensions({
+        token: reviewVideoToken,
+        width: Math.round(width),
+        height: Math.round(height)
+      });
+    }
+  }
 
   return (
     <section className="workPanel finalReviewPanel">
@@ -3075,7 +4128,7 @@ function FinalReviewPanel({
           </button>
           <button
             className="secondaryButton"
-            onClick={onBuildPreview}
+            onClick={handleBuildPreview}
             disabled={!canBuildPreview || busy}
             title={canBuildPreview ? "Create or refresh the local preview" : readiness.setupReady ? "Select an episode first" : "Clear the Render Readiness setup checks first"}
           >
@@ -3083,10 +4136,19 @@ function FinalReviewPanel({
             Build Preview
           </button>
           <button
-            className="runButton"
-            onClick={onRenderFinal}
+            className="secondaryButton"
+            onClick={handleRebuildFinal}
             disabled={!canRenderFinal || busy}
-            title={canRenderFinal ? "Create final local render" : "Complete the Render Readiness review checks first"}
+            title={canRenderFinal ? "Reuse existing shot videos, generate only missing clips, remix audio, and rebuild the final render" : "Complete the Render Readiness setup checks first"}
+          >
+            <RefreshCw size={17} />
+            Rebuild Final
+          </button>
+          <button
+            className="runButton"
+            onClick={handleRenderFinal}
+            disabled={!canRenderFinal || busy}
+            title={canRenderFinal ? "Regenerate all dialogue shot videos from the current audio, remix audio, and create the final render" : "Complete the Render Readiness setup checks first"}
           >
             <Film size={17} />
             Render Final
@@ -3111,16 +4173,89 @@ function FinalReviewPanel({
 
         {reviewVideo && (
           <div className="previewBlock">
-            <video
-              src={reviewVideo.localUrl}
-              controls
-              playsInline
-              style={{ aspectRatio: selectedFormat.aspectRatio === "9:16" ? "9 / 16" : "16 / 9" }}
-            />
-            <div>
-              <strong>{finalOutput ? "Final local render" : "Local episode preview"}</strong>
-              <p>{reviewVideo.name}</p>
+            <div className="previewCanvas">
+              <div
+                className="previewViewport"
+                aria-label={`Video displayed at ${reviewDimensionLabel}`}
+                style={reviewViewportStyle}
+              >
+                <video
+                  key={reviewVideoToken}
+                  src={reviewVideoUrl}
+                  width={reviewDisplayDimensions.width}
+                  height={reviewDisplayDimensions.height}
+                  controls
+                  playsInline
+                  style={reviewVideoStyle}
+                  onLoadedMetadata={handleReviewVideoMetadata}
+                />
+              </div>
             </div>
+            <div className="previewMetaRow">
+              <div>
+                <strong>{selectedReviewMode === "final" ? "Final local render" : "Local episode preview"}</strong>
+                <p>{reviewVideo.name} - display {reviewDimensionLabel}{finalReviewCountLabel}</p>
+              </div>
+              <div className="previewMetaActions">
+                {previewOutput && finalOutput ? (
+                  <div className="segmentedControl compact">
+                    <button
+                      type="button"
+                      className={selectedReviewMode === "preview" ? "active" : ""}
+                      onClick={() => setReviewVideoMode("preview")}
+                    >
+                      Preview
+                    </button>
+                    <button
+                      type="button"
+                      className={selectedReviewMode === "final" ? "active" : ""}
+                      onClick={() => setReviewVideoMode("final")}
+                    >
+                      Final
+                    </button>
+                  </div>
+                ) : null}
+                {selectedReviewMode === "final" && finalReviewOutputs.length > 1 ? (
+                  <div className="finalStepControls" aria-label="Final display navigation">
+                    <button
+                      type="button"
+                      className="quietButton iconOnly"
+                      onClick={() =>
+                        setFinalReviewIndex((index) => (index + finalReviewOutputs.length - 1) % finalReviewOutputs.length)
+                      }
+                      title="Previous final display"
+                      aria-label="Previous final display"
+                    >
+                      <ChevronLeft size={15} />
+                    </button>
+                    <span>{selectedFinalIndex + 1}/{finalReviewOutputs.length}</span>
+                    <button
+                      type="button"
+                      className="quietButton iconOnly"
+                      onClick={() => setFinalReviewIndex((index) => (index + 1) % finalReviewOutputs.length)}
+                      title="Next final display"
+                      aria-label="Next final display"
+                    >
+                      <ChevronRight size={15} />
+                    </button>
+                  </div>
+                ) : null}
+                <button
+                  type="button"
+                  className="quietButton iconOnly"
+                  onClick={() => setReviewRefreshToken((value) => value + 1)}
+                  title="Reload displayed video"
+                >
+                  <RefreshCw size={15} />
+                </button>
+              </div>
+            </div>
+            {selectedReviewMode === "final" ? (
+              <RenderGenerationPanel
+                manifestOutput={selectedReviewManifestOutput}
+                manifestEntry={selectedReviewManifestEntry}
+              />
+            ) : null}
           </div>
         )}
       </div>
@@ -3138,6 +4273,8 @@ function FinalReviewPanel({
         onSaveLayers={onSaveFinishingLayers}
         onExportMaster={onExportFinishedMaster}
         onGenerateMusic={onGenerateFinishingMusic}
+        onGenerateLaughTrack={onGenerateFinishingLaughTrack}
+        onGenerateApplauseTrack={onGenerateFinishingApplauseTrack}
       />
 
       <details className="reviewDetails thumbnailReviewPanel">
@@ -3191,7 +4328,7 @@ function FinalReviewPanel({
                   onClick={() => onSelectThumbnail(thumb)}
                   disabled={busy}
                 >
-                  <img src={thumb.localUrl} alt="" />
+                  <img src={thumb.localUrl} alt="" style={mediaAspectStyle(thumb)} />
                   <span>{thumb.name || thumb.fileName}</span>
                   <strong>{selectedThumbnailId === thumb.id ? "Final thumbnail" : "Select thumbnail"}</strong>
                 </button>
@@ -3239,11 +4376,15 @@ function FinalReviewPanel({
                 <span>{video.name || "Finished master"}</span>
               </a>
             ))}
-            {finalOutputs.slice(0, 2).map((video) => (
-              <a key={video.id} href={video.localUrl} target="_blank" rel="noreferrer">
-                <Film size={16} />
-                <span>{video.name}</span>
-              </a>
+            {finalOutputs.map((video, index) => (
+              <FinalOutputLink
+                key={video.id}
+                video={video}
+                index={index}
+                finalOutputs={finalOutputs}
+                finalManifestOutputs={finalManifestOutputs}
+                manifestCache={finalManifestCache}
+              />
             ))}
             {previewOutputs.slice(0, 2).map((video) => (
               <a key={video.id} href={video.localUrl} target="_blank" rel="noreferrer">
@@ -3316,7 +4457,9 @@ function FinishingLayersPanel({
   onUploadLayers,
   onSaveLayers,
   onExportMaster,
-  onGenerateMusic
+  onGenerateMusic,
+  onGenerateLaughTrack,
+  onGenerateApplauseTrack
 }) {
   const imageVideoInputRef = useRef(null);
   const audioInputRef = useRef(null);
@@ -3338,6 +4481,24 @@ function FinishingLayersPanel({
     description: "Instrumental background music that follows the video's energy, supports dialogue, and stays light enough for spoken lines to remain clear.",
     tags: "warm, playful, cinematic, light, instrumental",
     volume: 0.28
+  });
+  const [laughTrackBrief, setLaughTrackBrief] = useState({
+    description: "Warm studio audience laugh track for a late-night comedy monologue: natural laughs, small chuckles, no words, no applause.",
+    durationSeconds: 8,
+    promptInfluence: 0.35,
+    volume: 0.22,
+    autoPlace: true,
+    maxCues: 4,
+    cueDurationSeconds: 2.4
+  });
+  const [applauseTrackBrief, setApplauseTrackBrief] = useState({
+    description: "Warm studio audience applause for a late-night show: clean clapping, light cheering, no laughter, no words, no music.",
+    durationSeconds: 10,
+    promptInfluence: 0.35,
+    volume: 0.24,
+    autoPlace: true,
+    maxCues: 3,
+    cueDurationSeconds: 3.2
   });
 
   useEffect(() => {
@@ -3374,6 +4535,8 @@ function FinishingLayersPanel({
   const exportBusy = busyAction === "finishing-export";
   const saveBusy = busyAction === "finishing-save";
   const musicBusy = busyAction === "finishing-music";
+  const laughTrackBusy = busyAction === "finishing-laugh-track";
+  const applauseTrackBusy = busyAction === "finishing-applause-track";
   const elevenMusicReady = Boolean(integrations?.elevenlabs);
 
   function updateMusicBrief(key, value) {
@@ -3381,6 +4544,40 @@ function FinishingLayersPanel({
       ...prev,
       [key]: key === "volume" ? clampTimelineValue(Number(value) || 0, 0, 2) : value
     }));
+  }
+
+  function updateLaughTrackBrief(key, value) {
+    setLaughTrackBrief((prev) => {
+      const numericRanges = {
+        durationSeconds: [0.5, 30],
+        promptInfluence: [0, 1],
+        volume: [0, 2],
+        maxCues: [1, 8],
+        cueDurationSeconds: [0.5, 30]
+      };
+      const range = numericRanges[key];
+      return {
+        ...prev,
+        [key]: range ? clampTimelineValue(Number(value) || 0, range[0], range[1]) : value
+      };
+    });
+  }
+
+  function updateApplauseTrackBrief(key, value) {
+    setApplauseTrackBrief((prev) => {
+      const numericRanges = {
+        durationSeconds: [0.5, 30],
+        promptInfluence: [0, 1],
+        volume: [0, 2],
+        maxCues: [1, 8],
+        cueDurationSeconds: [0.5, 30]
+      };
+      const range = numericRanges[key];
+      return {
+        ...prev,
+        [key]: range ? clampTimelineValue(Number(value) || 0, range[0], range[1]) : value
+      };
+    });
   }
 
   function pushUndoSnapshot(label = "Edit layers") {
@@ -3982,6 +5179,206 @@ function FinishingLayersPanel({
           </span>
         </div>
 
+        <div className="finishingMusicPanel">
+          <div className="finishingMusicHeader">
+            <div>
+              <strong>Laugh Track</strong>
+              <span>
+                Generate audience laughter as a separate audio layer, then place and mix it before exporting.
+              </span>
+            </div>
+            <button
+              type="button"
+              className="secondaryButton"
+              onClick={() => onGenerateLaughTrack?.(laughTrackBrief)}
+              disabled={!baseFinalOutput || !elevenMusicReady || busy}
+              title={
+                !baseFinalOutput
+                  ? "Render Final before generating a laugh track."
+                  : !elevenMusicReady
+                    ? "Connect ElevenLabs before generating a laugh track."
+                    : "Generate a local audio layer from ElevenLabs sound effects."
+              }
+            >
+              {laughTrackBusy ? <RefreshCw className="spin" size={16} /> : <Activity size={16} />}
+              Generate Laugh Track
+            </button>
+          </div>
+          <div className="musicBriefGrid laughTrackBriefGrid">
+            <Field label="Laugh prompt">
+              <textarea
+                rows={3}
+                value={laughTrackBrief.description}
+                onChange={(event) => updateLaughTrackBrief("description", event.target.value)}
+                placeholder="Describe the audience, intensity, timing, and any sounds to avoid."
+              />
+            </Field>
+            <Field label="Duration">
+              <input
+                type="number"
+                min="0.5"
+                max="30"
+                step="0.5"
+                value={laughTrackBrief.durationSeconds}
+                onChange={(event) => updateLaughTrackBrief("durationSeconds", event.target.value)}
+              />
+            </Field>
+            <Field label="Prompt influence">
+              <input
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value={laughTrackBrief.promptInfluence}
+                onChange={(event) => updateLaughTrackBrief("promptInfluence", event.target.value)}
+              />
+            </Field>
+            <Field label="Volume">
+              <input
+                type="number"
+                min="0"
+                max="2"
+                step="0.05"
+                value={laughTrackBrief.volume}
+                onChange={(event) => updateLaughTrackBrief("volume", event.target.value)}
+              />
+            </Field>
+          </div>
+          <div className="laughTrackPlacementControls">
+            <Toggle
+              checked={laughTrackBrief.autoPlace}
+              onChange={(checked) => updateLaughTrackBrief("autoPlace", checked)}
+              label="Auto-place cues"
+              icon={Check}
+            />
+            <Field label="Max cues">
+              <input
+                type="number"
+                min="1"
+                max="8"
+                step="1"
+                value={laughTrackBrief.maxCues}
+                onChange={(event) => updateLaughTrackBrief("maxCues", event.target.value)}
+                disabled={!laughTrackBrief.autoPlace}
+              />
+            </Field>
+            <Field label="Cue length">
+              <input
+                type="number"
+                min="0.5"
+                max="30"
+                step="0.25"
+                value={laughTrackBrief.cueDurationSeconds}
+                onChange={(event) => updateLaughTrackBrief("cueDurationSeconds", event.target.value)}
+                disabled={!laughTrackBrief.autoPlace}
+              />
+            </Field>
+          </div>
+          <span className={`musicIntegrationStatus ${elevenMusicReady ? "ready" : ""}`}>
+            {elevenMusicReady ? "ElevenLabs sound effects ready" : "ElevenLabs not connected"}
+          </span>
+        </div>
+
+        <div className="finishingMusicPanel">
+          <div className="finishingMusicHeader">
+            <div>
+              <strong>Applause Track</strong>
+              <span>
+                Generate applause as its own audio layer for openings, closings, transitions, or big reveals.
+              </span>
+            </div>
+            <button
+              type="button"
+              className="secondaryButton"
+              onClick={() => onGenerateApplauseTrack?.(applauseTrackBrief)}
+              disabled={!baseFinalOutput || !elevenMusicReady || busy}
+              title={
+                !baseFinalOutput
+                  ? "Render Final before generating applause."
+                  : !elevenMusicReady
+                    ? "Connect ElevenLabs before generating applause."
+                    : "Generate a local applause audio layer from ElevenLabs sound effects."
+              }
+            >
+              {applauseTrackBusy ? <RefreshCw className="spin" size={16} /> : <Activity size={16} />}
+              Generate Applause
+            </button>
+          </div>
+          <div className="musicBriefGrid laughTrackBriefGrid">
+            <Field label="Applause prompt">
+              <textarea
+                rows={3}
+                value={applauseTrackBrief.description}
+                onChange={(event) => updateApplauseTrackBrief("description", event.target.value)}
+                placeholder="Describe the applause size, energy, room, and any sounds to avoid."
+              />
+            </Field>
+            <Field label="Duration">
+              <input
+                type="number"
+                min="0.5"
+                max="30"
+                step="0.5"
+                value={applauseTrackBrief.durationSeconds}
+                onChange={(event) => updateApplauseTrackBrief("durationSeconds", event.target.value)}
+              />
+            </Field>
+            <Field label="Prompt influence">
+              <input
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value={applauseTrackBrief.promptInfluence}
+                onChange={(event) => updateApplauseTrackBrief("promptInfluence", event.target.value)}
+              />
+            </Field>
+            <Field label="Volume">
+              <input
+                type="number"
+                min="0"
+                max="2"
+                step="0.05"
+                value={applauseTrackBrief.volume}
+                onChange={(event) => updateApplauseTrackBrief("volume", event.target.value)}
+              />
+            </Field>
+          </div>
+          <div className="laughTrackPlacementControls">
+            <Toggle
+              checked={applauseTrackBrief.autoPlace}
+              onChange={(checked) => updateApplauseTrackBrief("autoPlace", checked)}
+              label="Auto-place cues"
+              icon={Check}
+            />
+            <Field label="Max cues">
+              <input
+                type="number"
+                min="1"
+                max="8"
+                step="1"
+                value={applauseTrackBrief.maxCues}
+                onChange={(event) => updateApplauseTrackBrief("maxCues", event.target.value)}
+                disabled={!applauseTrackBrief.autoPlace}
+              />
+            </Field>
+            <Field label="Cue length">
+              <input
+                type="number"
+                min="0.5"
+                max="30"
+                step="0.25"
+                value={applauseTrackBrief.cueDurationSeconds}
+                onChange={(event) => updateApplauseTrackBrief("cueDurationSeconds", event.target.value)}
+                disabled={!applauseTrackBrief.autoPlace}
+              />
+            </Field>
+          </div>
+          <span className={`musicIntegrationStatus ${elevenMusicReady ? "ready" : ""}`}>
+            {elevenMusicReady ? "ElevenLabs sound effects ready" : "ElevenLabs not connected"}
+          </span>
+        </div>
+
         {draftLayers.length ? (
           <div className="finishingLayerList">
             {draftLayers.map((layer) => (
@@ -4379,6 +5776,7 @@ function FinalPackagePanel({
     madeForKids: Boolean(youtubeDraft.madeForKids),
     notifySubscribers: Boolean(youtubeDraft.notifySubscribers),
     containsSyntheticMedia: youtubeDraft.containsSyntheticMedia !== false,
+    shortsThumbnail: Boolean(youtubeDraft.shortsThumbnail),
     plannedPublishAt: youtubeDraft.plannedPublishAt || "",
     publishNotes: youtubeDraft.publishNotes || "",
     readyToPublish: Boolean(youtubeDraft.readyToPublish),
@@ -4404,6 +5802,7 @@ function FinalPackagePanel({
       madeForKids: Boolean(next.madeForKids),
       notifySubscribers: Boolean(next.notifySubscribers),
       containsSyntheticMedia: next.containsSyntheticMedia !== false,
+      shortsThumbnail: Boolean(next.shortsThumbnail),
       plannedPublishAt: next.plannedPublishAt || "",
       publishNotes: next.publishNotes || "",
       readyToPublish: Boolean(next.readyToPublish),
@@ -4443,6 +5842,7 @@ function FinalPackagePanel({
         madeForKids: Boolean(youtubeForm.madeForKids),
         notifySubscribers: Boolean(youtubeForm.notifySubscribers),
         containsSyntheticMedia: Boolean(youtubeForm.containsSyntheticMedia),
+        shortsThumbnail: Boolean(youtubeForm.shortsThumbnail),
         plannedPublishAt: youtubeForm.plannedPublishAt || "",
         publishNotes: youtubeForm.publishNotes.trim(),
         readyToPublish: Boolean(youtubeForm.readyToPublish),
@@ -4589,6 +5989,12 @@ function FinalPackagePanel({
   const youtubeWatchUrl = latestYoutubeUpload?.watchUrl || latestYoutubeUpload?.localUrl || "";
   const youtubeStudioUrl = latestYoutubeUpload?.studioUrl || "";
   const plannedPublishLabel = youtubeForm.plannedPublishAt ? dateTimeLabel(youtubeForm.plannedPublishAt) : "No schedule target";
+  const shortsThumbnailRequested = Boolean(youtubeForm.shortsThumbnail);
+  const shortsThumbnailUploadLabel = latestYoutubeUpload?.shortsThumbnailApplied
+    ? `added${latestYoutubeUpload.shortsThumbnailFrameSeconds ? ` (${latestYoutubeUpload.shortsThumbnailFrameSeconds}s)` : ""}`
+    : shortsThumbnailRequested
+      ? "not confirmed"
+      : "not requested";
   const completionState = latestYoutubeUpload?.videoId
     ? readyToPublish
       ? "Ready for manual publishing"
@@ -4714,7 +6120,7 @@ function FinalPackagePanel({
           </div>
           {selectedThumbnail?.localUrl ? (
             <div className="episodeThumbnailStrip">
-              <img src={selectedThumbnail.localUrl} alt="" />
+              <img src={selectedThumbnail.localUrl} alt="" style={mediaAspectStyle(selectedThumbnail)} />
               <div>
                 <span className="eyebrow">Selected Thumbnail</span>
                 <strong>{selectedThumbnail.name || selectedThumbnail.fileName}</strong>
@@ -4785,6 +6191,7 @@ function FinalPackagePanel({
               <span>
                 {latestYoutubeUpload.videoId}
                 {latestYoutubeUpload.thumbnailWarning ? ` - ${latestYoutubeUpload.thumbnailWarning}` : ""}
+                {latestYoutubeUpload.shortsThumbnailApplied ? " - Shorts thumbnail frame added" : ""}
               </span>
             </div>
             <Pill tone={thumbnailTone}>{latestYoutubeUpload.thumbnailSet ? "thumbnail set" : "thumbnail warning"}</Pill>
@@ -4812,6 +6219,10 @@ function FinalPackagePanel({
               <article>
                 <span>Processing</span>
                 <strong>{liveYoutubeStatus.processingStatus || "unchecked"}</strong>
+              </article>
+              <article className={latestYoutubeUpload.shortsThumbnailApplied ? "ready" : shortsThumbnailRequested ? "warning" : ""}>
+                <span>Shorts frame</span>
+                <strong>{shortsThumbnailUploadLabel}</strong>
               </article>
               <article>
                 <span>Last checked</span>
@@ -4847,6 +6258,14 @@ function FinalPackagePanel({
             {youtubeNeedsReconnectForStatus ? (
               <div className="manualPublishNotice warning">
                 YouTube is connected for uploads, but status checks need one more Google reconnect to approve readonly access.
+              </div>
+            ) : null}
+            <div className="manualPublishNotice">
+              YouTube does not let NewtBuilder replace the video file on an existing upload. To replace this draft, republish a new private draft, then delete the old upload or leave it private in Studio.
+            </div>
+            {shortsThumbnailRequested && latestYoutubeUpload?.videoId && !latestYoutubeUpload.shortsThumbnailApplied ? (
+              <div className="manualPublishNotice warning">
+                Shorts Thumbnail is on, but this upload did not confirm that the final-frame thumbnail was added. Restart the NewtBuilder API, then republish this draft.
               </div>
             ) : null}
           </div>
@@ -4902,7 +6321,18 @@ function FinalPackagePanel({
               label="Notify subs"
               icon={MonitorUp}
             />
+            <Toggle
+              checked={youtubeForm.shortsThumbnail}
+              onChange={(checked) => updateYoutubeForm("shortsThumbnail", checked)}
+              label="Shorts thumbnail"
+              icon={Film}
+            />
           </div>
+          {youtubeForm.shortsThumbnail ? (
+            <div className="manualPublishNotice">
+              Shorts Thumbnail adds the selected thumbnail as the final held frame of the uploaded video so YouTube Shorts can pick it from the video. The local final render stays unchanged.
+            </div>
+          ) : null}
           <div className="manualPublishNotice">
             NewtBuilder uploads private drafts only. The schedule target and notes are saved here, then applied manually in YouTube Studio.
           </div>
@@ -4992,6 +6422,29 @@ function FinalPackagePanel({
               Upload Private Draft
             </button>
           ) : null}
+          {latestYoutubeUpload?.videoId ? (
+            <button
+              className="runButton"
+              onClick={uploadPrivateDraft}
+              disabled={!canUploadDraft}
+              title={
+                canUploadDraft
+                  ? "Upload the current final video and thumbnail as a new private YouTube draft"
+                  : !ready
+                    ? "Render final video and select a thumbnail first"
+                    : !youtubeReady
+                      ? "Add YouTube OAuth credentials first"
+                    : !publishingUnlocked
+                      ? "Set NEWTBUILDER_ENABLE_PUBLISHING=true to unlock private draft uploads"
+                      : !launchReady
+                        ? "Clear the Launch Readiness blockers first"
+                        : "Republish is unavailable"
+              }
+            >
+              {uploadBusy ? <RefreshCw className="spin" size={17} /> : <Upload size={17} />}
+              Republish New Draft
+            </button>
+          ) : null}
           {latestYoutubeUpload?.videoId && !readyToPublish ? (
             <button
               className="secondaryButton"
@@ -5034,15 +6487,9 @@ function FinalPackagePanel({
               Export Package
             </button>
             {latestYoutubeUpload?.videoId ? (
-              <button
-                className="secondaryButton"
-                onClick={uploadPrivateDraft}
-                disabled={!canUploadDraft}
-                title="Create another private YouTube draft from the current final video and thumbnail"
-              >
-                {uploadBusy ? <RefreshCw className="spin" size={17} /> : <MonitorUp size={17} />}
-                Upload New Draft
-              </button>
+              <div className="manualPublishNotice">
+                Existing YouTube uploads can update metadata and thumbnails, but replacing the video file requires a new upload.
+              </div>
             ) : null}
             {latestPackage?.localUrl ? (
               <>
@@ -5198,6 +6645,8 @@ function productionMapInteractiveEvent(event) {
 
 function ProductionMapPanel({
   productionMap,
+  show,
+  format,
   characters,
   voices,
   shotTypes,
@@ -5212,13 +6661,17 @@ function ProductionMapPanel({
   onRegenerateAudio,
   onSetAudioStatus,
   onOpenMaskEditor,
+  onGenerateDialogueVideo,
+  onSelectDialogueVideoTake,
+  onGenerateMissingDialogueVideos,
   onGenerateInsertVideo,
   onUploadInsertVideo,
   busyAction,
   busy
 }) {
   const hasLines = productionMap.length > 0;
-  const [isOpen, setIsOpen] = useState(false);
+  const previousLineCountRef = useRef(productionMap.length);
+  const [isOpen, setIsOpen] = useState(() => productionMap.length > 0);
   const [selectedLineIds, setSelectedLineIds] = useState(() => new Set());
   const [dragLineId, setDragLineId] = useState("");
   const [dropTarget, setDropTarget] = useState(null);
@@ -5230,6 +6683,17 @@ function ProductionMapPanel({
     [productionMap, selectedLineIds]
   );
   const selectedGroupedLines = selectedLines.filter((line) => line.groupId);
+  const missingDialogueVideoCount = productionMap.filter(
+    (line) => line.lineType !== "insert" && line.audioTake?.localUrl && !line.videoTake?.localUrl
+  ).length;
+
+  useEffect(() => {
+    const previousLineCount = previousLineCountRef.current;
+    if (!previousLineCount && productionMap.length) {
+      setIsOpen(true);
+    }
+    previousLineCountRef.current = productionMap.length;
+  }, [productionMap.length]);
 
   useEffect(() => {
     setSelectedLineIds((current) => {
@@ -5282,7 +6746,9 @@ function ProductionMapPanel({
       assetId: "",
       needsMask: false,
       maskAssetId: "",
-      invertMask: false
+      invertMask: false,
+      videoStatus: "pending",
+      videoTake: null
     });
   }
 
@@ -5379,6 +6845,17 @@ function ProductionMapPanel({
               Ungroup
             </button>
           ) : null}
+          {missingDialogueVideoCount ? (
+            <button
+              className="secondaryButton"
+              type="button"
+              onClick={onGenerateMissingDialogueVideos}
+              disabled={busy}
+            >
+              {busyAction?.startsWith("dialogue-video:") ? <RefreshCw className="spin" size={15} /> : <Film size={15} />}
+              Generate missing videos
+            </button>
+          ) : null}
           {selectedLineIds.size ? <Pill tone="good">{selectedLineIds.size} selected</Pill> : null}
           <Pill tone={groupBlocks.some((block) => block.type === "group") ? "good" : "neutral"}>
             {groupBlocks.filter((block) => block.type === "group").length} groups
@@ -5405,6 +6882,8 @@ function ProductionMapPanel({
                 <ProductionLineRow
                   key={line.id}
                   line={line}
+                  show={show}
+                  format={format}
                   isInsert={isInsert}
                   selectedAsset={selectedAsset}
                   selectedMask={selectedMask}
@@ -5429,6 +6908,8 @@ function ProductionMapPanel({
                   onRegenerateAudio={onRegenerateAudio}
                   onSetAudioStatus={onSetAudioStatus}
                   onOpenMaskEditor={onOpenMaskEditor}
+                  onGenerateDialogueVideo={onGenerateDialogueVideo}
+                  onSelectDialogueVideoTake={onSelectDialogueVideoTake}
                   onGenerateInsertVideo={onGenerateInsertVideo}
                   onUploadInsertVideo={onUploadInsertVideo}
                   onDragEnd={() => {
@@ -5468,6 +6949,8 @@ function ProductionMapPanel({
                         <ProductionLineRow
                           key={line.id}
                           line={line}
+                          show={show}
+                          format={format}
                           isInsert={isInsert}
                           selectedAsset={selectedAsset}
                           selectedMask={selectedMask}
@@ -5492,6 +6975,8 @@ function ProductionMapPanel({
                           onRegenerateAudio={onRegenerateAudio}
                           onSetAudioStatus={onSetAudioStatus}
                           onOpenMaskEditor={onOpenMaskEditor}
+                          onGenerateDialogueVideo={onGenerateDialogueVideo}
+                          onSelectDialogueVideoTake={onSelectDialogueVideoTake}
                           onGenerateInsertVideo={onGenerateInsertVideo}
                           onUploadInsertVideo={onUploadInsertVideo}
                           onDragEnd={() => {
@@ -5516,6 +7001,8 @@ function ProductionMapPanel({
 
 function ProductionLineRow({
   line,
+  show,
+  format,
   isInsert,
   selectedAsset,
   selectedMask,
@@ -5539,16 +7026,34 @@ function ProductionLineRow({
   onRegenerateAudio,
   onSetAudioStatus,
   onOpenMaskEditor,
+  onGenerateDialogueVideo,
+  onSelectDialogueVideoTake,
   onGenerateInsertVideo,
   onUploadInsertVideo,
   busyAction,
   onDragEnd
 }) {
-  const lipSyncModel = lipSyncModelForLine(line);
+  const lipSyncOverrideModel = lineLipSyncOverrideModel(line);
+  const inheritedLipSyncModel =
+    assetLipSyncModel(selectedAsset) ||
+    optionalLipSyncModel(show?.production?.defaultLipSyncModel) ||
+    "fabric";
+  const lipSyncModel = resolvedLipSyncModelForLine(line, selectedAsset, show);
+  const globalLipSyncPrompt = assetLipSyncPrompt(selectedAsset);
+  const lineInputPromptOverride = lineLipSyncInputPromptOverride(line);
+  const displayedLipSyncPrompt = lineLipSyncInputPrompt(line, selectedAsset);
+  const promptLocked = line.lipSyncInputPromptLocked !== false;
+  const defaultRendererLabel = selectedAsset
+    ? `Use visual default (${lipSyncModelLabel(inheritedLipSyncModel)})`
+    : `Use show default (${lipSyncModelLabel(inheritedLipSyncModel)})`;
   const insertUploadMode = isInsert && line.insertVideoMode === "upload";
   const showScriptEditor = !insertUploadMode;
   const maskExpected = !isInsert && lineExpectsSpeakerMask(line, selectedAsset);
   const hasMask = Boolean(line.maskAssetId);
+  const hasLineAudio = Boolean(line.audioTake?.localUrl);
+  const hasLineVideo = Boolean(line.videoTake?.localUrl || line.videoTake?.proxyLocalUrl);
+  const shotReady = isInsert ? hasLineVideo && reviewStatus !== "failed" : hasLineAudio && hasLineVideo && line.videoStatus !== "failed";
+  const shotPartial = !shotReady && (hasLineAudio || hasLineVideo);
 
   function updateScriptText(text) {
     if (isInsert) {
@@ -5565,7 +7070,9 @@ function ProductionLineRow({
     onUpdate(line.id, {
       text,
       audioStatus: "pending",
-      audioTake: null
+      audioTake: null,
+      videoStatus: "pending",
+      videoTake: null
     });
   }
 
@@ -5576,6 +7083,8 @@ function ProductionLineRow({
         isInsert ? "insertProductionLine" : "",
         isSelected ? "selected" : "",
         isDragging ? "dragging" : "",
+        shotReady ? "shotReady" : "",
+        shotPartial ? "shotPartial" : "",
         dropPlacement ? `drop-${dropPlacement}` : ""
       ].filter(Boolean).join(" ")}
       draggable
@@ -5605,6 +7114,11 @@ function ProductionLineRow({
           <Pill tone={isInsert ? videoStatusTone(reviewStatus) : audioStatusTone(reviewStatus)}>
             {isInsert ? videoStatusLabel(reviewStatus) : audioStatusLabel(reviewStatus)}
           </Pill>
+          {!isInsert ? (
+            <Pill tone={hasLineVideo && line.videoStatus !== "failed" ? "good" : line.videoStatus === "failed" ? "danger" : "neutral"}>
+              {videoStatusLabel(line.videoStatus || (hasLineVideo ? "generated" : "pending"))}
+            </Pill>
+          ) : null}
         </div>
         {showScriptEditor ? (
           <label className="dialogueEditField">
@@ -5622,20 +7136,35 @@ function ProductionLineRow({
             <label className="audioTagField">
               <span>V3 tags</span>
               <input
-                value={line.audioTags || ""}
-                onChange={(event) => onUpdate(line.id, { audioTags: event.target.value })}
-                placeholder="[happy] [whispers]"
-              />
+              value={line.audioTags || ""}
+              onChange={(event) =>
+                onUpdate(line.id, {
+                  audioTags: event.target.value,
+                  audioStatus: "pending",
+                  audioTake: null,
+                  videoStatus: "pending",
+                  videoTake: null
+                })
+              }
+              placeholder="[happy] [whispers]"
+            />
             </label>
-            <LineAudioReview
-              line={line}
-              status={reviewStatus}
+          <LineAudioReview
+            line={line}
+            status={reviewStatus}
               busy={busy}
               onRegenerateAudio={onRegenerateAudio}
-              onSetAudioStatus={onSetAudioStatus}
-            />
-          </>
-        )}
+            onSetAudioStatus={onSetAudioStatus}
+          />
+          <LineDialogueVideoReview
+            line={line}
+            busy={busy}
+            busyAction={busyAction}
+            onGenerateDialogueVideo={onGenerateDialogueVideo}
+            onSelectDialogueVideoTake={onSelectDialogueVideoTake}
+          />
+        </>
+      )}
       </div>
 
       {isInsert ? (
@@ -5663,7 +7192,18 @@ function ProductionLineRow({
             </Field>
 
             <Field label="Voice">
-              <select value={line.voiceId || ""} onChange={(event) => onUpdate(line.id, { voiceId: event.target.value })}>
+              <select
+                value={line.voiceId || ""}
+                onChange={(event) =>
+                  onUpdate(line.id, {
+                    voiceId: event.target.value,
+                    audioStatus: "pending",
+                    audioTake: null,
+                    videoStatus: "pending",
+                    videoTake: null
+                  })
+                }
+              >
                 <VoiceSelectOptions voices={voices} currentValue={line.voiceId} />
               </select>
             </Field>
@@ -5686,7 +7226,12 @@ function ProductionLineRow({
                     assetId: event.target.value,
                     needsMask: false,
                     maskAssetId: "",
-                    invertMask: false
+                    invertMask: false,
+                    lipSyncPromptOverride: "",
+                    lipSyncInputPromptOverride: "",
+                    lipSyncInputPromptLocked: true,
+                    videoStatus: "pending",
+                    videoTake: null
                   })
                 }
               >
@@ -5704,31 +7249,126 @@ function ProductionLineRow({
               <textarea
                 value={line.videoPrompt || ""}
                 rows={2}
-                onChange={(event) => onUpdate(line.id, { videoPrompt: event.target.value })}
+                onChange={(event) =>
+                  onUpdate(line.id, {
+                    videoPrompt: event.target.value,
+                    videoStatus: "pending",
+                    videoTake: null
+                  })
+                }
                 placeholder="Optional motion, blocking, or expression direction for this shot"
               />
             </label>
+
+            {lipSyncModel !== "fabric" ? (
+              <div className="lipSyncPromptReview">
+                <div className="lipSyncPromptHeader">
+                  <span>Input prompt</span>
+                  <div className="lipSyncPromptHeaderActions">
+                    <Pill tone={lineInputPromptOverride ? "good" : "neutral"}>
+                      {lineInputPromptOverride ? "shot" : "global"}
+                    </Pill>
+                    <button
+                      type="button"
+                      className="quietButton iconOnly promptLockButton"
+                      onClick={() => onUpdate(line.id, { lipSyncInputPromptLocked: !promptLocked })}
+                      title={promptLocked ? "Unlock prompt" : "Lock prompt"}
+                    >
+                      {promptLocked ? <Lock size={14} /> : <Unlock size={14} />}
+                    </button>
+                  </div>
+                </div>
+                <textarea
+                  value={displayedLipSyncPrompt}
+                  rows={5}
+                  disabled={promptLocked}
+                  onChange={(event) =>
+                    onUpdate(line.id, {
+                      lipSyncInputPromptOverride: event.target.value,
+                      lipSyncPromptOverride: "",
+                      videoStatus: "pending",
+                      videoTake: null
+                    })
+                  }
+                  placeholder="No Cast Visual prompt yet"
+                />
+                {lineInputPromptOverride && globalLipSyncPrompt ? (
+                  <div className="lipSyncGeneratedPrompt">
+                    <span>Global default</span>
+                    <small>{globalLipSyncPrompt}</small>
+                  </div>
+                ) : null}
+                <div className="lipSyncPromptActions">
+                  <button
+                    type="button"
+                    className="quietButton"
+                    onClick={() =>
+                      onUpdate(line.id, {
+                        lipSyncInputPromptOverride: "",
+                        lipSyncPromptOverride: "",
+                        lipSyncInputPromptLocked: true,
+                        videoStatus: "pending",
+                        videoTake: null
+                      })
+                    }
+                    disabled={promptLocked || !lineInputPromptOverride}
+                  >
+                    Use Global
+                  </button>
+                  <button
+                    type="button"
+                    className="quietButton"
+                    onClick={() => onUpdate(line.id, { lipSyncInputPromptLocked: true })}
+                    disabled={promptLocked}
+                  >
+                    Lock
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div className="lineVisualControls">
             <ShotMaskCard
               imageAsset={selectedAsset}
               maskAsset={selectedMask}
+              format={format}
               hasMask={hasMask}
               maskNeeded={maskExpected && !hasMask}
               busy={busy}
               onOpen={() => onOpenMaskEditor(line.id)}
             />
-            <Toggle
-              checked={lipSyncModel === "kling"}
-              onChange={(checked) => onUpdate(line.id, { lipSyncModel: checked ? "kling" : "fabric" })}
-              label="Use Kling"
-              icon={Clapperboard}
-            />
-            {lipSyncModel === "kling" ? (
+            <Field label="Lip-sync renderer">
+              <select
+                value={lipSyncOverrideModel}
+                onChange={(event) =>
+                  onUpdate(line.id, {
+                    lipSyncModel: event.target.value,
+                    lipSyncModelOverride: event.target.value,
+                    lipSyncPromptOverride: "",
+                    videoStatus: "pending",
+                    videoTake: null
+                  })
+                }
+              >
+                <option value="">{defaultRendererLabel}</option>
+                {lipSyncModelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {lipSyncModel !== "fabric" ? (
               <Toggle
                 checked={Boolean(line.expressiveBodyMotion)}
-                onChange={(checked) => onUpdate(line.id, { expressiveBodyMotion: checked })}
+                onChange={(checked) =>
+                  onUpdate(line.id, {
+                    expressiveBodyMotion: checked,
+                    videoStatus: "pending",
+                    videoTake: null
+                  })
+                }
                 label="Expressive body"
                 icon={Activity}
               />
@@ -5740,10 +7380,12 @@ function ProductionLineRow({
   );
 }
 
-function ShotMaskCard({ imageAsset, maskAsset, hasMask, maskNeeded, busy, onOpen }) {
+function ShotMaskCard({ imageAsset, maskAsset, format, hasMask, maskNeeded, busy, onOpen }) {
+  const previewStyle = mediaAspectStyle(imageAsset) || mediaAspectStyle(format);
+
   return (
     <div className="shotMaskCard">
-      <div className="shotMaskPreview">
+      <div className="shotMaskPreview" style={previewStyle}>
         {imageAsset?.localUrl ? (
           <img src={imageAsset.localUrl} alt="" />
         ) : (
@@ -6165,6 +7807,7 @@ function LineInsertVideoReview({
   const previewLeft = clipDuration ? (inPoint / clipDuration) * 100 : 0;
   const previewWidth = clipDuration ? ((outPoint - inPoint) / clipDuration) * 100 : 100;
   const proxyUrl = take?.proxyLocalUrl || take?.localUrl || "";
+  const dimensionLabel = mediaDimensionLabel(take);
 
   useEffect(() => {
     setIsPlayingTrim(false);
@@ -6224,8 +7867,14 @@ function LineInsertVideoReview({
     <div className="lineAudioReview lineVideoReview">
       {hasVideo ? (
         <>
+          {dimensionLabel ? (
+            <div className="lineAudioMeta">
+              <span>{take?.model || "Shot video"}</span>
+              <span>{dimensionLabel}</span>
+            </div>
+          ) : null}
           <div className="trimPreviewShell">
-            <video key={proxyUrl} ref={videoRef} muted playsInline preload="metadata" src={proxyUrl} />
+            <video key={proxyUrl} ref={videoRef} muted playsInline preload="metadata" src={proxyUrl} style={mediaAspectStyle(take)} />
             <button
               type="button"
               className={`trimPreviewPlay ${isPlayingTrim ? "playing" : ""}`}
@@ -6243,6 +7892,82 @@ function LineInsertVideoReview({
       ) : (
         <div className="lineAudioEmpty">Choose an insert image to generate, or upload your own video clip.</div>
       )}
+    </div>
+  );
+}
+
+function LineDialogueVideoReview({ line, busy, busyAction, onGenerateDialogueVideo, onSelectDialogueVideoTake }) {
+  const take = line.videoTake || null;
+  const videoTakes = lineVideoTakeOptions(line);
+  const activeTakeKey = videoTakeKey(take);
+  const foundTakeIndex = videoTakes.findIndex((candidate) => videoTakeKey(candidate) === activeTakeKey);
+  const activeTakeIndex = foundTakeIndex >= 0 ? foundTakeIndex : 0;
+  const hasVideo = Boolean(take?.localUrl || take?.proxyLocalUrl);
+  const previewUrl = take?.proxyLocalUrl || take?.localUrl || "";
+  const hasAudio = Boolean(line.audioTake?.localUrl);
+  const isGenerating = busyAction === `dialogue-video:${line.id}`;
+  const isSelecting = busyAction === `dialogue-video-take:${line.id}`;
+  const buttonLabel = hasVideo ? "Regenerate Video" : "Generate Video";
+  const dimensionLabel = mediaDimensionLabel(take);
+  const previousTake = videoTakes[activeTakeIndex - 1] || null;
+  const nextTake = videoTakes[activeTakeIndex + 1] || null;
+  const videoMessage =
+    take?.warning ||
+    line.videoWarning ||
+    line.videoError ||
+    (line.videoStatus === "failed" ? "Shot video failed. Check the render status, then try regenerating the video." : "");
+
+  return (
+    <div className="lineAudioReview lineDialogueVideoReview">
+      <div className="lineAudioMeta">
+        <span>{take?.model || "No shot video yet"}</span>
+        {dimensionLabel ? <span>{dimensionLabel}</span> : null}
+        {take?.durationSeconds ? <span>{formatSeconds(take.durationSeconds)}</span> : null}
+        {videoTakes.length > 1 ? <span>{activeTakeIndex + 1} / {videoTakes.length}</span> : null}
+      </div>
+      {hasVideo ? (
+        <video key={previewUrl} controls playsInline preload="metadata" src={previewUrl} style={mediaAspectStyle(take)} />
+      ) : (
+        <div className="lineAudioEmpty">Generate this shot video after the line audio is ready.</div>
+      )}
+      {videoMessage ? <div className="lineAudioWarning">{videoMessage}</div> : null}
+      <div className="lineAudioActions">
+        {videoTakes.length > 1 ? (
+          <div className="lineVideoTakeStepper" aria-label="Shot video take navigation">
+            <button
+              type="button"
+              className="quietButton iconOnly"
+              onClick={() => previousTake && onSelectDialogueVideoTake?.(line, previousTake)}
+              disabled={busy || !previousTake}
+              title="Previous generated take"
+              aria-label="Previous generated take"
+            >
+              <ChevronLeft size={15} />
+            </button>
+            <span>{activeTakeIndex + 1} / {videoTakes.length}</span>
+            <button
+              type="button"
+              className="quietButton iconOnly"
+              onClick={() => nextTake && onSelectDialogueVideoTake?.(line, nextTake)}
+              disabled={busy || !nextTake}
+              title="Next generated take"
+              aria-label="Next generated take"
+            >
+              <ChevronRight size={15} />
+            </button>
+          </div>
+        ) : null}
+        <button
+          type="button"
+          className="quietButton"
+          onClick={() => onGenerateDialogueVideo(line)}
+          disabled={busy || !hasAudio}
+          title={hasAudio ? buttonLabel : "Generate line audio before shot video"}
+        >
+          {isGenerating || isSelecting ? <RefreshCw className="spin" size={15} /> : <Film size={15} />}
+          {isGenerating ? "Generating..." : isSelecting ? "Selecting..." : buttonLabel}
+        </button>
+      </div>
     </div>
   );
 }
@@ -6439,6 +8164,17 @@ function InsertShotControls({ line, assets, busy, busyAction, onUpdate, onGenera
 
       {hasVideo ? (
         <>
+          {!isUploadMode ? (
+            <button
+              type="button"
+              className="secondaryButton insertGenerateButton"
+              onClick={() => onGenerateInsertVideo(line)}
+              disabled={busy || !canGenerate}
+            >
+              {isGenerating ? <RefreshCw className="spin" size={15} /> : <Sparkles size={15} />}
+              {isGenerating ? "Generating..." : "Regenerate Video"}
+            </button>
+          ) : null}
           <label className="secondaryButton insertGenerateButton insertUploadButton">
             {isUploading ? <RefreshCw className="spin" size={15} /> : <Upload size={15} />}
             {isUploading ? "Uploading..." : isUploadMode ? "Replace Uploaded Video" : "Replace With Video"}
@@ -6672,7 +8408,7 @@ function audioStatusLabel(status) {
 }
 
 function videoStatusTone(status) {
-  if (status === "approved" || status === "generated") return "good";
+  if (status === "approved" || status === "generated" || status === "cached") return "good";
   if (status === "hold") return "warn";
   if (status === "failed") return "danger";
   return "neutral";
@@ -6681,6 +8417,7 @@ function videoStatusTone(status) {
 function videoStatusLabel(status) {
   if (status === "approved") return "video approved";
   if (status === "generated") return "video ready";
+  if (status === "cached") return "video cached";
   if (status === "hold") return "video hold";
   if (status === "failed") return "video failed";
   return "video pending";
@@ -6857,7 +8594,7 @@ function rolesFromFilenameSegment(segment) {
 }
 
 function isGuestNameToken(token) {
-  if (!token || ["TALKING", "SPEAKING", "SHOT", "WIDE", "MEDIUM", "CU", "MS", "WS", "INSERT", "INS", "LEFT", "RIGHT", "CENTER", "MIDDLE", "MID", "TABLE", "ROOM", "CLUBHOUSE", "REACTION", "BACKGROUND", "BG", "FG"].includes(token)) {
+  if (!token || ["TALKING", "SPEAKING", "SHOT", "WIDE", "MEDIUM", "CU", "MS", "WS", "INSERT", "INS", "LEFT", "RIGHT", "CENTER", "MIDDLE", "MID", "VERT", "VERTICAL", "PORTRAIT", "HORZ", "HORIZ", "HORIZONTAL", "LANDSCAPE", "TABLE", "ROOM", "CLUBHOUSE", "REACTION", "BACKGROUND", "BG", "FG"].includes(token)) {
     return false;
   }
   return !/^\d+$/.test(token);
@@ -6869,7 +8606,18 @@ function shotBindingLabel(binding) {
   return [binding.prefix, roleText].filter(Boolean).join(" ");
 }
 
-function CastVisualLibrary({ uploadShotTypes, assetCounts, assetsByRole, onUpload, onDelete, onUpdateTags }) {
+function CastVisualLibrary({
+  uploadShotTypes,
+  assetCounts,
+  assetsByRole,
+  onUpload,
+  onDelete,
+  onUpdateTags,
+  onUpdateLipSyncDefaults,
+  onGenerateLipSyncPrompt,
+  showDefaultLipSyncModel,
+  busyAction
+}) {
   const characterShotTypes = uploadShotTypes.filter((type) => type.role !== "insert_shot");
   const insertShotType = uploadShotTypes.find((type) => type.role === "insert_shot");
 
@@ -6889,6 +8637,10 @@ function CastVisualLibrary({ uploadShotTypes, assetCounts, assetsByRole, onUploa
             onUpload={(files) => onUpload(files, type.role)}
             onDelete={onDelete}
             onUpdateTags={onUpdateTags}
+            onUpdateLipSyncDefaults={onUpdateLipSyncDefaults}
+            onGenerateLipSyncPrompt={onGenerateLipSyncPrompt}
+            showDefaultLipSyncModel={showDefaultLipSyncModel}
+            busyAction={busyAction}
           />
         ))}
       </div>
@@ -6906,6 +8658,10 @@ function CastVisualLibrary({ uploadShotTypes, assetCounts, assetsByRole, onUploa
               onUpload={(files) => onUpload(files, insertShotType.role)}
               onDelete={onDelete}
               onUpdateTags={onUpdateTags}
+              onUpdateLipSyncDefaults={onUpdateLipSyncDefaults}
+              onGenerateLipSyncPrompt={onGenerateLipSyncPrompt}
+              showDefaultLipSyncModel={showDefaultLipSyncModel}
+              busyAction={busyAction}
             />
           </div>
         </>
@@ -6914,7 +8670,18 @@ function CastVisualLibrary({ uploadShotTypes, assetCounts, assetsByRole, onUploa
   );
 }
 
-function ShotUploadCard({ type, count, assets, onUpload, onDelete, onUpdateTags }) {
+function ShotUploadCard({
+  type,
+  count,
+  assets,
+  onUpload,
+  onDelete,
+  onUpdateTags,
+  onUpdateLipSyncDefaults,
+  onGenerateLipSyncPrompt,
+  showDefaultLipSyncModel,
+  busyAction
+}) {
   const Icon = type.icon;
   const previewAssets = (assets || []).filter((asset) => asset.type === "image");
 
@@ -6957,7 +8724,16 @@ function ShotUploadCard({ type, count, assets, onUpload, onDelete, onUpdateTags 
                 <span>{asset.fileName}</span>
               </div>
               {asset.shotRole !== "insert_shot" ? (
-                <AssetTagsField asset={asset} onSave={(tags) => onUpdateTags?.(asset.id, tags)} />
+                <>
+                  <AssetTagsField asset={asset} onSave={(tags) => onUpdateTags?.(asset.id, tags)} />
+                  <AssetLipSyncDefaults
+                    asset={asset}
+                    showDefaultLipSyncModel={showDefaultLipSyncModel}
+                    busy={busyAction === `asset-prompt:${asset.id}`}
+                    onSave={(patch) => onUpdateLipSyncDefaults?.(asset.id, patch)}
+                    onGenerate={(provider) => onGenerateLipSyncPrompt?.(asset.id, provider)}
+                  />
+                </>
               ) : null}
             </div>
           ))}
@@ -7002,5 +8778,74 @@ function AssetTagsField({ asset, onSave }) {
         placeholder="@name"
       />
     </label>
+  );
+}
+
+function AssetLipSyncDefaults({ asset, showDefaultLipSyncModel, busy, onSave, onGenerate }) {
+  const savedModel = assetLipSyncModel(asset);
+  const savedPrompt = assetLipSyncPrompt(asset);
+  const [modelDraft, setModelDraft] = useState(savedModel);
+  const [promptDraft, setPromptDraft] = useState(savedPrompt);
+  const effectiveModel = modelDraft || optionalLipSyncModel(showDefaultLipSyncModel) || "fabric";
+
+  useEffect(() => {
+    setModelDraft(savedModel);
+  }, [asset?.id, savedModel]);
+
+  useEffect(() => {
+    setPromptDraft(savedPrompt);
+  }, [asset?.id, savedPrompt]);
+
+  function savePrompt() {
+    const normalized = compactText(promptDraft.trim(), LIPSYNC_INPUT_PROMPT_MAX_LENGTH);
+    if (normalized === savedPrompt) {
+      setPromptDraft(normalized);
+      return;
+    }
+    setPromptDraft(normalized);
+    onSave?.({ lipSyncPrompt: normalized });
+  }
+
+  function saveModel(value) {
+    const normalized = optionalLipSyncModel(value);
+    setModelDraft(normalized);
+    if (normalized !== savedModel) {
+      onSave?.({ lipSyncModel: normalized });
+    }
+  }
+
+  return (
+    <div className="assetLipSyncDefaults">
+      <label className="assetDefaultModel">
+        <span>Global model</span>
+        <select value={modelDraft} onChange={(event) => saveModel(event.target.value)}>
+          <option value="">Show default ({lipSyncModelLabel(showDefaultLipSyncModel)})</option>
+          {lipSyncModelOptions.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="assetPromptField">
+        <span>Global prompt</span>
+        <textarea
+          value={promptDraft}
+          rows={4}
+          onChange={(event) => setPromptDraft(event.target.value)}
+          onBlur={savePrompt}
+          placeholder="Generate from image or write a reusable visual reference prompt"
+        />
+      </label>
+      <div className="assetPromptActions">
+        <button type="button" className="quietButton" onClick={savePrompt}>
+          Save
+        </button>
+        <button type="button" className="secondaryButton" onClick={() => onGenerate?.(effectiveModel)} disabled={busy}>
+          <WandSparkles size={14} />
+          {busy ? "Generating" : `Generate for ${lipSyncModelLabel(effectiveModel)}`}
+        </button>
+      </div>
+    </div>
   );
 }

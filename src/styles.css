@@ -938,6 +938,17 @@ label:has(textarea:disabled) {
   color: var(--text);
 }
 
+.segmentedControl.compact {
+  min-height: 34px;
+  padding: 3px;
+}
+
+.segmentedControl.compact button {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 .helperText {
   color: var(--muted);
   line-height: 1.45;
@@ -1435,13 +1446,35 @@ label:has(textarea:disabled) {
   margin-bottom: 14px;
 }
 
-.previewBlock video {
+.previewCanvas {
   width: 100%;
-  aspect-ratio: 16 / 9;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.previewViewport {
+  justify-self: start;
+  align-self: start;
   display: block;
+  flex: 0 0 auto;
+  max-width: none;
+  max-height: none;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #10100e;
+  box-sizing: content-box;
+}
+
+.previewBlock video {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  display: block;
+  flex: 0 0 auto;
+  background: #10100e;
+  object-fit: contain;
 }
 
 .previewBlock strong,
@@ -1455,6 +1488,182 @@ label:has(textarea:disabled) {
   color: var(--muted);
   line-height: 1.4;
   font-size: 13px;
+}
+
+.previewMetaRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.previewMetaRow > div:first-child {
+  min-width: 0;
+}
+
+.previewMetaActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.finalStepControls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #151511;
+}
+
+.finalStepControls .quietButton.iconOnly {
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+}
+
+.finalStepControls span {
+  min-width: 42px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+}
+
+.renderGenerationPanel {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #181814;
+  overflow: hidden;
+}
+
+.renderGenerationPanel[open] {
+  padding-bottom: 12px;
+}
+
+.renderGenerationPanel > p {
+  margin: 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.renderGenerationSummary,
+.renderLineModelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.renderGenerationSummary {
+  min-height: 54px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.renderGenerationSummary::-webkit-details-marker {
+  display: none;
+}
+
+.renderGenerationPanel[open] .renderGenerationSummary {
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.renderGenerationChevron {
+  flex: 0 0 auto;
+  color: var(--muted);
+  transition: color 160ms ease, transform 160ms ease;
+}
+
+.renderGenerationPanel[open] .renderGenerationChevron,
+.renderGenerationSummary:hover .renderGenerationChevron {
+  color: var(--jade);
+}
+
+.renderGenerationPanel[open] .renderGenerationChevron {
+  transform: rotate(90deg);
+}
+
+.renderGenerationTitle,
+.renderGenerationHeader > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.renderGenerationTitle strong,
+.renderGenerationHeader strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.renderGenerationBody {
+  display: grid;
+  gap: 10px;
+  padding: 0 12px;
+}
+
+.renderGenerationStats,
+.renderLineModelGrid {
+  display: grid;
+  gap: 8px;
+}
+
+.renderGenerationStats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.renderGenerationStats span,
+.renderLineModel {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #1d1d19;
+}
+
+.renderGenerationStats strong {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.renderGenerationStats span,
+.renderLineModel span,
+.renderLineModel small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.renderLineModel {
+  display: grid;
+  gap: 6px;
+}
+
+.renderLineModel p {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.renderLineModel span,
+.renderLineModel small {
+  display: block;
+  line-height: 1.35;
+}
+
+.warningText {
+  color: var(--amber) !important;
 }
 
 .reportSummary {
@@ -1909,6 +2118,16 @@ label:has(textarea:disabled) {
   background: #161613;
 }
 
+.draftStatusGrid article.ready {
+  border-color: rgba(109, 208, 165, 0.36);
+  background: rgba(109, 208, 165, 0.08);
+}
+
+.draftStatusGrid article.warning {
+  border-color: rgba(244, 189, 80, 0.36);
+  background: rgba(244, 189, 80, 0.08);
+}
+
 .draftStatusGrid span,
 .draftStatusGrid strong {
   display: block;
@@ -2010,7 +2229,7 @@ label:has(textarea:disabled) {
 
 .packageToggleGrid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 9px;
 }
 
@@ -2037,6 +2256,10 @@ label:has(textarea:disabled) {
 
 .packageActions a {
   text-decoration: none;
+}
+
+.packageActions .manualPublishNotice {
+  flex: 1 1 100%;
 }
 
 .advancedYoutubeActions {
@@ -2118,6 +2341,38 @@ label:has(textarea:disabled) {
   white-space: nowrap;
 }
 
+.reportList a.outputLinkWithMeta {
+  align-items: start;
+  min-height: 64px;
+  padding-block: 9px;
+}
+
+.reportList a.outputLinkWithMeta span {
+  display: grid;
+  gap: 3px;
+  white-space: normal;
+}
+
+.outputLinkWithMeta strong,
+.outputLinkWithMeta small,
+.outputLinkWithMeta em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outputLinkWithMeta small {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.outputLinkWithMeta em {
+  color: var(--jade);
+  font-size: 12px;
+  font-style: normal;
+}
+
 .productionMapPanel {
   grid-column: 1 / -1;
 }
@@ -2181,6 +2436,21 @@ label:has(textarea:disabled) {
 
 .productionLine:hover {
   border-color: rgba(133, 221, 172, 0.34);
+}
+
+.productionLine.shotReady {
+  border-color: rgba(109, 208, 165, 0.5);
+  background: #1d271f;
+}
+
+.productionLine.shotReady .lineIndex {
+  color: #d9ffee;
+  border-color: rgba(109, 208, 165, 0.42);
+  background: #20382c;
+}
+
+.productionLine.shotPartial:not(.shotReady) {
+  border-color: rgba(244, 189, 80, 0.26);
 }
 
 .productionLine:focus-visible,
@@ -2326,10 +2596,38 @@ label:has(textarea:disabled) {
   height: 34px;
 }
 
-.lineVideoReview video {
-  width: 100%;
+.lineVideoTakeStepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #151511;
+}
+
+.lineVideoTakeStepper .quietButton.iconOnly {
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+}
+
+.lineVideoTakeStepper span {
+  min-width: 40px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  text-align: center;
+}
+
+.lineVideoReview video,
+.lineDialogueVideoReview video {
+  width: auto;
+  max-width: 100%;
   display: block;
   max-height: 170px;
+  margin: 0 auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #10100d;
@@ -2338,6 +2636,8 @@ label:has(textarea:disabled) {
 
 .trimPreviewShell {
   position: relative;
+  display: grid;
+  place-items: center;
 }
 
 .trimPreviewPlay {
@@ -2635,9 +2935,87 @@ label:has(textarea:disabled) {
   font-size: 12px;
 }
 
+.lipSyncPromptReview {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(243, 240, 232, 0.08);
+  border-radius: 8px;
+  background: #191914;
+}
+
+.lineAssignmentGrid .lipSyncPromptReview {
+  grid-column: 1 / -1;
+}
+
+.lipSyncPromptHeader,
+.lipSyncPromptActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lipSyncPromptHeaderActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.promptLockButton {
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+}
+
+.lipSyncPromptHeader span,
+.lipSyncGeneratedPrompt span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.lipSyncPromptReview textarea {
+  min-height: 110px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.lipSyncPromptReview textarea:disabled {
+  color: var(--muted);
+  background: #141410;
+  cursor: default;
+}
+
+.lipSyncGeneratedPrompt {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #141410;
+}
+
+.lipSyncGeneratedPrompt small {
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.lipSyncPromptActions {
+  justify-content: flex-end;
+}
+
+.lipSyncPromptActions .quietButton {
+  min-height: 32px;
+  padding-inline: 10px;
+  font-size: 12px;
+}
+
 .shotMaskPreview {
   position: relative;
-  aspect-ratio: 16 / 9;
+  aspect-ratio: 9 / 16;
+  max-height: 240px;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -2648,7 +3026,7 @@ label:has(textarea:disabled) {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: cover;
+  object-fit: contain;
 }
 
 .shotMaskPreview > span:not(.pill) {
@@ -2862,6 +3240,10 @@ label:has(textarea:disabled) {
   gap: 8px;
 }
 
+.castShotUploadGrid .assetPreviewGrid {
+  grid-template-columns: 1fr;
+}
+
 .assetThumb {
   overflow: hidden;
   border-radius: 8px;
@@ -2871,6 +3253,8 @@ label:has(textarea:disabled) {
 
 .assetThumbImage {
   position: relative;
+  display: grid;
+  place-items: center;
   min-height: 92px;
   overflow: hidden;
 }
@@ -2879,7 +3263,7 @@ label:has(textarea:disabled) {
   width: 100%;
   height: 100%;
   min-height: 92px;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
 }
 
@@ -2950,6 +3334,58 @@ label:has(textarea:disabled) {
   min-height: 32px;
   padding: 0 8px;
   border-radius: 6px;
+  font-size: 12px;
+}
+
+.assetLipSyncDefaults {
+  display: grid;
+  gap: 7px;
+  padding: 7px;
+  border-top: 1px solid var(--line);
+  background: #181814;
+}
+
+.assetDefaultModel,
+.assetPromptField {
+  display: grid;
+  gap: 5px;
+}
+
+.assetDefaultModel span,
+.assetPromptField span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.assetDefaultModel select {
+  min-height: 32px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.assetPromptField textarea {
+  min-height: 96px;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  resize: vertical;
+}
+
+.assetPromptActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.assetPromptActions .quietButton,
+.assetPromptActions .secondaryButton {
+  min-height: 30px;
+  padding-inline: 9px;
   font-size: 12px;
 }
 
@@ -3086,6 +3522,17 @@ label:has(textarea:disabled) {
 .musicBriefGrid {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) minmax(180px, 0.55fr) minmax(96px, 0.22fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.laughTrackBriefGrid {
+  grid-template-columns: minmax(280px, 1fr) minmax(104px, 0.22fr) minmax(136px, 0.28fr) minmax(96px, 0.2fr);
+}
+
+.laughTrackPlacementControls {
+  display: grid;
+  grid-template-columns: minmax(180px, auto) minmax(96px, 0.2fr) minmax(110px, 0.24fr);
   gap: 10px;
   align-items: end;
 }
@@ -3557,6 +4004,8 @@ label:has(textarea:disabled) {
   .settingsGroup .automationStageGrid,
   .dashboardMetricGrid,
   .musicBriefGrid,
+  .laughTrackBriefGrid,
+  .laughTrackPlacementControls,
   .finishingPreviewGrid {
     grid-template-columns: 1fr;
   }
@@ -3659,6 +4108,10 @@ label:has(textarea:disabled) {
     grid-column: auto;
   }
 
+  .lipSyncPromptReview {
+    grid-column: auto;
+  }
+
   .gateActions {
     flex-wrap: wrap;
   }
@@ -3670,6 +4123,10 @@ label:has(textarea:disabled) {
 
   .brushSlider input {
     width: 100%;
+  }
+
+  .renderGenerationStats {
+    grid-template-columns: 1fr;
   }
 
   .metric {

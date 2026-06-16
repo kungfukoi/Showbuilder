@@ -25,6 +25,7 @@ NewtBuilder is a local show-and-episode builder for animated episodes. It is des
 
 - Aspect ratio: `9:16`
 - Resolution: `1080x1920`
+- Resolution can be changed in Settings with standard presets for 9:16 and 16:9 formats.
 - Runtime: estimated from script word count and show WPM settings
 - Runtime is informational only; the app does not lock episodes to a micro-video length.
 - Container: `mp4`
@@ -75,6 +76,17 @@ Insert-shot generation defaults to Seedance 2.0 reference-to-video so uploaded i
 Insert lines can also use `Video upload` mode. In that mode, the script/prompt/generate controls are inactive and the uploaded clip becomes the active preview and trim source.
 
 Keep `NEWTBUILDER_ENABLE_PUBLISHING` unset or `false` while testing locally. The upload endpoint stays locked until that flag is enabled.
+
+## Lip-Sync Renderers
+
+Final renders use the selected per-line lip-sync renderer when `FAL_KEY` is configured and `NEWTBUILDER_LIPSYNC_ENABLED=true`. The default renderer is controlled by `NEWTBUILDER_DEFAULT_LIPSYNC_MODEL`, which is set to `fabric` in the sample environment.
+
+Available renderers:
+
+- `aurora`: Creatify Aurora on fal, using `fal-ai/creatify/aurora`.
+- `fabric`: Fabric on fal, using `veed/fabric-1.0`.
+- `infinitalk`: InfiniteTalk on fal, using `fal-ai/infinitalk`.
+- `kling`: Kling Avatar on fal, using `fal-ai/kling-video/ai-avatar/v2/pro`.
 
 ## Finishing Layers
 

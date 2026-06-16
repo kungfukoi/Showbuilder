@@ -1,0 +1,136 @@
+{
+  "source_workflow": "D:\\_AI\\Comfyui_1_0_4\\ComfyUI\\custom_nodes\\ComfyUI-WanVideoWrapper\\example_workflows\\wanvideo_2_1_14B_I2V_InfiniteTalk_example_03.json",
+  "output_workflow": "C:\\dev\\NewtBuilder\\comfyui-workflows\\infinitalk-i2v-api.json",
+  "output_node": "131",
+  "image_node": "284",
+  "audio_node": "125",
+  "prompt_node": "241",
+  "negative_prompt_node": "241",
+  "width_node": "245",
+  "height_node": "246",
+  "num_frames_node": "270",
+  "seed_node": "128",
+  "filename_prefix_node": "131",
+  "removed_frontend_aliases": [
+    [
+      "239",
+      "MarkdownNote",
+      "Model links"
+    ],
+    [
+      "240",
+      "SetNode",
+      "Set_VAE"
+    ],
+    [
+      "260",
+      "SetNode",
+      "Set_wanmodel"
+    ],
+    [
+      "264",
+      "SetNode",
+      "Set_clip_vision_model"
+    ],
+    [
+      "247",
+      "SetNode",
+      "Set_width"
+    ],
+    [
+      "248",
+      "SetNode",
+      "Set_height"
+    ],
+    [
+      "282",
+      "GetNode",
+      "Get_height"
+    ],
+    [
+      "261",
+      "GetNode",
+      "Get_wanmodel"
+    ],
+    [
+      "265",
+      "GetNode",
+      "Get_clip_vision_model"
+    ],
+    [
+      "294",
+      "SetNode",
+      "Set_actual_audio_frames"
+    ],
+    [
+      "271",
+      "SetNode",
+      "Set_max_frames"
+    ],
+    [
+      "263",
+      "Note",
+      ""
+    ],
+    [
+      "272",
+      "GetNode",
+      "Get_max_frames"
+    ],
+    [
+      "254",
+      "GetNode",
+      "Get_input_audio"
+    ],
+    [
+      "283",
+      "GetNode",
+      "Get_width"
+    ],
+    [
+      "299",
+      "Note",
+      ""
+    ],
+    [
+      "253",
+      "SetNode",
+      "Set_input_audio"
+    ],
+    [
+      "302",
+      "MelBandRoFormerSampler",
+      ""
+    ],
+    [
+      "303",
+      "MarkdownNote",
+      "Wav2vec2 safetensors"
+    ],
+    [
+      "304",
+      "MarkdownNote",
+      "Wav2vec2 safetensors"
+    ],
+    [
+      "301",
+      "MelBandRoFormerModelLoader",
+      ""
+    ],
+    [
+      "244",
+      "GetNode",
+      "Get_VAE"
+    ],
+    [
+      "310",
+      "Note",
+      ""
+    ]
+  ],
+  "notes": [
+    "SetNode/GetNode aliases were resolved into direct API links.",
+    "MelBandRoFormer audio separation nodes were bypassed because they are not loaded in this ComfyUI runtime; raw input audio feeds InfiniteTalk directly.",
+    "NewtBuilder overrides image, audio, prompt, width, height, num_frames, seed, and filename_prefix at render time."
+  ]
+}

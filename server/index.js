@@ -16,6 +16,9 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const falFabricRunnerPath = path.join(__dirname, "fal_fabric_runner.py");
 const falKlingAvatarRunnerPath = path.join(__dirname, "fal_kling_avatar_runner.py");
+const falAuroraRunnerPath = path.join(__dirname, "fal_aurora_runner.py");
+const falInfiniteTalkRunnerPath = path.join(__dirname, "fal_infinitalk_runner.py");
+const localInfiniteTalkRunnerPath = path.join(__dirname, "local_infinitalk_runner.py");
 const dataDir = path.join(__dirname, "data");
 const uploadsDir = path.join(rootDir, "uploads");
 const outputsDir = path.join(rootDir, "outputs");
@@ -27,6 +30,10 @@ const youtubeAuthPath = path.join(dataDir, "youtube-oauth.json");
 const port = Number(process.env.PORT || 3334);
 const execFileAsync = promisify(execFile);
 const publishingEnabled = String(process.env.NEWTBUILDER_ENABLE_PUBLISHING || "").toLowerCase() === "true";
+const configuredShortsThumbnailFrameSeconds = Number(process.env.YOUTUBE_SHORTS_THUMBNAIL_SECONDS || 0.75);
+const shortsThumbnailFrameSeconds = Number.isFinite(configuredShortsThumbnailFrameSeconds)
+  ? Math.min(3, Math.max(0.2, configuredShortsThumbnailFrameSeconds))
+  : 0.75;
 const elevenLabsApiKey = process.env.ELEVEN_API_KEY || process.env.XI_API_KEY || "";
 const falApiKey = process.env.FAL_KEY || process.env.FAL_API_KEY || "";
 const openAiApiKey = process.env.OPENAI_API_KEY || "";
@@ -126,6 +133,66 @@ const shortFormatDefaults = {
   audioSampleRate: 48000
 };
 
+const standardFormatResolutions = {
+  "9:16": new Set(["540x960", "720x1280", "1080x1920", "1440x2560", "2160x3840"]),
+  "16:9": new Set(["960x540", "1280x720", "1920x1080", "2560x1440", "3840x2160"])
+};
+const lipSyncInputPromptMaxLength = 2400;
+const lipSyncFullPromptMaxLength = 3600;
+const defaultComfyUiInfiniteTalkNegativePrompt = [
+  "pupils",
+  "irises",
+  "eyeballs",
+  "sclera",
+  "human eyes",
+  "realistic eyes",
+  "CG eyes",
+  "3D eyes",
+  "cartoon eyes",
+  "animated eyes",
+  "anime eyes",
+  "cute eyes",
+  "round cartoon eyes",
+  "drawn eyeballs",
+  "plastic eyes",
+  "wet eyes",
+  "white eyes",
+  "eye whites",
+  "catchlights in eyes",
+  "eye reflections",
+  "glass eyes",
+  "eyelids opening over eyeballs",
+  "realistic human facial anatomy",
+  "naturalistic facial motion",
+  "bright tones",
+  "overexposed",
+  "static",
+  "blurred details",
+  "subtitles",
+  "style",
+  "works",
+  "paintings",
+  "images",
+  "overall gray",
+  "worst quality",
+  "low quality",
+  "JPEG compression residue",
+  "ugly",
+  "incomplete",
+  "extra fingers",
+  "poorly drawn hands",
+  "poorly drawn faces",
+  "deformed",
+  "disfigured",
+  "misshapen limbs",
+  "fused fingers",
+  "still picture",
+  "messy background",
+  "three legs",
+  "many people in the background",
+  "walking backwards"
+].join(", ");
+
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 app.use("/uploads", express.static(uploadsDir));
@@ -133,17 +200,26 @@ app.use("/outputs", express.static(outputsDir));
 
 app.get("/api/health", async (_req, res) => {
   const youtube = await youtubeOAuthStatus();
+  const comfyUi = await comfyUiHealthStatus();
   res.json({
     ok: true,
     app: "NewtBuilder",
     dataDirectory: dataDir,
     outputDirectory: outputsDir,
+    features: {
+      shortsThumbnailUploadFrame: true,
+      shortsThumbnailFrameSeconds
+    },
     integrations: {
       youtube: youtube.connected,
       openai: Boolean(process.env.OPENAI_API_KEY),
       elevenlabs: Boolean(elevenLabsApiKey),
-      fal: Boolean(falApiKey)
+      fal: Boolean(falApiKey),
+      infinitalkLocal: localInfiniteTalkConfigured(),
+      comfyui: comfyUi.reachable,
+      infinitalkComfyUi: comfyUi.reachable && comfyUiInfiniteTalkConfigured()
     },
+    comfyUi,
     safety: {
       publishingEnabled,
       mode: publishingEnabled ? "publishing-capable" : "local-test-only",
@@ -355,6 +431,26 @@ app.post("/api/episodes", async (req, res) => {
   res.json(episode);
 });
 
+app.post("/api/episodes/:id/duplicate", async (req, res) => {
+  const shows = await readShows();
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+
+  const show = shows.find((item) => item.id === current.showId) || shows[0];
+  const duplicate = duplicateEpisodeForNextScript({
+    episode: current,
+    show,
+    episodes: episodes.filter((item) => item.showId === current.showId),
+    title: req.body?.title
+  });
+
+  await writeEpisodes([duplicate, ...episodes]);
+  res.json(duplicate);
+});
+
 app.patch("/api/episodes/:id", async (req, res) => {
   const shows = await readShows();
   const episodes = await readEpisodes();
@@ -363,14 +459,34 @@ app.patch("/api/episodes/:id", async (req, res) => {
     return res.status(404).json({ error: "Episode not found." });
   }
   const show = shows.find((item) => item.id === current.showId) || shows[0];
+  const productionMapChanged =
+    Array.isArray(req.body.productionMap) &&
+    String(req.body.productionMapEditedAt || "") &&
+    String(req.body.productionMapEditedAt || "") !== String(current.productionMapEditedAt || "");
+  const approvals = productionMapChanged
+    ? resetRenderApproval(current.approvals, "Production map changed after render review.")
+    : Array.isArray(req.body.approvals)
+      ? req.body.approvals
+      : current.approvals;
+
+  const requestedFormat =
+    req.body.format && typeof req.body.format === "object" && !Array.isArray(req.body.format)
+      ? req.body.format
+      : {};
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(current.format || {}),
+    ...requestedFormat
+  });
 
   const updated = await ensureAutomaticSpeakerMasksForEpisode(normalizeEpisode({
     ...current,
     ...req.body,
+    approvals,
     id: current.id,
     showId: current.showId,
     createdAt: current.createdAt,
-    format: show.shortFormat || req.body.format || current.format,
+    format,
     updatedAt: new Date().toISOString()
   }), show);
   await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
@@ -465,36 +581,60 @@ app.patch("/api/episodes/:id/assets/:assetId", async (req, res) => {
     return res.status(404).json({ error: "Asset not found." });
   }
 
+  const hasSpeakingTag =
+    Object.prototype.hasOwnProperty.call(req.body || {}, "speakingTag") ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, "characterTags") ||
+    Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "speakingTag") ||
+    Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "characterTags");
   const speakingTag = sanitizeSpeakingTag(
-    req.body?.speakingTag ??
-      req.body?.characterTags ??
-      req.body?.metadata?.speakingTag ??
-      req.body?.metadata?.characterTags ??
-      asset.metadata?.speakingTag ??
-      asset.metadata?.characterTags ??
-      ""
+    hasSpeakingTag
+      ? req.body?.speakingTag ??
+          req.body?.characterTags ??
+          req.body?.metadata?.speakingTag ??
+          req.body?.metadata?.characterTags ??
+          ""
+      : asset.metadata?.speakingTag ?? asset.metadata?.characterTags ?? ""
   );
+  const hasLipSyncModel =
+    Object.prototype.hasOwnProperty.call(req.body || {}, "lipSyncModel") ||
+    Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "lipSyncModel");
+  const hasLipSyncPrompt =
+    Object.prototype.hasOwnProperty.call(req.body || {}, "lipSyncPrompt") ||
+    Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "lipSyncPrompt");
   const updatedAssets = current.assets.map((item) =>
     item.id === assetId
       ? normalizeAsset({
           ...item,
           metadata: {
             ...(item.metadata || {}),
-            speakingTag
+            ...(hasSpeakingTag ? { speakingTag } : {}),
+            ...(hasLipSyncModel
+              ? { lipSyncModel: sanitizeOptionalLipSyncModel(req.body?.lipSyncModel ?? req.body?.metadata?.lipSyncModel) }
+              : {}),
+            ...(hasLipSyncPrompt
+              ? {
+                  lipSyncPrompt: compactText(
+                    String(req.body?.lipSyncPrompt ?? req.body?.metadata?.lipSyncPrompt ?? "").trim(),
+                    lipSyncInputPromptMaxLength
+                  )
+                }
+              : {})
           }
         })
       : item
   );
 
   const removedAutoMaskIds = new Set(
-    current.assets
-      .filter(
-        (item) =>
-          item.shotRole === "mask" &&
-          item.metadata?.kind === "speaker-auto-mask" &&
-          cleanId(item.metadata?.sourceImageAssetId) === assetId
-      )
-      .map((item) => item.id)
+    hasSpeakingTag
+      ? current.assets
+          .filter(
+            (item) =>
+              item.shotRole === "mask" &&
+              item.metadata?.kind === "speaker-auto-mask" &&
+              cleanId(item.metadata?.sourceImageAssetId) === assetId
+          )
+          .map((item) => item.id)
+      : []
   );
   const remainingAssets = updatedAssets.filter((item) => !removedAutoMaskIds.has(item.id));
   const productionMap = clearMaskAssetsFromProductionMap(current.productionMap, removedAutoMaskIds);
@@ -503,13 +643,72 @@ app.patch("/api/episodes/:id/assets/:assetId", async (req, res) => {
   const show = shows.find((item) => item.id === current.showId) || shows[0];
   const updated = await ensureAutomaticSpeakerMasksForEpisode(normalizeEpisode({
     ...current,
+    approvals: (hasSpeakingTag || hasLipSyncModel || hasLipSyncPrompt)
+      ? resetRenderApproval(current.approvals, "Cast Visual defaults changed after render review.")
+      : current.approvals,
     assets: remainingAssets,
     productionMap,
-    jobLog: appendLog(current.jobLog, `Updated speaking tag for ${asset.fileName}.`),
+    jobLog: appendLog(
+      current.jobLog,
+      hasSpeakingTag ? `Updated speaking tag for ${asset.fileName}.` : `Updated Cast Visual defaults for ${asset.fileName}.`
+    ),
     updatedAt: new Date().toISOString()
   }), show);
   await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
   res.json(updated);
+});
+
+app.post("/api/episodes/:id/assets/:assetId/lipsync-prompt", async (req, res) => {
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+
+  const assetId = req.params.assetId;
+  const asset = current.assets.find((item) => item.id === assetId);
+  if (!asset) {
+    return res.status(404).json({ error: "Asset not found." });
+  }
+  if (asset.type !== "image" || asset.shotRole === "mask") {
+    return res.status(400).json({ error: "Only Cast Visual image assets can generate a lip-sync prompt." });
+  }
+
+  const shows = await readShows();
+  const show = shows.find((item) => item.id === current.showId) || shows[0] || defaultShow();
+  const provider =
+    sanitizeOptionalLipSyncModel(req.body?.provider || req.body?.lipSyncModel || req.body?.metadata?.lipSyncModel) ||
+    sanitizeOptionalLipSyncModel(asset.metadata?.lipSyncModel) ||
+    sanitizeLipSyncModel(show.production?.defaultLipSyncModel || defaultLipSyncModel());
+  const prompt = await generateCastVisualLipSyncPrompt({ asset, show, provider });
+  const now = new Date().toISOString();
+  const updatedAssets = current.assets.map((item) =>
+    item.id === assetId
+      ? normalizeAsset({
+          ...item,
+          metadata: {
+            ...(item.metadata || {}),
+            lipSyncPrompt: prompt,
+            lipSyncPromptSource: "openai-vision",
+            lipSyncPromptModel: provider,
+            lipSyncPromptGeneratedAt: now
+          }
+        })
+      : item
+  );
+  const updated = normalizeEpisode({
+    ...current,
+    approvals: resetRenderApproval(current.approvals, "Cast Visual prompt changed after render review."),
+    assets: updatedAssets,
+    jobLog: appendLog(current.jobLog, `Generated Cast Visual prompt for ${asset.fileName}.`),
+    updatedAt: now
+  });
+  await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+  res.json({
+    episode: updated,
+    asset: updated.assets.find((item) => item.id === assetId),
+    prompt
+  });
 });
 
 app.delete("/api/episodes/:id/assets/:assetId", async (req, res) => {
@@ -528,6 +727,7 @@ app.delete("/api/episodes/:id/assets/:assetId", async (req, res) => {
 
   const updated = normalizeEpisode({
     ...current,
+    approvals: resetRenderApproval(current.approvals, "Episode asset changed after render review."),
     assets: current.assets.filter((item) => item.id !== req.params.assetId),
     productionMap: clearAssetFromProductionMap(current.productionMap, req.params.assetId),
     jobLog: appendLog(current.jobLog, `Deleted asset: ${asset.fileName}`),
@@ -546,7 +746,11 @@ app.post("/api/episodes/:id/build-plan", async (req, res) => {
   }
   const show = shows.find((item) => item.id === current.showId) || shows[0];
   const scriptText = String(req.body.scriptText ?? current.scriptText ?? "");
-  const format = normalizeShortFormat(req.body.format || show.shortFormat || current.format);
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(current.format || {}),
+    ...(req.body.format || {})
+  });
   const plan = analyzeScript(scriptText, show);
   const productionMap = createProductionMap({
     scriptText,
@@ -566,7 +770,7 @@ app.post("/api/episodes/:id/build-plan", async (req, res) => {
     drafts,
     status: plan.wordCount ? "planned" : "draft",
     currentStage: "Planning",
-    approvals: refreshApprovals(current.approvals, show.automation),
+    approvals: resetRenderApproval(refreshApprovals(current.approvals, show.automation), "Script plan changed after render review."),
     jobLog: appendLog(current.jobLog, "Script plan and production map refreshed."),
     updatedAt: new Date().toISOString()
   }), show);
@@ -584,14 +788,24 @@ app.patch("/api/episodes/:id/production-map", async (req, res) => {
 
   const shows = await readShows();
   const show = shows.find((item) => item.id === current.showId) || shows[0];
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(current.format || {})
+  });
+  const productionMapEditedAt = String(req.body.productionMapEditedAt ?? current.productionMapEditedAt ?? "");
+  const approvals =
+    productionMapEditedAt && productionMapEditedAt !== String(current.productionMapEditedAt || "")
+      ? resetRenderApproval(current.approvals, "Production map changed after render review.")
+      : current.approvals;
   const updated = await ensureAutomaticSpeakerMasksForEpisode(normalizeEpisode({
     ...current,
-    format: show.shortFormat || current.format,
+    approvals,
+    format,
     productionMap: normalizeProductionMapForFormat(
       Array.isArray(req.body.productionMap) ? req.body.productionMap : current.productionMap,
-      show.shortFormat || current.format
+      format
     ),
-    productionMapEditedAt: String(req.body.productionMapEditedAt ?? current.productionMapEditedAt ?? ""),
+    productionMapEditedAt,
     jobLog: appendLog(current.jobLog, "Production map saved."),
     updatedAt: new Date().toISOString()
   }), show);
@@ -647,6 +861,7 @@ app.post("/api/episodes/:id/lines/:lineId/drawn-mask", async (req, res) => {
     ).length;
     const updated = normalizeEpisode({
       ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} mask changed after render review.`),
       assets: nextAssets,
       productionMap: nextMap,
       jobLog: appendLog(
@@ -716,13 +931,17 @@ app.post("/api/episodes/:id/audio-lines/:lineId/regenerate", async (req, res) =>
       {
         ...line,
         audioStatus: "pending",
-        audioTake
+        audioTake,
+        videoStatus: "pending",
+        videoTake: null,
+        videoTakes: []
       },
       lineIndex
     );
 
     const updated = normalizeEpisode({
       ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} audio changed after render review.`),
       productionMap: nextMap,
       jobLog: appendLog(current.jobLog, `Audio regenerated for line ${line.index}.`),
       updatedAt: new Date().toISOString()
@@ -754,6 +973,7 @@ app.patch("/api/episodes/:id/audio-lines/:lineId/review", async (req, res) => {
   );
   const updated = normalizeEpisode({
     ...current,
+    approvals: resetRenderApproval(current.approvals, `Line ${productionMap[lineIndex].index} audio review changed.`),
     productionMap,
     jobLog: appendLog(current.jobLog, `Line ${productionMap[lineIndex].index} audio marked ${status}.`),
     updatedAt: new Date().toISOString()
@@ -776,7 +996,10 @@ app.post("/api/episodes/:id/insert-lines/:lineId/generate-video", async (req, re
   }
 
   const show = shows.find((item) => item.id === current.showId) || shows[0];
-  const format = normalizeShortFormat(current.format || show.shortFormat);
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(current.format || {})
+  });
   const assets = Array.isArray(current.assets) ? current.assets.map(normalizeAsset) : [];
   const assetById = new Map(assets.map((asset) => [asset.id, asset]));
   const line = normalizeProductionLine(
@@ -840,6 +1063,7 @@ app.post("/api/episodes/:id/insert-lines/:lineId/generate-video", async (req, re
     );
     const updated = normalizeEpisode({
       ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} insert video changed after render review.`),
       productionMap,
       jobLog: appendLog(current.jobLog, `Insert video generated for line ${line.index}.`),
       updatedAt: new Date().toISOString()
@@ -848,10 +1072,11 @@ app.post("/api/episodes/:id/insert-lines/:lineId/generate-video", async (req, re
     res.json({ episode: updated, line: updated.productionMap[lineIndex] });
   } catch (error) {
     const productionMap = (current.productionMap || []).map((item, index) =>
-      index === lineIndex ? normalizeProductionLine({ ...line, videoStatus: "failed" }, index) : normalizeProductionLine(item, index)
+      index === lineIndex ? normalizeProductionLine({ ...line, videoStatus: "failed", videoTake: null }, index) : normalizeProductionLine(item, index)
     );
     const updated = normalizeEpisode({
       ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} insert video failed after render review.`),
       productionMap,
       jobLog: appendLog(current.jobLog, `Insert video failed for line ${line.index}: ${cleanErrorMessage(error)}`),
       updatedAt: new Date().toISOString()
@@ -882,7 +1107,10 @@ app.post("/api/episodes/:id/insert-lines/:lineId/upload-video", upload.single("v
   }
 
   const show = shows.find((item) => item.id === current.showId) || shows[0];
-  const format = normalizeShortFormat(current.format || show.shortFormat);
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(current.format || {})
+  });
   const requestedLine = parseJsonObject(req.body?.line);
   const line = normalizeProductionLine(
     requestedLine ? { ...current.productionMap[lineIndex], ...requestedLine, id: req.params.lineId } : current.productionMap[lineIndex],
@@ -918,6 +1146,7 @@ app.post("/api/episodes/:id/insert-lines/:lineId/upload-video", upload.single("v
     );
     const updated = normalizeEpisode({
       ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} uploaded insert video changed after render review.`),
       productionMap,
       jobLog: appendLog(current.jobLog, `Uploaded custom insert video for line ${line.index}: ${req.file.originalname}`),
       updatedAt: new Date().toISOString()
@@ -928,6 +1157,203 @@ app.post("/api/episodes/:id/insert-lines/:lineId/upload-video", upload.single("v
     await deleteStoredUpload(req.file.filename);
     res.status(400).json({ error: cleanErrorMessage(error) });
   }
+});
+
+app.post("/api/episodes/:id/dialogue-lines/:lineId/generate-video", async (req, res) => {
+  const shows = await readShows();
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+
+  const lineIndex = (current.productionMap || []).findIndex((line) => line.id === req.params.lineId);
+  if (lineIndex < 0) {
+    return res.status(404).json({ error: "Production line not found." });
+  }
+
+  const show = shows.find((item) => item.id === current.showId) || shows[0];
+  const requestedLine = req.body?.line && typeof req.body.line === "object" ? req.body.line : {};
+  const nextMap = (current.productionMap || []).map((line, index) =>
+    normalizeProductionLine(index === lineIndex ? { ...line, ...requestedLine, id: req.params.lineId } : line, index)
+  );
+  const line = nextMap[lineIndex];
+  if (line.lineType === "insert") {
+    return res.status(400).json({ error: "Insert lines use the insert video generator instead." });
+  }
+
+  const runId = randomUUID();
+  const tempDir = path.join(outputsDir, "tmp", `dialogue-video-${runId}`);
+
+  try {
+    await mkdir(tempDir, { recursive: true });
+    const manifest = buildRenderManifest({
+      previewId: `dialogue-video-${runId}`,
+      episode: {
+        ...current,
+        productionMap: nextMap
+      },
+      show,
+      createdAt: new Date().toISOString()
+    });
+    const manifestLine = manifest.lines.find((item) => item.id === req.params.lineId);
+    if (!manifestLine) {
+      throw new Error("Production line was not found in the render manifest.");
+    }
+    if (!manifestLine.imagePath) {
+      throw new Error(`Line ${line.index} needs an assigned image before shot video can render.`);
+    }
+
+    const reusableTake = reusableAudioTakeForLine(manifestLine);
+    if (!reusableTake) {
+      throw new Error(`Line ${line.index} needs a current audio review clip before shot video can render.`);
+    }
+    const audioPath = audioTakeFilePath(reusableTake);
+    if (!audioPath) {
+      throw new Error(`Line ${line.index} audio review clip is missing from disk.`);
+    }
+    manifestLine.durationSeconds = reusableTake.durationSeconds || manifestLine.durationSeconds;
+    manifestLine.audioTake = reusableTake;
+    manifestLine.audio = {
+      ...reusableTake,
+      filePath: audioPath
+    };
+    manifest.lines = [manifestLine];
+    refreshManifestTiming(manifest);
+
+    const provider = lipSyncModelForLine(manifestLine);
+    if (!lipSyncProviderAvailable(provider, manifestLine, manifest)) {
+      const providerConfig = lipSyncProviderConfig(provider, { line: manifestLine, manifest });
+      const message = `${providerConfig.label} is not configured for line ${line.index}. ${lipSyncProviderUnavailableMessage(provider, manifestLine, manifest)}`;
+      const updated = normalizeEpisode({
+        ...current,
+        productionMap: nextMap.map((item, index) =>
+          index === lineIndex
+            ? normalizeProductionLine({ ...item, videoStatus: "failed", videoError: message }, index)
+            : normalizeProductionLine(item, index)
+        ),
+        jobLog: appendLog(current.jobLog, `Shot video not started for line ${line.index}: ${message}`),
+        updatedAt: new Date().toISOString()
+      });
+      await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+      return res.status(409).json({ error: message, episode: updated, line: updated.productionMap[lineIndex] });
+    }
+
+    await renderLipSyncClipsForManifest({ episode: current, manifest, tempDir, forceRegenerate: true });
+    const videoTake = normalizeVideoTake(manifestLine.lipSyncTake || manifestLine.videoTake);
+    if (!videoTake?.localUrl) {
+      throw new Error(`Line ${line.index} did not produce a shot video.`);
+    }
+
+    const productionMap = nextMap.map((item, index) =>
+      index === lineIndex
+        ? normalizeProductionLine(
+            {
+              ...line,
+              audioTake: reusableTake,
+              videoStatus: "generated",
+              videoTake,
+              videoTakes: normalizeVideoTakes([videoTake, ...(line.videoTakes || [])], videoTake),
+              videoError: "",
+              videoWarning: ""
+            },
+            index
+          )
+        : normalizeProductionLine(item, index)
+    );
+    const updated = normalizeEpisode({
+      ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} shot video changed after render review.`),
+      productionMap,
+      jobLog: appendLog(current.jobLog, `Shot video generated for line ${line.index}.`),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.json({ episode: updated, line: updated.productionMap[lineIndex] });
+  } catch (error) {
+    const message = cleanErrorMessage(error);
+    const productionMap = nextMap.map((item, index) =>
+      index === lineIndex
+        ? normalizeProductionLine(
+            {
+              ...line,
+              videoStatus: "failed",
+              videoTake: line.videoTake || null,
+              videoTakes: line.videoTakes || [],
+              videoError: message
+            },
+            index
+          )
+        : normalizeProductionLine(item, index)
+    );
+    const updated = normalizeEpisode({
+      ...current,
+      approvals: resetRenderApproval(current.approvals, `Line ${line.index} shot video failed after render review.`),
+      productionMap,
+      jobLog: appendLog(current.jobLog, `Shot video failed for line ${line.index}: ${message}`),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.status(500).json({ error: message, episode: updated, line: updated.productionMap[lineIndex] });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+app.patch("/api/episodes/:id/dialogue-lines/:lineId/video-take", async (req, res) => {
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+
+  const lineIndex = (current.productionMap || []).findIndex((line) => line.id === req.params.lineId);
+  if (lineIndex < 0) {
+    return res.status(404).json({ error: "Production line not found." });
+  }
+
+  const requestedTakeId = cleanId(req.body?.takeId);
+  const requestedLocalUrl = String(req.body?.localUrl || "").trim();
+  const productionMap = (current.productionMap || []).map((line, index) => normalizeProductionLine(line, index));
+  const line = productionMap[lineIndex];
+  if (line.lineType === "insert") {
+    return res.status(400).json({ error: "Insert lines do not use dialogue lip-sync take selection." });
+  }
+
+  const takes = normalizeVideoTakes(line.videoTakes, line.videoTake);
+  const selectedTake = takes.find((take) => {
+    if (requestedTakeId && take.id === requestedTakeId) return true;
+    if (requestedLocalUrl && [take.localUrl, take.proxyLocalUrl, take.fileName].includes(requestedLocalUrl)) return true;
+    return false;
+  });
+  if (!selectedTake) {
+    return res.status(404).json({ error: `Video take was not found for line ${line.index}.` });
+  }
+  if (!videoTakeFilePath(selectedTake)) {
+    return res.status(409).json({ error: `The selected video take for line ${line.index} is missing from disk.` });
+  }
+
+  productionMap[lineIndex] = normalizeProductionLine(
+    {
+      ...line,
+      videoStatus: "generated",
+      videoTake: selectedTake,
+      videoTakes: normalizeVideoTakes(takes, selectedTake),
+      videoError: "",
+      videoWarning: selectedTake.warning || ""
+    },
+    lineIndex
+  );
+
+  const updated = normalizeEpisode({
+    ...current,
+    approvals: resetRenderApproval(current.approvals, `Line ${line.index} selected shot video take changed after render review.`),
+    productionMap,
+    jobLog: appendLog(current.jobLog, `Selected shot video take for line ${line.index}.`),
+    updatedAt: new Date().toISOString()
+  });
+  await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+  res.json({ episode: updated, line: updated.productionMap[lineIndex] });
 });
 
 app.post("/api/episodes/:id/approvals/:gateId", async (req, res) => {
@@ -977,6 +1403,9 @@ app.post("/api/episodes/:id/run", async (req, res) => {
 
   const updated = normalizeEpisode({
     ...current,
+    approvals: outputs.some((output) => ["preview_video", "audio_mix", "render_manifest"].includes(output.type))
+      ? resetRenderApproval(current.approvals, "Preview rebuilt after render review.")
+      : current.approvals,
     status:
       job.status === "waiting_for_approval"
         ? "waiting"
@@ -1005,7 +1434,8 @@ app.post("/api/episodes/:id/final-render", async (req, res) => {
   const show = shows.find((item) => item.id === current.showId) || shows[0];
 
   try {
-    const finalRender = await createFinalRender({ episode: current, show });
+    const regenerateVideos = req.body?.regenerateVideos !== false;
+    const finalRender = await createFinalRender({ episode: current, show, regenerateVideos });
     const lipSyncWarnings = finalRender.manifest?.lipSync?.warnings || [];
     const lipSyncStatus = Boolean(finalRender.manifest?.lipSync?.clips?.length)
       ? lipSyncWarnings.length
@@ -1024,13 +1454,15 @@ app.post("/api/episodes/:id/final-render", async (req, res) => {
       status: "final_render_ready",
       currentStage: "Final Render Ready",
       createdAt: new Date().toISOString(),
-      summary: `Final local render created.${lipSyncSummary} No publishing was attempted.`,
+      summary: `${regenerateVideos ? "Final local render created with regenerated shot videos." : "Final local render rebuilt from existing shot videos."}${lipSyncSummary} No publishing was attempted.`,
       steps: [
-        { id: "audio_mix", label: "Use approved audio mix", enabled: true, status: "rendered" },
+        { id: "audio_mix", label: "Build final audio mix from current shot audio", enabled: true, status: "rendered" },
         {
           id: "lipsync",
-          label: "Generate Fabric/Kling lip-sync clips",
-          enabled: Boolean(falApiKey) && !lipSyncDisabled(),
+          label: regenerateVideos
+            ? "Regenerate Fabric/Kling/Aurora/InfiniteTalk lip-sync clips"
+            : "Reuse existing lip-sync clips and generate missing clips",
+          enabled: Boolean(finalRender.manifest?.lipSync?.enabled),
           status: lipSyncStatus
         },
         { id: "visual_render", label: "Render final video", enabled: true, status: "rendered" },
@@ -1043,6 +1475,7 @@ app.post("/api/episodes/:id/final-render", async (req, res) => {
       ...current,
       status: "final_render_ready",
       currentStage: "Final Render Ready",
+      productionMap: finalRender.productionMap || current.productionMap,
       outputs: [...finalRender.outputs, ...(current.outputs || [])],
       jobLog: appendLog(current.jobLog, `${job.summary} Output: ${finalRender.video.localUrl}`),
       updatedAt: new Date().toISOString()
@@ -1060,11 +1493,11 @@ app.post("/api/episodes/:id/final-render", async (req, res) => {
       createdAt: new Date().toISOString(),
       summary: `Final render failed: ${message}`,
       steps: [
-        { id: "audio_mix", label: "Use approved audio mix", enabled: true, status: "checked" },
+        { id: "audio_mix", label: "Build final audio mix from current shot audio", enabled: true, status: "checked" },
         {
           id: "lipsync",
-          label: "Generate Fabric/Kling lip-sync clips",
-          enabled: Boolean(falApiKey) && !lipSyncDisabled(),
+          label: "Generate Fabric/Kling/Aurora/InfiniteTalk lip-sync clips",
+          enabled: !lipSyncDisabled(),
           status: "failed"
         },
         { id: "visual_render", label: "Render final video", enabled: true, status: "blocked" },
@@ -1185,6 +1618,96 @@ app.post("/api/episodes/:id/finishing/music", async (req, res) => {
     const updated = normalizeEpisode({
       ...current,
       jobLog: appendLog(current.jobLog, `ElevenLabs music generation failed: ${message}`),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.status(400).json({ error: message, episode: updated });
+  }
+});
+
+app.post("/api/episodes/:id/finishing/laugh-track", async (req, res) => {
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+  if (!elevenLabsApiKey) {
+    return res.status(400).json({ error: "ElevenLabs API key is not configured." });
+  }
+
+  try {
+    const laughTrack = await generateElevenLaughTrackLayer({ episode: current, brief: req.body || {} });
+    const generatedLayers = Array.isArray(laughTrack.layers) && laughTrack.layers.length
+      ? laughTrack.layers
+      : [laughTrack.layer].filter(Boolean);
+    const currentLayers = normalizeFinishingLayers(current.drafts?.finishingLayers);
+    const updated = normalizeEpisode({
+      ...current,
+      drafts: {
+        ...(current.drafts || {}),
+        finishingLayers: [...currentLayers, ...generatedLayers]
+      },
+      outputs: [laughTrack.output, ...(current.outputs || [])],
+      jobLog: appendLog(
+        current.jobLog,
+        generatedLayers.length > 1
+          ? `Generated ElevenLabs laugh track and placed ${generatedLayers.length} cues.`
+          : `Generated ElevenLabs laugh track layer: ${generatedLayers[0]?.fileName || laughTrack.output.fileName}.`
+      ),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.json({ episode: updated, layer: generatedLayers[0] || null, layers: generatedLayers, output: laughTrack.output });
+  } catch (error) {
+    const message = cleanErrorMessage(error);
+    const updated = normalizeEpisode({
+      ...current,
+      jobLog: appendLog(current.jobLog, `ElevenLabs laugh track generation failed: ${message}`),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.status(400).json({ error: message, episode: updated });
+  }
+});
+
+app.post("/api/episodes/:id/finishing/applause-track", async (req, res) => {
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+  if (!elevenLabsApiKey) {
+    return res.status(400).json({ error: "ElevenLabs API key is not configured." });
+  }
+
+  try {
+    const applauseTrack = await generateElevenApplauseTrackLayer({ episode: current, brief: req.body || {} });
+    const generatedLayers = Array.isArray(applauseTrack.layers) && applauseTrack.layers.length
+      ? applauseTrack.layers
+      : [applauseTrack.layer].filter(Boolean);
+    const currentLayers = normalizeFinishingLayers(current.drafts?.finishingLayers);
+    const updated = normalizeEpisode({
+      ...current,
+      drafts: {
+        ...(current.drafts || {}),
+        finishingLayers: [...currentLayers, ...generatedLayers]
+      },
+      outputs: [applauseTrack.output, ...(current.outputs || [])],
+      jobLog: appendLog(
+        current.jobLog,
+        generatedLayers.length > 1
+          ? `Generated ElevenLabs applause track and placed ${generatedLayers.length} cues.`
+          : `Generated ElevenLabs applause track layer: ${generatedLayers[0]?.fileName || applauseTrack.output.fileName}.`
+      ),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.json({ episode: updated, layer: generatedLayers[0] || null, layers: generatedLayers, output: applauseTrack.output });
+  } catch (error) {
+    const message = cleanErrorMessage(error);
+    const updated = normalizeEpisode({
+      ...current,
+      jobLog: appendLog(current.jobLog, `ElevenLabs applause track generation failed: ${message}`),
       updatedAt: new Date().toISOString()
     });
     await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
@@ -1412,6 +1935,9 @@ app.post("/api/episodes/:id/youtube/upload-draft", async (req, res) => {
       publishNotes: uploadResult.metadata?.youtube?.publishNotes || "",
       thumbnailSet: Boolean(uploadResult.thumbnailSet),
       thumbnailWarning: uploadResult.thumbnailWarning || "",
+      shortsThumbnailApplied: Boolean(uploadResult.shortsThumbnailApplied),
+      shortsThumbnailFrameSeconds: uploadResult.shortsThumbnailFrameSeconds || 0,
+      uploadVideoFileName: uploadResult.uploadVideoFileName || "",
       createdAt: uploadResult.createdAt
     };
     const updated = normalizeEpisode({
@@ -1419,7 +1945,15 @@ app.post("/api/episodes/:id/youtube/upload-draft", async (req, res) => {
       outputs: [output, ...(episodeForUpload.outputs || []).filter((item) => item.type !== "youtube_upload")],
       jobLog: appendLog(
         episodeForUpload.jobLog,
-        `Uploaded private YouTube draft: ${uploadResult.watchUrl}${uploadResult.thumbnailWarning ? ` Thumbnail warning: ${uploadResult.thumbnailWarning}` : ""}`
+        `Uploaded private YouTube draft: ${uploadResult.watchUrl}${
+          uploadResult.metadata?.youtube?.shortsThumbnail
+            ? uploadResult.shortsThumbnailApplied
+              ? ` Shorts thumbnail frame added (${uploadResult.shortsThumbnailFrameSeconds || shortsThumbnailFrameSeconds}s).`
+              : " Shorts thumbnail frame was requested but not confirmed."
+            : ""
+        }${
+          uploadResult.thumbnailWarning ? ` Thumbnail warning: ${uploadResult.thumbnailWarning}` : ""
+        }`
       ),
       updatedAt: new Date().toISOString()
     });
@@ -1430,9 +1964,17 @@ app.post("/api/episodes/:id/youtube/upload-draft", async (req, res) => {
       status: "youtube_private_draft_ready",
       currentStage: "YouTube Private Draft Ready",
       createdAt: output.createdAt,
-      summary: `Private YouTube draft uploaded. Video ID: ${uploadResult.videoId}`,
+      summary: `Private YouTube draft uploaded. Video ID: ${uploadResult.videoId}${
+        uploadResult.shortsThumbnailApplied ? " Shorts thumbnail frame added." : ""
+      }`,
       steps: [
         { id: "youtube_video", label: "Upload video as private draft", enabled: true, status: "uploaded" },
+        {
+          id: "youtube_shorts_thumbnail",
+          label: "Add Shorts thumbnail frame",
+          enabled: Boolean(uploadResult.metadata?.youtube?.shortsThumbnail),
+          status: uploadResult.shortsThumbnailApplied ? "uploaded" : "skipped"
+        },
         { id: "youtube_thumbnail", label: "Set thumbnail", enabled: true, status: uploadResult.thumbnailSet ? "uploaded" : "warning" }
       ]
     };
@@ -1869,7 +2411,8 @@ function normalizeShow(show) {
     },
     production: {
       ...(show.production || {}),
-      defaultLipSyncModel: sanitizeLipSyncModel(show.production?.defaultLipSyncModel || "fabric"),
+      defaultLipSyncModel: sanitizeLipSyncModel(show.production?.defaultLipSyncModel || defaultLipSyncModel()),
+      infiniteTalkBackend: sanitizeInfiniteTalkBackend(show.production?.infiniteTalkBackend || defaultInfiniteTalkBackend()),
       defaultExpressiveBodyMotion: Boolean(show.production?.defaultExpressiveBodyMotion),
       defaultInsertTrimSeconds: Number(show.production?.defaultInsertTrimSeconds || insertTrimDefaultSeconds)
     },
@@ -1949,6 +2492,84 @@ function normalizeEpisode(episode) {
     outputs: Array.isArray(episode.outputs) ? episode.outputs : [],
     jobLog: Array.isArray(episode.jobLog) ? episode.jobLog.slice(0, 25) : []
   };
+}
+
+function duplicateEpisodeForNextScript({ episode, show, episodes = [], title = "" }) {
+  const source = normalizeEpisode(episode);
+  const now = new Date().toISOString();
+  const reusableAssets = source.assets.filter((asset) => asset.type !== "script");
+  const assetIdMap = new Map(reusableAssets.map((asset) => [asset.id, randomUUID()]));
+  const assets = reusableAssets.map((asset) =>
+    normalizeAsset({
+      ...asset,
+      id: assetIdMap.get(asset.id) || randomUUID(),
+      metadata: remapDuplicateAssetMetadata(asset.metadata, assetIdMap),
+      createdAt: now
+    })
+  );
+  const automation = {
+    ...automationDefaults,
+    ...source.automation
+  };
+
+  return normalizeEpisode({
+    ...source,
+    id: randomUUID(),
+    title: String(title || "").trim() || nextEpisodeDuplicateTitle(source.title, episodes),
+    status: "draft",
+    currentStage: "Script",
+    createdAt: now,
+    updatedAt: now,
+    scriptText: "",
+    automation,
+    approvals: buildApprovals(automation),
+    assets,
+    productionMap: [],
+    productionMapEditedAt: "",
+    plan: emptyPlan(),
+    drafts: emptyDrafts(show || defaultShow()),
+    outputs: [],
+    jobLog: appendLog([], `Duplicated setup from "${source.title}". Add a new script to build this episode.`)
+  });
+}
+
+function nextEpisodeDuplicateTitle(title = "", episodes = []) {
+  const existingTitles = new Set(
+    (Array.isArray(episodes) ? episodes : [])
+      .map((episode) => String(episode?.title || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const base = String(title || "Untitled Episode").trim() || "Untitled Episode";
+  let candidate = incrementEpisodeTitle(base) || `${base} Copy`;
+  let copyNumber = 2;
+  for (let guard = 0; existingTitles.has(candidate.toLowerCase()) && guard < 100; guard += 1) {
+    const nextCandidate = incrementEpisodeTitle(candidate);
+    if (nextCandidate && nextCandidate !== candidate) {
+      candidate = nextCandidate;
+    } else {
+      candidate = `${base} Copy ${copyNumber}`;
+      copyNumber += 1;
+    }
+  }
+  return candidate;
+}
+
+function incrementEpisodeTitle(title = "") {
+  const text = String(title || "").trim();
+  const matches = [...text.matchAll(/\b(episode\s*)(\d+)\b/gi)];
+  const match = matches[matches.length - 1];
+  if (!match) return "";
+  const digits = match[2];
+  const nextNumber = String((Number(digits) || 0) + 1).padStart(digits.length, "0");
+  return `${text.slice(0, match.index)}${match[1]}${nextNumber}${text.slice(match.index + match[0].length)}`;
+}
+
+function remapDuplicateAssetMetadata(metadata = {}, idMap = new Map()) {
+  const remapped = {};
+  for (const [key, value] of Object.entries(metadata || {})) {
+    remapped[key] = typeof value === "string" && idMap.has(value) ? idMap.get(value) : value;
+  }
+  return remapped;
 }
 
 function defaultShow() {
@@ -2038,6 +2659,7 @@ function emptyDrafts(show) {
       notifySubscribers: Boolean(show.platforms?.youtube?.notifySubscribers),
       madeForKids: Boolean(show.platforms?.youtube?.madeForKids),
       containsSyntheticMedia: show.platforms?.youtube?.containsSyntheticMedia !== false,
+      shortsThumbnail: false,
       plannedPublishAt: "",
       publishNotes: "",
       readyToPublish: false,
@@ -2160,7 +2782,8 @@ function createProductionMap({ scriptText, show, format = show?.shortFormat, ass
         audioTags: line.audioTags || previous?.audioTags || "",
         expressiveBodyMotion:
           previous?.expressiveBodyMotion ?? Boolean(show.production?.defaultExpressiveBodyMotion),
-        lipSyncModel: previous?.lipSyncModel || show.production?.defaultLipSyncModel || "fabric",
+        lipSyncModel: previous?.lipSyncModel || previous?.lipSyncModelOverride || "",
+        lipSyncModelOverride: previous?.lipSyncModelOverride || "",
         shotRole,
         assetId,
         maskAssetId,
@@ -2172,6 +2795,7 @@ function createProductionMap({ scriptText, show, format = show?.shortFormat, ass
         estimatedSeconds: isInsert ? estimateInsertSeconds(line.text) : estimateLineSeconds(line.text, show),
         videoStatus: previous?.videoStatus || "pending",
         videoTake: previous?.videoTake || null,
+        videoTakes: previous?.videoTakes || (previous?.videoTake ? [previous.videoTake] : []),
         videoInSeconds: previous?.videoInSeconds || 0,
         videoOutSeconds: previous?.videoOutSeconds || 0
       },
@@ -2339,6 +2963,7 @@ function isExplicitDialogueSpeakerLabel(rawLabel, speaker) {
 function normalizeProductionLine(line, index = 0) {
   const lineIndex = Number(line.index);
   const maskAssetId = cleanId(line.maskAssetId);
+  const videoTake = normalizeVideoTake(line.videoTake);
   return {
     id: cleanId(line.id) || `line-${index + 1}`,
     index: Number.isFinite(lineIndex) && lineIndex > 0 ? lineIndex : index + 1,
@@ -2349,7 +2974,8 @@ function normalizeProductionLine(line, index = 0) {
     text: String(line.text || "").trim(),
     audioTags: sanitizeAudioTags(line.audioTags),
     expressiveBodyMotion: Boolean(line.expressiveBodyMotion),
-    lipSyncModel: sanitizeLipSyncModel(line.lipSyncModel),
+    lipSyncModel: sanitizeOptionalLipSyncModel(line.lipSyncModel),
+    lipSyncModelOverride: sanitizeOptionalLipSyncModel(line.lipSyncModelOverride),
     shotRole: sanitizeShotRole(line.shotRole || "character_one_shot"),
     assetId: cleanId(line.assetId),
     maskAssetId,
@@ -2358,10 +2984,17 @@ function normalizeProductionLine(line, index = 0) {
     audioStatus: sanitizeAudioStatus(line.audioStatus),
     audioTake: normalizeAudioTake(line.audioTake),
     videoStatus: sanitizeVideoStatus(line.videoStatus),
-    videoTake: normalizeVideoTake(line.videoTake),
+    videoTake,
+    videoTakes: normalizeVideoTakes(line.videoTakes, videoTake),
+    videoError: compactText(String(line.videoError || "").trim(), 600),
+    videoWarning: compactText(String(line.videoWarning || "").trim(), 600),
     insertVideoMode: sanitizeInsertVideoMode(line.insertVideoMode),
     insertEndAssetId: cleanId(line.insertEndAssetId),
     videoPrompt: String(line.videoPrompt || "").trim(),
+    lipSyncPromptOverride: compactText(String(line.lipSyncPromptOverride || "").trim(), lipSyncFullPromptMaxLength),
+    lipSyncFullPromptOverride: compactText(String(line.lipSyncFullPromptOverride || "").trim(), lipSyncFullPromptMaxLength),
+    lipSyncInputPromptOverride: compactText(String(line.lipSyncInputPromptOverride || "").trim(), lipSyncInputPromptMaxLength),
+    lipSyncInputPromptLocked: line.lipSyncInputPromptLocked !== false,
     videoInSeconds: Math.max(0, roundSeconds(line.videoInSeconds)),
     videoOutSeconds: Math.max(0, roundSeconds(line.videoOutSeconds)),
     notes: String(line.notes || "").trim(),
@@ -2429,7 +3062,7 @@ function sanitizeAudioStatus(status) {
 }
 
 function sanitizeVideoStatus(status) {
-  return ["pending", "generated", "approved", "hold", "failed"].includes(status) ? status : "pending";
+  return ["pending", "generated", "cached", "approved", "hold", "failed"].includes(status) ? status : "pending";
 }
 
 function sanitizeInsertVideoMode(mode) {
@@ -2443,7 +3076,22 @@ function sanitizeInsertVideoMode(mode) {
 function sanitizeLipSyncModel(model) {
   const value = String(model || "").trim().toLowerCase();
   if (["kling", "fal-kling-avatar", "kling-avatar"].includes(value)) return "kling";
+  if (["aurora", "creatify", "creatify-aurora", "fal-aurora", "fal-ai/creatify/aurora"].includes(value)) return "aurora";
+  if (["infinitalk", "infinite-talk", "infinite talk", "fal-infinitalk", "fal-ai/infinitalk"].includes(value)) return "infinitalk";
   return "fabric";
+}
+
+function sanitizeOptionalLipSyncModel(model) {
+  const value = String(model || "").trim().toLowerCase();
+  if (!value || ["default", "inherit", "visual-default", "cast-default", "none"].includes(value)) return "";
+  return sanitizeLipSyncModel(value);
+}
+
+function sanitizeInfiniteTalkBackend(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["comfyui", "comfy-ui", "comfy", "comfy ui"].includes(normalized)) return "comfyui";
+  if (["local", "localhost", "self-hosted", "self_hosted", "offline"].includes(normalized)) return "local";
+  return "fal";
 }
 
 function normalizeAudioTake(take) {
@@ -2472,6 +3120,10 @@ function normalizeVideoTake(take) {
   const fileName = path.basename(String(take.fileName || localUrl.split("/").pop() || "").trim());
   const proxyLocalUrl = String(take.proxyLocalUrl || "").trim();
   const proxyFileName = path.basename(String(take.proxyFileName || proxyLocalUrl.split("/").pop() || "").trim());
+  const width = Math.max(0, Math.round(Number(take.width) || 0));
+  const height = Math.max(0, Math.round(Number(take.height) || 0));
+  const resolution = String(take.resolution || (width && height ? `${width}x${height}` : "")).trim();
+  const aspectRatio = String(take.aspectRatio || (width && height ? (width > height ? "16:9" : "9:16") : "")).trim();
   if (!localUrl && !fileName) return null;
   return {
     id: cleanId(take.id) || randomUUID(),
@@ -2487,8 +3139,27 @@ function normalizeVideoTake(take) {
     durationSeconds: roundSeconds(take.durationSeconds),
     signature: String(take.signature || "").trim(),
     source: String(take.source || "").trim(),
+    width,
+    height,
+    resolution,
+    aspectRatio,
     generatedAt: String(take.generatedAt || "").trim()
   };
+}
+
+function normalizeVideoTakes(takes = [], activeTake = null) {
+  const normalizedTakes = [];
+  const seen = new Set();
+  const sourceTakes = Array.isArray(takes) ? takes : [];
+  for (const candidate of [...sourceTakes, activeTake]) {
+    const take = normalizeVideoTake(candidate);
+    if (!take) continue;
+    const key = take.id || take.localUrl || take.proxyLocalUrl || take.fileName;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalizedTakes.push(take);
+  }
+  return normalizedTakes.slice(0, 24);
 }
 
 function productionLineKey(line) {
@@ -2719,6 +3390,13 @@ function isGuestNameToken(token) {
       "CENTER",
       "MIDDLE",
       "MID",
+      "VERT",
+      "VERTICAL",
+      "PORTRAIT",
+      "HORZ",
+      "HORIZ",
+      "HORIZONTAL",
+      "LANDSCAPE",
       "TABLE",
       "ROOM",
       "CLUBHOUSE",
@@ -2913,8 +3591,7 @@ function createDrafts({ episode, show, plan, scriptText }) {
 }
 
 async function createPipelineJob({ episode, show }) {
-  const blockedGate = preRenderBlockedGate(episode.approvals);
-  const canContinue = !blockedGate || blockedGate.status === "auto";
+  const blockedGate = null;
   const steps = [
     { id: "parse", label: "Parse script", enabled: show.automation.parseScript },
     { id: "voice", label: "Generate audio", enabled: show.automation.generateVoices },
@@ -2934,30 +3611,25 @@ async function createPipelineJob({ episode, show }) {
     createdAt: report.createdAt
   }];
 
-  if (!canContinue && blockedGate) {
-    return {
-      report,
-      outputs,
-      job: {
-      id: randomUUID(),
-      episodeId: episode.id,
-      showId: show.id,
-      status: "waiting_for_approval",
-      currentStage: blockedGate.stage,
-      createdAt: new Date().toISOString(),
-      summary: `Local test complete. Waiting for ${blockedGate.title} approval. No publishing was attempted.`,
-      steps: steps.map((step) => ({ ...step, status: step.enabled ? "waiting" : "manual" }))
-      }
-    };
-  }
-
   let preview = null;
+  let finalRender = null;
   let productionMap = null;
   if (report.renderReady) {
     preview = await createLocalPreview({ previewId: reportId, episode, show });
     report = await attachPreviewToReport(report, preview);
     outputs.unshift(...preview.outputs);
     productionMap = attachAudioTakesToProductionMap(episode.productionMap, preview.manifest.lines);
+
+    if (show.automation.renderEpisode) {
+      const episodeForFinal = normalizeEpisode({
+        ...episode,
+        productionMap,
+        outputs: [...outputs, ...(episode.outputs || [])]
+      });
+      finalRender = await createFinalRender({ episode: episodeForFinal, show, regenerateVideos: true });
+      outputs.unshift(...finalRender.outputs);
+      productionMap = finalRender.productionMap || productionMap;
+    }
   }
 
   return {
@@ -2968,19 +3640,21 @@ async function createPipelineJob({ episode, show }) {
     id: randomUUID(),
     episodeId: episode.id,
     showId: show.id,
-    status: report.overall === "fail" ? "blocked" : preview?.video ? "local_preview_ready" : "local_test_passed",
-    currentStage: preview?.video ? "Preview Ready" : report.renderReady ? "Ready for Render Integration" : "Package Review",
+    status: report.overall === "fail" ? "blocked" : finalRender?.video ? "final_render_ready" : preview?.video ? "local_preview_ready" : "local_test_passed",
+    currentStage: finalRender?.video ? "Final Render Ready" : preview?.video ? "Preview Ready" : report.renderReady ? "Ready for Render Integration" : "Package Review",
     createdAt: new Date().toISOString(),
     summary:
       report.overall === "fail"
         ? "Local test found required fixes. No publishing was attempted."
-        : preview?.video
+        : finalRender?.video
+          ? "Final local render created by automation. No publishing was attempted."
+          : preview?.video
           ? "Local preview rendered. No publishing was attempted."
           : "Local test passed for current NewtBuilder workflow. No publishing was attempted.",
     steps: steps.map((step) => ({
       ...step,
       status:
-        step.id === "render" && preview?.video
+        step.id === "render" && (finalRender?.video || preview?.video)
           ? "rendered"
           : step.id === "youtube" || step.id === "marketing"
             ? "local-only"
@@ -3006,7 +3680,10 @@ async function writeLocalBuildReport({ reportId, episode, show, blockedGate }) {
     roleCounts[role] = (roleCounts[role] || 0) + 1;
   }
   const characters = Array.isArray(show.characters) ? show.characters : [];
-  const format = normalizeShortFormat(show?.shortFormat || episode.format);
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(episode.format || {})
+  });
   const voiceCount = characters.filter((character) => String(character.voiceId || "").trim()).length;
   const approvals = Array.isArray(episode.approvals) ? episode.approvals : [];
   const pendingPreRenderApprovals = approvals.filter(
@@ -3089,15 +3766,17 @@ async function writeLocalBuildReport({ reportId, episode, show, blockedGate }) {
     ),
     buildCheck(
       "approvals",
-      "Pre-render approval gates are clear",
-      pendingPreRenderApprovals.length === 0,
-      pendingPreRenderApprovals.length ? `${pendingPreRenderApprovals.length} pre-render approvals still need attention` : "Ready to render locally"
+      "Approval gates",
+      true,
+      pendingPreRenderApprovals.length
+        ? `${pendingPreRenderApprovals.length} pre-render approval${pendingPreRenderApprovals.length === 1 ? "" : "s"} pending; automation can still render locally`
+        : "Approvals are clear"
     ),
     buildCheck(
       "render_review",
       "Episode Render approval records preview review",
-      renderApproved,
-      renderApproved ? "Preview review approval is complete." : "Approve Episode Render after watching the local preview.",
+      true,
+      renderApproved ? "Preview review approval is complete." : "Preview approval is optional before local render.",
       "warning"
     ),
     buildCheck(
@@ -3312,6 +3991,9 @@ async function createLocalPreview({ previewId, episode, show, reuseOnly = false,
       name: video.fileName,
       localUrl: video.localUrl,
       createdAt,
+      width: video.width,
+      height: video.height,
+      resolution: video.resolution,
       durationSeconds: video.durationSeconds
     });
   }
@@ -3319,13 +4001,20 @@ async function createLocalPreview({ previewId, episode, show, reuseOnly = false,
   return { manifest: stripPrivateManifestFields(manifest), video, outputs };
 }
 
-async function createFinalRender({ episode, show }) {
+async function createFinalRender({ episode, show, regenerateVideos = true }) {
   const renderId = randomUUID();
   const createdAt = new Date().toISOString();
-  const manifest = buildRenderManifest({ previewId: renderId, episode, show, createdAt });
+  const manifest = buildRenderManifest({
+    previewId: renderId,
+    episode,
+    show,
+    createdAt,
+    reuseExistingVideoTakes: !regenerateVideos
+  });
+  const recoveredAudioTakes = new Map();
   manifest.mode = "local-production-render";
   manifest.renderNote =
-    "Final local render with approved audio and per-shot Fabric/Kling lip-sync clips when fal is configured. No publishing was attempted.";
+    "Final local render with approved audio and per-shot Fabric/Kling/Aurora/InfiniteTalk lip-sync clips when their selected backend is configured. No publishing was attempted.";
   const audioDir = path.join(outputsDir, "final-audio", renderId);
   const manifestDir = path.join(outputsDir, "render-manifests");
   const tempDir = path.join(outputsDir, "tmp", `final-${renderId}`);
@@ -3336,7 +4025,14 @@ async function createFinalRender({ episode, show }) {
   ]);
 
   for (const line of manifest.lines) {
-    const reusableTake = reusableAudioTakeForLine(line);
+    let reusableTake = reusableAudioTakeForLine(line);
+    if (!reusableTake) {
+      reusableTake = await recoverAudioTakeForLineFromManifests({ episode, line });
+      if (reusableTake) {
+        line.audioTake = reusableTake;
+        recoveredAudioTakes.set(line.id, reusableTake);
+      }
+    }
     if (!reusableTake) {
       throw new Error(`Audio review clip is missing or stale for line ${line.index}. Rebuild audio before final render.`);
     }
@@ -3363,7 +4059,12 @@ async function createFinalRender({ episode, show }) {
       .map((line) => `Line ${line.index}: ${line.audio.warning}`)
   };
 
-  await renderLipSyncClipsForManifest({ episode, manifest, tempDir });
+  await renderLipSyncClipsForManifest({
+    episode,
+    manifest,
+    tempDir,
+    forceRegenerate: regenerateVideos
+  });
   const video = await renderFinalVideo({ renderId, manifest, mixPath });
   manifest.video = video;
 
@@ -3376,6 +4077,7 @@ async function createFinalRender({ episode, show }) {
   return {
     manifest: stripPrivateManifestFields(manifest),
     video,
+    productionMap: attachAudioTakesToProductionMap(episode.productionMap, manifest.lines),
     outputs: [
       {
         id: `${renderId}-final-video`,
@@ -3383,6 +4085,9 @@ async function createFinalRender({ episode, show }) {
         name: video.fileName,
         localUrl: video.localUrl,
         createdAt,
+        width: video.width,
+        height: video.height,
+        resolution: video.resolution,
         durationSeconds: video.durationSeconds
       },
       {
@@ -3403,12 +4108,16 @@ async function createFinalRender({ episode, show }) {
   };
 }
 
-function buildRenderManifest({ previewId, episode, show, createdAt }) {
-  const format = normalizeShortFormat(show?.shortFormat || episode.format);
+function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistingVideoTakes = false }) {
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(episode.format || {})
+  });
   const { width, height } = parseResolution(format.resolution, format.aspectRatio);
   const assets = Array.isArray(episode.assets) ? episode.assets.map(normalizeAsset) : [];
   const assetById = new Map(assets.map((asset) => [asset.id, asset]));
   const characters = new Map((show.characters || []).map((character) => [character.id, character]));
+  const infiniteTalkBackend = infiniteTalkBackendForShow(show);
   let cursor = 0;
 
   const lines = normalizeProductionMapForFormat(episode.productionMap, format).map((line, index) => {
@@ -3417,7 +4126,15 @@ function buildRenderManifest({ previewId, episode, show, createdAt }) {
     const endImageAsset = assetById.get(normalized.insertEndAssetId);
     const maskAsset = resolveMaskAsset(normalized.maskAssetId, assetById);
     const maskPath = resolveAssetPath(maskAsset);
-    const videoTake = reusableVideoTakeForLine(normalized, imageAsset, endImageAsset, format);
+    const character = characters.get(normalized.characterId);
+    const visualLipSyncModel = sanitizeOptionalLipSyncModel(imageAsset?.metadata?.lipSyncModel);
+    const visualLipSyncPrompt = lineLipSyncInputPrompt(normalized, imageAsset);
+    const resolvedLipSyncModel = lipSyncModelForLine(normalized, { imageAsset, character, show });
+    const videoTake = reusableVideoTakeForLine(normalized, imageAsset, endImageAsset, format, maskAsset, {
+      show,
+      character,
+      reuseExistingVideoTake: reuseExistingVideoTakes
+    });
     const durationSeconds =
       normalized.lineType === "insert"
         ? insertPlaybackDurationSeconds(normalized, videoTake)
@@ -3430,12 +4147,16 @@ function buildRenderManifest({ previewId, episode, show, createdAt }) {
       index: normalized.index,
       lineType: normalized.lineType,
       speaker: normalized.speaker,
-      character: characters.get(normalized.characterId)?.name || normalized.speaker,
+      character: character?.name || normalized.speaker,
       voiceId: normalized.voiceId,
       text: normalized.text,
       audioTags: normalized.audioTags,
       expressiveBodyMotion: Boolean(normalized.expressiveBodyMotion),
-      lipSyncModel: sanitizeLipSyncModel(normalized.lipSyncModel),
+      lipSyncModel: resolvedLipSyncModel,
+      lipSyncModelOverride: sanitizeOptionalLipSyncModel(normalized.lipSyncModel || normalized.lipSyncModelOverride),
+      infiniteTalkBackend,
+      visualLipSyncModel,
+      visualLipSyncPrompt,
       audioStatus: normalized.audioStatus,
       audioTake: normalized.audioTake,
       videoStatus: normalized.videoStatus,
@@ -3443,6 +4164,10 @@ function buildRenderManifest({ previewId, episode, show, createdAt }) {
       insertVideoMode: normalized.insertVideoMode,
       insertEndAssetId: normalized.insertEndAssetId,
       videoPrompt: normalized.videoPrompt,
+      lipSyncPromptOverride: normalized.lipSyncPromptOverride,
+      lipSyncFullPromptOverride: normalized.lipSyncFullPromptOverride,
+      lipSyncInputPromptOverride: normalized.lipSyncInputPromptOverride,
+      lipSyncInputPromptLocked: normalized.lipSyncInputPromptLocked,
       videoInSeconds: normalized.videoInSeconds,
       videoOutSeconds: normalized.videoOutSeconds,
       shotRole: normalized.shotRole,
@@ -3454,7 +4179,9 @@ function buildRenderManifest({ previewId, episode, show, createdAt }) {
         ? {
             assetId: imageAsset.id,
             fileName: imageAsset.fileName,
-            localUrl: imageAsset.localUrl
+            localUrl: imageAsset.localUrl,
+            lipSyncModel: visualLipSyncModel,
+            lipSyncPrompt: visualLipSyncPrompt
           }
         : null,
       imagePath: resolveAssetPath(imageAsset),
@@ -3489,7 +4216,10 @@ function buildRenderManifest({ previewId, episode, show, createdAt }) {
     },
     show: {
       id: show.id,
-      name: show.name
+      name: show.name,
+      production: {
+        infiniteTalkBackend
+      }
     },
     format: {
       ...format,
@@ -3506,35 +4236,54 @@ function resolveMaskAsset(maskAssetId, assetById) {
   return assetById.get(maskAssetId) || null;
 }
 
-async function renderLipSyncClipsForManifest({ episode, manifest, tempDir }) {
+async function renderLipSyncClipsForManifest({
+  episode,
+  manifest,
+  tempDir,
+  allowStillFallback = allowLipSyncStillFallback(),
+  forceRegenerate = false
+}) {
   const dialogueLines = manifest.lines.filter((line) => line.lineType !== "insert");
+  const outputWidth = Number(manifest.format.width || parseResolution(manifest.format.resolution, manifest.format.aspectRatio).width);
+  const outputHeight = Number(manifest.format.height || parseResolution(manifest.format.resolution, manifest.format.aspectRatio).height);
+  const outputResolution = `${outputWidth}x${outputHeight}`;
   const selectedModels = [...new Set(dialogueLines.map((line) => lipSyncModelForLine(line)))];
+  const selectedBackends = [...new Set(dialogueLines
+    .filter((line) => lipSyncModelForLine(line) === "infinitalk")
+    .map((line) => infiniteTalkBackendForLine(line, manifest)))];
+  const disabledBySetting = lipSyncDisabled();
   manifest.lipSync = {
     provider: "per-shot",
-    enabled: Boolean(falApiKey) && !lipSyncDisabled(),
-    defaultModel: "fabric",
+    enabled: !disabledBySetting && dialogueLines.some((line) => lipSyncProviderAvailable(lipSyncModelForLine(line), line, manifest)),
+    defaultModel: selectedModels[0] || defaultLipSyncModel(),
     models: selectedModels,
+    infiniteTalkBackend: selectedBackends[0] || infiniteTalkBackendForLine({}, manifest),
+    infiniteTalkBackends: selectedBackends,
     mode: "image-audio-prompt",
     clips: [],
     warnings: []
   };
 
   if (!dialogueLines.length) return;
-  if (!manifest.lipSync.enabled) {
+  if (disabledBySetting) {
+    const message = "Lip-sync rendering is disabled by NEWTBUILDER_LIPSYNC_ENABLED.";
+    const missingReviewedClips = dialogueLines.filter((line) => !line.videoPath);
+    if (missingReviewedClips.length && !allowStillFallback) {
+      throw new Error(`${message} Set NEWTBUILDER_ALLOW_LIPSYNC_FALLBACK=true to render still/source media instead.`);
+    }
     manifest.lipSync.warnings.push(
-      falApiKey
-        ? "Lip-sync rendering is disabled by NEWTBUILDER_LIPSYNC_ENABLED."
-        : "fal API key is not configured; final render used clean stills without lip-sync."
+      missingReviewedClips.length ? message : `${message} Reusing reviewed shot video clips already recorded on the production map.`
     );
-    return;
+    if (missingReviewedClips.length) return;
   }
 
   for (const line of dialogueLines) {
     const provider = lipSyncModelForLine(line);
-    const outputFolder = provider === "kling" ? "kling-renders" : "fabric-renders";
-    const source = provider === "kling" ? "fal-kling-avatar" : "fal-fabric";
-    const modelId = provider === "kling" ? klingAvatarModelId() : fabricModelId();
-    const providerLabel = provider === "kling" ? "Kling avatar" : "Fabric";
+    const providerConfig = lipSyncProviderConfig(provider, { line, manifest });
+    const outputFolder = providerConfig.outputFolder;
+    const source = providerConfig.source;
+    const modelId = providerConfig.modelId;
+    const providerLabel = providerConfig.label;
     const lipSyncDir = path.join(outputsDir, outputFolder, episode.id);
     const rawDir = path.join(lipSyncDir, "raw");
     await Promise.all([
@@ -3552,9 +4301,43 @@ async function renderLipSyncClipsForManifest({ episode, manifest, tempDir }) {
       throw new Error(`Line ${line.index} needs a mask for the assigned wide shot.`);
     }
 
-    const prompt = provider === "kling" ? klingAvatarPromptForLine(line) : "";
+    const prompt = lipSyncPromptForLine(line, provider);
+    const existingTake = normalizeVideoTake(line.videoTake || line.lipSyncTake);
+    if (!forceRegenerate && line.videoPath && existingTake?.localUrl) {
+      const durationSeconds = (await probeDuration(line.videoPath)) || existingTake.durationSeconds || line.durationSeconds;
+      const take = normalizeVideoTake({
+        ...existingTake,
+        durationSeconds,
+        width: existingTake.width || outputWidth,
+        height: existingTake.height || outputHeight,
+        resolution: existingTake.resolution || outputResolution,
+        aspectRatio: existingTake.aspectRatio || manifest.format.aspectRatio || ""
+      });
+      line.lipSyncTake = take;
+      line.videoTake = take;
+      line.videoStatus = line.videoStatus === "failed" ? "cached" : line.videoStatus || "cached";
+      manifest.lipSync.clips.push({
+        lineIndex: line.index,
+        speaker: line.speaker,
+        localUrl: take.localUrl,
+        durationSeconds,
+        cached: true,
+        provider,
+        backend: providerConfig.backend || "",
+        model: take.model || modelId,
+        resolution: take.resolution || outputResolution,
+        aspectRatio: take.aspectRatio || manifest.format.aspectRatio || "",
+        masked: Boolean(line.needsMask && line.maskPath),
+        invertMask: Boolean(line.invertMask),
+        expressiveBodyMotion: Boolean(line.expressiveBodyMotion)
+      });
+      continue;
+    }
+
     const signature = lineLipSyncSignature(line, manifest.format, { provider, modelId, prompt });
-    const signatureHash = signatureHashFor(signature);
+    const signatureHash = forceRegenerate
+      ? `${signatureHashFor(signature)}-${randomUUID().slice(0, 8)}`
+      : signatureHashFor(signature);
     const lineLabel = `line-${String(line.index).padStart(3, "0")}-${safeFileSegment(line.speaker)}`;
     const fileName = `${lineLabel}-${signatureHash}.mp4`;
     const filePath = path.join(lipSyncDir, fileName);
@@ -3563,36 +4346,47 @@ async function renderLipSyncClipsForManifest({ episode, manifest, tempDir }) {
     const masked = Boolean(line.needsMask && line.maskPath);
     let durationSeconds = cachedDuration;
     let remoteUrl = "";
-    let cached = cachedDuration > 0;
+    let cached = !forceRegenerate && cachedDuration > 0;
 
     try {
       if (!cached) {
+        if (!lipSyncProviderAvailable(provider, line, manifest)) {
+          throw new Error(`${providerLabel} clip for line ${line.index} is not cached. ${lipSyncProviderUnavailableMessage(provider, line, manifest)}`);
+        }
         const rawPath = path.join(rawDir, `${lineLabel}-${signatureHash}-raw.mp4`);
         const lipSyncInputPath = masked
           ? await prepareLipSyncInputImage({ line, tempDir, signatureHash })
           : line.imagePath;
-        const lipSyncAudioPath = provider === "kling"
-          ? await prepareLipSyncAudio({ line, tempDir, signatureHash })
+        const lipSyncAudioPath = lipSyncMinimumAudioSeconds(provider) > 0
+          ? await prepareLipSyncAudio({ line, tempDir, signatureHash, provider })
           : line.audio.filePath;
-        const result = provider === "kling"
-          ? await runFalKlingAvatar({
-              imagePath: lipSyncInputPath,
-              audioPath: lipSyncAudioPath,
-              prompt,
-              line,
-              tempDir
-            })
-          : await runFalFabric({
-              imagePath: lipSyncInputPath,
-              audioPath: lipSyncAudioPath,
-              line,
-              tempDir
-            });
-        remoteUrl = falVideoUrl(result);
-        if (!remoteUrl) {
-          throw new Error(`${providerLabel} did not return a video URL for line ${line.index}.`);
+        const result = await runLipSyncProvider({
+          provider,
+          imagePath: lipSyncInputPath,
+          audioPath: lipSyncAudioPath,
+          prompt,
+          line,
+          format: manifest.format,
+          tempDir,
+          rawPath,
+          manifest
+        });
+        const localResultPath = localVideoPath(result);
+        if (localResultPath) {
+          const resolvedLocalResultPath = path.resolve(localResultPath);
+          if (!existsSync(resolvedLocalResultPath)) {
+            throw new Error(`${providerLabel} returned a local video path that does not exist for line ${line.index}.`);
+          }
+          if (resolvedLocalResultPath !== path.resolve(rawPath)) {
+            await copyFile(resolvedLocalResultPath, rawPath);
+          }
+        } else {
+          remoteUrl = falVideoUrl(result);
+          if (!remoteUrl) {
+            throw new Error(`${providerLabel} did not return a video URL for line ${line.index}.`);
+          }
+          await downloadRemoteFile(remoteUrl, rawPath, `${providerLabel} lip-sync clip`);
         }
-        await downloadRemoteFile(remoteUrl, rawPath, `${providerLabel} lip-sync clip`);
         const rawDurationSeconds = await probeDuration(rawPath);
         if (masked) {
           await compositeLipSyncClipWithMask({
@@ -3602,13 +4396,17 @@ async function renderLipSyncClipsForManifest({ episode, manifest, tempDir }) {
             outputPath: filePath,
             invertMask: line.invertMask,
             fps: Number(manifest.format.fps || 30),
-            durationSeconds: rawDurationSeconds || line.durationSeconds
+            durationSeconds: rawDurationSeconds || line.durationSeconds,
+            width: outputWidth,
+            height: outputHeight
           });
         } else {
           await normalizeLipSyncClip({
             sourcePath: rawPath,
             outputPath: filePath,
-            fps: Number(manifest.format.fps || 30)
+            fps: Number(manifest.format.fps || 30),
+            width: outputWidth,
+            height: outputHeight
           });
         }
         durationSeconds = await probeDuration(filePath);
@@ -3620,18 +4418,19 @@ async function renderLipSyncClipsForManifest({ episode, manifest, tempDir }) {
         localUrl,
         remoteUrl,
         model: modelId,
-        prompt: provider === "kling"
-          ? line.expressiveBodyMotion
-            ? "Expressive body motion enabled."
-            : "Minimal body motion enabled."
-          : "Fabric lip-sync.",
+        prompt: compactText(prompt || providerConfig.promptSummary, lipSyncPromptLengthForProvider(provider)),
         warning: "",
         durationSeconds,
         signature,
         source,
+        width: outputWidth,
+        height: outputHeight,
+        resolution: outputResolution,
+        aspectRatio: manifest.format.aspectRatio || "",
         generatedAt: cached ? "" : new Date().toISOString()
       });
       line.lipSyncTake = take;
+      line.videoTake = take;
       line.videoPath = filePath;
       line.videoStatus = cached ? "cached" : "generated";
       manifest.lipSync.clips.push({
@@ -3641,13 +4440,21 @@ async function renderLipSyncClipsForManifest({ episode, manifest, tempDir }) {
         durationSeconds,
         cached,
         provider,
+        backend: providerConfig.backend || "",
         model: modelId,
+        resolution: outputResolution,
+        aspectRatio: manifest.format.aspectRatio || "",
         masked,
         invertMask: Boolean(line.invertMask),
         expressiveBodyMotion: Boolean(line.expressiveBodyMotion)
       });
     } catch (error) {
       const message = compactText(String(error?.message || error || `Unknown ${providerLabel} error`).replace(/\s+/g, " "), 700);
+      if (!allowStillFallback) {
+        throw new Error(
+          `${providerLabel} lip-sync failed for line ${line.index}; rendering stopped before falling back to still/source media. ${message} Set NEWTBUILDER_ALLOW_LIPSYNC_FALLBACK=true to allow still fallback.`
+        );
+      }
       manifest.lipSync.warnings.push(`Line ${line.index}: ${providerLabel} failed; using the still image. ${message}`);
       line.videoPath = "";
       line.videoStatus = "lip_sync_failed";
@@ -3769,6 +4576,9 @@ async function renderPreviewVideo({ previewId, manifest, mixPath }) {
     type: "preview_video",
     fileName,
     localUrl: `/outputs/previews/${fileName}`,
+    width,
+    height,
+    resolution: `${width}x${height}`,
     durationSeconds: await probeDuration(outputPath)
   };
 }
@@ -3875,6 +4685,9 @@ async function renderFinalVideo({ renderId, manifest, mixPath }) {
     type: "final_video",
     fileName,
     localUrl: `/outputs/final-renders/${fileName}`,
+    width,
+    height,
+    resolution: `${width}x${height}`,
     durationSeconds: await probeDuration(outputPath)
   };
 }
@@ -3924,14 +4737,18 @@ async function generateFrameThumbnailCandidates({ episode, show, thumbnailBrief 
         height,
         variant
       });
+      const actualDimensions = await readImageDimensions(outputPath);
+      const outputWidth = actualDimensions.width || width;
+      const outputHeight = actualDimensions.height || height;
       outputs.push({
         id: `${runId}-${variant.id}`,
         type: "thumbnail_image",
         name: variant.label,
         fileName,
         localUrl: `/outputs/thumbnails/${episode.id}/${fileName}`,
-        width,
-        height,
+        width: outputWidth,
+        height: outputHeight,
+        resolution: `${outputWidth}x${outputHeight}`,
         sourceOutputId: sourceOutput.id || "",
         sourceOutputType: sourceOutput.type || "",
         timestampSeconds: roundSeconds(timestamp),
@@ -4002,14 +4819,18 @@ async function generateAiThumbnailCandidates({ episode, show, thumbnailBrief = {
       const fileName = `${safeFileSegment(episode.title)}-${runId.slice(0, 8)}-${variant.id}-ai.png`;
       const outputPath = path.join(thumbnailDir, fileName);
       await downloadRemoteFile(remoteUrl, outputPath, "AI thumbnail");
+      const actualDimensions = await readImageDimensions(outputPath);
+      const outputWidth = actualDimensions.width || result?.images?.[0]?.width || width;
+      const outputHeight = actualDimensions.height || result?.images?.[0]?.height || height;
       outputs.push({
         id: `${runId}-${variant.id}-ai`,
         type: "thumbnail_image",
         name: `${variant.label} AI`,
         fileName,
         localUrl: `/outputs/thumbnails/${episode.id}/${fileName}`,
-        width: result?.images?.[0]?.width || width,
-        height: result?.images?.[0]?.height || height,
+        width: outputWidth,
+        height: outputHeight,
+        resolution: `${outputWidth}x${outputHeight}`,
         sourceOutputId: sourceOutput?.id || "",
         sourceOutputType: sourceOutput?.type || "",
         prompt,
@@ -4168,6 +4989,473 @@ async function generateElevenVideoMusicLayer({ episode, brief = {} }) {
   return { layer, output };
 }
 
+async function generateElevenLaughTrackLayer({ episode, brief = {} }) {
+  const sourceOutput = latestFinalVideoOutput(episode);
+  const sourcePath = outputFilePath(sourceOutput);
+  if (!sourcePath) {
+    throw new Error("Render the final video before generating a laugh track.");
+  }
+
+  const sourceDuration = Number(sourceOutput.durationSeconds || (await probeDuration(sourcePath)) || 0);
+  const laughTrackId = randomUUID();
+  const laughTrackDir = path.join(outputsDir, "laugh-tracks");
+  await mkdir(laughTrackDir, { recursive: true });
+
+  const outputFormat = String(process.env.ELEVEN_LAUGH_TRACK_OUTPUT_FORMAT || process.env.ELEVEN_SOUND_EFFECTS_OUTPUT_FORMAT || "").trim();
+  const modelId =
+    String(process.env.ELEVEN_LAUGH_TRACK_MODEL_ID || process.env.ELEVEN_SOUND_EFFECTS_MODEL_ID || "eleven_text_to_sound_v2").trim() ||
+    "eleven_text_to_sound_v2";
+  const url = new URL("https://api.elevenlabs.io/v1/sound-generation");
+  if (outputFormat) url.searchParams.set("output_format", outputFormat);
+
+  const description = compactText(
+    String(
+      brief.description ||
+        "Warm studio audience laugh track for a late-night comedy monologue: natural laughs, small chuckles, no words, no applause."
+    ).trim(),
+    1000
+  );
+  const requestedDuration = clampNumber(brief.durationSeconds ?? Math.min(8, sourceDuration || 8), 0.5, 30);
+  const promptInfluence = clampNumber(brief.promptInfluence ?? 0.35, 0, 1);
+  const body = {
+    text: description,
+    duration_seconds: requestedDuration,
+    prompt_influence: promptInfluence,
+    model_id: modelId
+  };
+  if (Object.prototype.hasOwnProperty.call(brief, "loop")) {
+    body.loop = Boolean(brief.loop);
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": elevenLabsApiKey,
+      "Content-Type": "application/json",
+      Accept: audioMimeTypeForElevenOutputFormat(outputFormat)
+    },
+    body: JSON.stringify(body),
+    signal:
+      typeof AbortSignal !== "undefined" && AbortSignal.timeout
+        ? AbortSignal.timeout(Number(process.env.ELEVEN_LAUGH_TRACK_TIMEOUT_MS || process.env.ELEVEN_SOUND_EFFECTS_TIMEOUT_MS || 180000))
+        : undefined
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`ElevenLabs sound effects returned ${response.status}${detail ? `: ${compactText(detail, 180)}` : ""}`);
+  }
+
+  const contentType = String(response.headers.get("content-type") || audioMimeTypeForElevenOutputFormat(outputFormat));
+  const extension = extensionForGeneratedAudio({ contentType, outputFormat });
+  const fileName = `${safeFileSegment(episode.title)}-${laughTrackId.slice(0, 8)}-eleven-laugh-track.${extension}`;
+  const outputPath = path.join(laughTrackDir, fileName);
+  const audioBytes = Buffer.from(await response.arrayBuffer());
+  await writeFile(outputPath, audioBytes);
+
+  const audioDuration = Number((await probeDuration(outputPath)) || 0);
+  const autoPlace = brief.autoPlace !== false;
+  const maxCues = Math.round(clampNumber(brief.maxCues ?? 4, 1, 8));
+  const cueDuration = clampNumber(
+    brief.cueDurationSeconds ?? Math.min(2.4, audioDuration || requestedDuration),
+    0.5,
+    Math.max(0.5, audioDuration || requestedDuration)
+  );
+  const fallbackLayerDuration = Math.min(sourceDuration || audioDuration || requestedDuration, audioDuration || requestedDuration);
+  const placements = autoPlace
+    ? await laughTrackPlacementsForEpisode({
+        episode,
+        baseDuration: sourceDuration,
+        cueDuration,
+        maxCues
+      })
+    : [];
+  const effectivePlacements = placements.length
+    ? placements
+    : [
+        {
+          startSeconds: 0,
+          durationSeconds: autoPlace ? Math.min(cueDuration, fallbackLayerDuration) : fallbackLayerDuration,
+          lineIndex: 0,
+          reason: autoPlace ? "No punchline timing found; placed at the start." : "Manual placement."
+        }
+      ];
+  const layers = effectivePlacements.map((placement, index) =>
+    normalizeFinishingLayer({
+      id: `${laughTrackId}-laugh-track-layer-${index + 1}`,
+      type: "audio",
+      name: placement.lineIndex
+        ? `ElevenLabs laugh track - line ${placement.lineIndex}`
+        : "ElevenLabs laugh track",
+      fileName,
+      storedFileName: "",
+      mimeType: contentType,
+      localUrl: `/outputs/laugh-tracks/${fileName}`,
+      enabled: true,
+      startSeconds: placement.startSeconds,
+      durationSeconds: placement.durationSeconds,
+      sourceDurationSeconds: audioDuration || requestedDuration,
+      sourceFileSize: audioBytes.length,
+      volume: clampNumber(brief.volume ?? 0.22, 0, 2),
+      fadeInSeconds: 0.12,
+      fadeOutSeconds: 0.35,
+      createdAt: new Date().toISOString()
+    })
+  );
+  const output = {
+    id: `${laughTrackId}-laugh-track`,
+    type: "laugh_track",
+    name: "ElevenLabs laugh track",
+    fileName,
+    localUrl: `/outputs/laugh-tracks/${fileName}`,
+    sourceFinalVideoId: sourceOutput.id || "",
+    sourceFinalVideoName: sourceOutput.name || sourceOutput.fileName || "",
+    description,
+    modelId,
+    outputFormat: outputFormat || "default",
+    durationSeconds: audioDuration || requestedDuration,
+    promptInfluence,
+    autoPlaced: autoPlace,
+    placements: effectivePlacements,
+    createdAt: new Date().toISOString()
+  };
+  return { layer: layers[0] || null, layers, output };
+}
+
+async function generateElevenApplauseTrackLayer({ episode, brief = {} }) {
+  const sourceOutput = latestFinalVideoOutput(episode);
+  const sourcePath = outputFilePath(sourceOutput);
+  if (!sourcePath) {
+    throw new Error("Render the final video before generating applause.");
+  }
+
+  const sourceDuration = Number(sourceOutput.durationSeconds || (await probeDuration(sourcePath)) || 0);
+  const applauseTrackId = randomUUID();
+  const applauseTrackDir = path.join(outputsDir, "applause-tracks");
+  await mkdir(applauseTrackDir, { recursive: true });
+
+  const outputFormat = String(process.env.ELEVEN_APPLAUSE_TRACK_OUTPUT_FORMAT || process.env.ELEVEN_SOUND_EFFECTS_OUTPUT_FORMAT || "").trim();
+  const modelId =
+    String(process.env.ELEVEN_APPLAUSE_TRACK_MODEL_ID || process.env.ELEVEN_SOUND_EFFECTS_MODEL_ID || "eleven_text_to_sound_v2").trim() ||
+    "eleven_text_to_sound_v2";
+  const url = new URL("https://api.elevenlabs.io/v1/sound-generation");
+  if (outputFormat) url.searchParams.set("output_format", outputFormat);
+
+  const description = compactText(
+    String(
+      brief.description ||
+        "Warm studio audience applause for a late-night show: clean clapping, light cheering, no laughter, no words, no music."
+    ).trim(),
+    1000
+  );
+  const requestedDuration = clampNumber(brief.durationSeconds ?? Math.min(10, sourceDuration || 10), 0.5, 30);
+  const promptInfluence = clampNumber(brief.promptInfluence ?? 0.35, 0, 1);
+  const body = {
+    text: description,
+    duration_seconds: requestedDuration,
+    prompt_influence: promptInfluence,
+    model_id: modelId
+  };
+  if (Object.prototype.hasOwnProperty.call(brief, "loop")) {
+    body.loop = Boolean(brief.loop);
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": elevenLabsApiKey,
+      "Content-Type": "application/json",
+      Accept: audioMimeTypeForElevenOutputFormat(outputFormat)
+    },
+    body: JSON.stringify(body),
+    signal:
+      typeof AbortSignal !== "undefined" && AbortSignal.timeout
+        ? AbortSignal.timeout(Number(process.env.ELEVEN_APPLAUSE_TRACK_TIMEOUT_MS || process.env.ELEVEN_SOUND_EFFECTS_TIMEOUT_MS || 180000))
+        : undefined
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`ElevenLabs sound effects returned ${response.status}${detail ? `: ${compactText(detail, 180)}` : ""}`);
+  }
+
+  const contentType = String(response.headers.get("content-type") || audioMimeTypeForElevenOutputFormat(outputFormat));
+  const extension = extensionForGeneratedAudio({ contentType, outputFormat });
+  const fileName = `${safeFileSegment(episode.title)}-${applauseTrackId.slice(0, 8)}-eleven-applause-track.${extension}`;
+  const outputPath = path.join(applauseTrackDir, fileName);
+  const audioBytes = Buffer.from(await response.arrayBuffer());
+  await writeFile(outputPath, audioBytes);
+
+  const audioDuration = Number((await probeDuration(outputPath)) || 0);
+  const autoPlace = brief.autoPlace !== false;
+  const maxCues = Math.round(clampNumber(brief.maxCues ?? 3, 1, 8));
+  const cueDuration = clampNumber(
+    brief.cueDurationSeconds ?? Math.min(3.2, audioDuration || requestedDuration),
+    0.5,
+    Math.max(0.5, audioDuration || requestedDuration)
+  );
+  const fallbackLayerDuration = Math.min(sourceDuration || audioDuration || requestedDuration, audioDuration || requestedDuration);
+  const placements = autoPlace
+    ? await applauseTrackPlacementsForEpisode({
+        episode,
+        baseDuration: sourceDuration,
+        cueDuration,
+        maxCues
+      })
+    : [];
+  const effectivePlacements = placements.length
+    ? placements
+    : [
+        {
+          startSeconds: 0,
+          durationSeconds: autoPlace ? Math.min(cueDuration, fallbackLayerDuration) : fallbackLayerDuration,
+          lineIndex: 0,
+          reason: autoPlace ? "No applause timing found; placed at the start." : "Manual placement."
+        }
+      ];
+  const layers = effectivePlacements.map((placement, index) =>
+    normalizeFinishingLayer({
+      id: `${applauseTrackId}-applause-track-layer-${index + 1}`,
+      type: "audio",
+      name: placement.lineIndex
+        ? `ElevenLabs applause track - line ${placement.lineIndex}`
+        : "ElevenLabs applause track",
+      fileName,
+      storedFileName: "",
+      mimeType: contentType,
+      localUrl: `/outputs/applause-tracks/${fileName}`,
+      enabled: true,
+      startSeconds: placement.startSeconds,
+      durationSeconds: placement.durationSeconds,
+      sourceDurationSeconds: audioDuration || requestedDuration,
+      sourceFileSize: audioBytes.length,
+      volume: clampNumber(brief.volume ?? 0.24, 0, 2),
+      fadeInSeconds: 0.18,
+      fadeOutSeconds: 0.55,
+      createdAt: new Date().toISOString()
+    })
+  );
+  const output = {
+    id: `${applauseTrackId}-applause-track`,
+    type: "applause_track",
+    name: "ElevenLabs applause track",
+    fileName,
+    localUrl: `/outputs/applause-tracks/${fileName}`,
+    sourceFinalVideoId: sourceOutput.id || "",
+    sourceFinalVideoName: sourceOutput.name || sourceOutput.fileName || "",
+    description,
+    modelId,
+    outputFormat: outputFormat || "default",
+    durationSeconds: audioDuration || requestedDuration,
+    promptInfluence,
+    autoPlaced: autoPlace,
+    placements: effectivePlacements,
+    createdAt: new Date().toISOString()
+  };
+  return { layer: layers[0] || null, layers, output };
+}
+
+async function laughTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDuration = 2.4, maxCues = 4 }) {
+  const timeline = await laughTrackTimelineLinesForEpisode(episode);
+  const lines = timeline.lines;
+  if (!lines.length) return [];
+  const totalDuration = Number(baseDuration) || Number(timeline.totalSeconds) || 0;
+  return selectLaughTrackPlacements({
+    lines,
+    baseDuration: totalDuration,
+    cueDuration,
+    maxCues
+  });
+}
+
+async function applauseTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDuration = 3.2, maxCues = 3 }) {
+  const timeline = await laughTrackTimelineLinesForEpisode(episode);
+  const lines = timeline.lines;
+  if (!lines.length) return [];
+  const totalDuration = Number(baseDuration) || Number(timeline.totalSeconds) || 0;
+  return selectApplauseTrackPlacements({
+    lines,
+    baseDuration: totalDuration,
+    cueDuration,
+    maxCues
+  });
+}
+
+async function laughTrackTimelineLinesForEpisode(episode) {
+  const manifestOutputs = (Array.isArray(episode.outputs) ? episode.outputs : [])
+    .filter((output) => output.type === "final_render_manifest" && outputFilePath(output))
+    .sort((a, b) => Date.parse(b.createdAt || "") - Date.parse(a.createdAt || ""));
+
+  for (const output of manifestOutputs) {
+    const manifest = await readJson(outputFilePath(output), null);
+    const lines = Array.isArray(manifest?.lines) ? manifest.lines : [];
+    if (lines.length) {
+      return {
+        source: "final_render_manifest",
+        totalSeconds: Number(manifest.totalSeconds || manifest.video?.durationSeconds || 0),
+        lines: lines.map((line, index) => ({
+          id: line.id || `line-${index + 1}`,
+          index: Number(line.index) || index + 1,
+          lineType: sanitizeLineType(line.lineType),
+          text: String(line.text || "").trim(),
+          startSeconds: Math.max(0, roundSeconds(line.startSeconds)),
+          durationSeconds: Math.max(0.35, roundSeconds(line.durationSeconds || 0.35))
+        }))
+      };
+    }
+  }
+
+  let cursor = 0;
+  const fallbackLines = normalizeProductionMapForFormat(episode.productionMap, episode.format).map((line, index) => {
+    const durationSeconds = Math.max(0.35, Number(line.audioTake?.durationSeconds || line.estimatedSeconds || 2));
+    const startSeconds = cursor;
+    cursor += durationSeconds;
+    return {
+      id: line.id || `line-${index + 1}`,
+      index: Number(line.index) || index + 1,
+      lineType: line.lineType,
+      text: line.text,
+      startSeconds: roundSeconds(startSeconds),
+      durationSeconds: roundSeconds(durationSeconds)
+    };
+  });
+
+  return {
+    source: "production_map",
+    totalSeconds: roundSeconds(cursor),
+    lines: fallbackLines
+  };
+}
+
+function selectLaughTrackPlacements({ lines = [], baseDuration = 0, cueDuration = 2.4, maxCues = 4 }) {
+  const dialogueLines = (Array.isArray(lines) ? lines : [])
+    .filter((line) => line.lineType !== "insert" && String(line.text || "").trim())
+    .map((line, index) => ({ ...line, sequenceIndex: index }));
+  if (!dialogueLines.length) return [];
+
+  const totalDuration =
+    Number(baseDuration) ||
+    Math.max(...dialogueLines.map((line) => Number(line.startSeconds || 0) + Number(line.durationSeconds || 0)));
+  if (!Number.isFinite(totalDuration) || totalDuration <= 0) return [];
+
+  const requestedCueDuration = clampNumber(cueDuration, 0.5, 30);
+  const requestedMaxCues = Math.round(clampNumber(maxCues, 1, 8));
+  const minSpacing = Math.max(4.5, requestedCueDuration + 1.5);
+  const scored = dialogueLines
+    .map((line, index) => ({
+      line,
+      score: laughTrackLineScore(line, index, dialogueLines.length)
+    }))
+    .sort((a, b) => b.score - a.score || Number(a.line.startSeconds || 0) - Number(b.line.startSeconds || 0));
+  const pool = scored.filter((item) => item.score >= 1.25);
+  const candidates = pool.length ? pool : scored.slice(0, Math.min(requestedMaxCues, scored.length));
+  const selected = [];
+
+  for (const candidate of candidates) {
+    const line = candidate.line;
+    const lineEnd = Number(line.startSeconds || 0) + Number(line.durationSeconds || 0);
+    const startSeconds = roundSeconds(lineEnd + 0.08);
+    if (startSeconds >= totalDuration - 0.35) continue;
+    if (selected.some((placement) => Math.abs(placement.startSeconds - startSeconds) < minSpacing)) continue;
+    const durationSeconds = roundSeconds(Math.min(requestedCueDuration, Math.max(0.5, totalDuration - startSeconds)));
+    selected.push({
+      startSeconds,
+      durationSeconds,
+      lineId: line.id || "",
+      lineIndex: Number(line.index) || 0,
+      score: roundSeconds(candidate.score),
+      reason: compactText(String(line.text || "").trim(), 120)
+    });
+    if (selected.length >= requestedMaxCues) break;
+  }
+
+  return selected.sort((a, b) => a.startSeconds - b.startSeconds);
+}
+
+function selectApplauseTrackPlacements({ lines = [], baseDuration = 0, cueDuration = 3.2, maxCues = 3 }) {
+  const dialogueLines = (Array.isArray(lines) ? lines : [])
+    .filter((line) => line.lineType !== "insert" && String(line.text || "").trim())
+    .map((line, index) => ({ ...line, sequenceIndex: index }));
+  if (!dialogueLines.length) return [];
+
+  const totalDuration =
+    Number(baseDuration) ||
+    Math.max(...dialogueLines.map((line) => Number(line.startSeconds || 0) + Number(line.durationSeconds || 0)));
+  if (!Number.isFinite(totalDuration) || totalDuration <= 0) return [];
+
+  const requestedCueDuration = clampNumber(cueDuration, 0.5, 30);
+  const requestedMaxCues = Math.round(clampNumber(maxCues, 1, 8));
+  const minSpacing = Math.max(7, requestedCueDuration + 2);
+  const scored = dialogueLines
+    .map((line, index) => ({
+      line,
+      score: applauseTrackLineScore(line, index, dialogueLines.length)
+    }))
+    .sort((a, b) => b.score - a.score || Number(a.line.startSeconds || 0) - Number(b.line.startSeconds || 0));
+  const pool = scored.filter((item) => item.score >= 1.15);
+  const candidates = pool.length ? pool : scored.slice(0, Math.min(requestedMaxCues, scored.length));
+  const selected = [];
+
+  for (const candidate of candidates) {
+    const line = candidate.line;
+    const lineEnd = Number(line.startSeconds || 0) + Number(line.durationSeconds || 0);
+    const startSeconds = roundSeconds(lineEnd + 0.12);
+    if (startSeconds >= totalDuration - 0.35) continue;
+    if (selected.some((placement) => Math.abs(placement.startSeconds - startSeconds) < minSpacing)) continue;
+    const durationSeconds = roundSeconds(Math.min(requestedCueDuration, Math.max(0.5, totalDuration - startSeconds)));
+    selected.push({
+      startSeconds,
+      durationSeconds,
+      lineId: line.id || "",
+      lineIndex: Number(line.index) || 0,
+      score: roundSeconds(candidate.score),
+      reason: compactText(String(line.text || "").trim(), 120)
+    });
+    if (selected.length >= requestedMaxCues) break;
+  }
+
+  return selected.sort((a, b) => a.startSeconds - b.startSeconds);
+}
+
+function laughTrackLineScore(line, index, totalLines) {
+  const text = String(line.text || "").trim();
+  const normalized = text.toLowerCase();
+  let score = 0.25;
+  const position = totalLines > 1 ? index / (totalLines - 1) : 0;
+  score += position * 0.35;
+  if (/[!?]["')\]]?$/.test(text)) score += 0.6;
+  if (text.length >= 35 && text.length <= 180) score += 0.35;
+  if (/^("|'|and\b|but\b|so\b|because\b|which\b|that\b|then\b)/i.test(text)) score += 0.35;
+  if (/"[^"]{3,}"/.test(text)) score += 0.45;
+  if (/\b(seriously|folks|apparently|somehow|meanwhile|frankly|admittedly|honestly|trust me|for the first time|goodnight)\b/i.test(text)) score += 0.6;
+  if (/\b(dead|alive|afterlife|insane|ridiculous|absurd|normal|forever|again|anyway|shocked|license|hobby|yogurt|payroll|nuclear|comment sections|exclusive|limited-time|offer)\b/i.test(text)) score += 0.75;
+  if (/\b(no|not|never|only|just|even|still|actually|exactly|absolutely)\b/i.test(text)) score += 0.25;
+  if (index === totalLines - 1) score += 0.5;
+  if (/\b(thank you|welcome back|before we begin|moving on)\b/i.test(normalized)) score -= 0.35;
+  if (text.length > 220) score -= 0.45;
+  return score;
+}
+
+function applauseTrackLineScore(line, index, totalLines) {
+  const text = String(line.text || "").trim();
+  const normalized = text.toLowerCase();
+  let score = 0.1;
+  const isFirst = index === 0;
+  const isLast = index === totalLines - 1;
+  const position = totalLines > 1 ? index / (totalLines - 1) : 0;
+  score += position * 0.25;
+  if (isFirst) score += 1.1;
+  if (isLast) score += 1.25;
+  if (/[!]["')\]]?$/.test(text)) score += 0.35;
+  if (/\b(good evening|welcome|welcome back|thank you|thanks|goodnight|good night|that'?s our show|joining us|first episode|tonight'?s show|moving on|finally|before we begin|and that'?s)\b/i.test(normalized)) score += 1.0;
+  if (/\b(please welcome|give it up|big hand|applause|audience|show|episode|everybody|folks)\b/i.test(normalized)) score += 0.9;
+  if (/\b(reveal|announcement|winner|celebrating|birthday|anniversary|final|closing)\b/i.test(normalized)) score += 0.55;
+  if (text.length >= 20 && text.length <= 160) score += 0.25;
+  if (/\b(seriously|apparently|somehow|insane|ridiculous|dead|afterlife)\b/i.test(normalized)) score -= 0.25;
+  if (text.length > 220) score -= 0.45;
+  return score;
+}
+
 async function exportFinishedMaster({ episode, show, layers = [] }) {
   const baseOutput = baseFinalVideoOutput(episode);
   const basePath = outputFilePath(baseOutput);
@@ -4293,7 +5581,7 @@ async function exportFinishedMaster({ episode, show, layers = [] }) {
       filters.push(`[${inputIndex}:a]${fadeFilters.join(",")}[a${index + 1}]`);
       audioLabels.push(`[a${index + 1}]`);
     });
-    filters.push(`${audioLabels.join("")}amix=inputs=${audioLabels.length}:duration=first:dropout_transition=0,alimiter=limit=0.95[aout]`);
+    filters.push(`${audioLabels.join("")}amix=inputs=${audioLabels.length}:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[aout]`);
     audioMap = "[aout]";
   } else if (!baseHasAudio) {
     filters.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${baseDuration.toFixed(3)},asetpts=PTS-STARTPTS[aout]`);
@@ -4375,7 +5663,8 @@ async function exportUploadPackage({ episode, show }) {
   const packageDir = path.join(outputsDir, "packages", episode.id, packageName);
   await mkdir(packageDir, { recursive: true });
 
-  const videoFileName = `video${path.extname(finalVideoPath) || ".mp4"}`;
+  const shortsThumbnailRequested = Boolean(episode.drafts?.youtube?.shortsThumbnail);
+  const videoFileName = shortsThumbnailRequested ? "video-shorts-thumbnail.mp4" : `video${path.extname(finalVideoPath) || ".mp4"}`;
   const thumbnailFileName = `thumbnail${path.extname(thumbnailPath) || ".png"}`;
   const metadataFileName = "youtube-metadata.json";
   const textFileName = "youtube-upload.txt";
@@ -4383,7 +5672,16 @@ async function exportUploadPackage({ episode, show }) {
   const campaignTextFileName = "campaign-drafts.txt";
   const promotionPacketFileName = "promotion-packet.json";
   const promotionPacketTextFileName = "promotion-packet.txt";
-  await copyFile(finalVideoPath, path.join(packageDir, videoFileName));
+  if (shortsThumbnailRequested) {
+    await prepareShortsThumbnailUploadVideo({
+      videoPath: finalVideoPath,
+      thumbnailPath,
+      tempDir: packageDir,
+      outputPath: path.join(packageDir, videoFileName)
+    });
+  } else {
+    await copyFile(finalVideoPath, path.join(packageDir, videoFileName));
+  }
   await copyFile(thumbnailPath, path.join(packageDir, thumbnailFileName));
 
   const metadata = youtubePackageMetadata({
@@ -4595,6 +5893,18 @@ async function buildLaunchReadiness({ episode, show }) {
       "warning"
     );
   }
+  if (youtubeDraft.shortsThumbnail) {
+    add(
+      "render",
+      "shorts_thumbnail_frame",
+      "Shorts thumbnail frame",
+      Boolean(finalVideoPath && thumbnailPath),
+      finalVideoPath && thumbnailPath
+        ? `Selected thumbnail will be held for ${shortsThumbnailFrameSeconds}s as the final upload frame`
+        : "Render final video and select a thumbnail before adding the Shorts frame",
+      "warning"
+    );
+  }
 
   add(
     "youtube",
@@ -4762,6 +6072,8 @@ function youtubePackageMetadata({ episode, show, finalVideo, selectedThumbnail, 
       madeForKids: Boolean(youtube.madeForKids ?? show.platforms?.youtube?.madeForKids),
       notifySubscribers: Boolean(youtube.notifySubscribers ?? show.platforms?.youtube?.notifySubscribers),
       containsSyntheticMedia: youtube.containsSyntheticMedia !== false,
+      shortsThumbnail: Boolean(youtube.shortsThumbnail),
+      shortsThumbnailFrameSeconds: Boolean(youtube.shortsThumbnail) ? shortsThumbnailFrameSeconds : 0,
       plannedPublishAt: String(youtube.plannedPublishAt || ""),
       publishNotes: String(youtube.publishNotes || "").trim(),
       readyToPublish: Boolean(youtube.readyToPublish),
@@ -4918,6 +6230,11 @@ function youtubePackageText(metadata) {
     "Contains synthetic media:",
     metadata.youtube.containsSyntheticMedia ? "yes" : "no",
     "",
+    "Shorts thumbnail frame:",
+    metadata.youtube.shortsThumbnail
+      ? `yes (${metadata.youtube.shortsThumbnailFrameSeconds || shortsThumbnailFrameSeconds}s held at end of upload video)`
+      : "no",
+    "",
     "Target publish time:",
     metadata.youtube.plannedPublishAt || "",
     "",
@@ -4978,10 +6295,25 @@ async function uploadYouTubePrivateDraft({ episode, show }) {
       videoFileName: path.basename(finalVideoPath),
       thumbnailFileName: path.basename(thumbnailPath)
     });
+    let uploadVideoPath = finalVideoPath;
+    let shortsThumbnailApplied = false;
+    if (metadata.youtube.shortsThumbnail) {
+      uploadVideoPath = await prepareShortsThumbnailUploadVideo({
+        videoPath: finalVideoPath,
+        thumbnailPath,
+        tempDir
+      });
+      if (!uploadVideoPath || uploadVideoPath === finalVideoPath) {
+        throw new Error("Shorts thumbnail was requested, but NewtBuilder could not prepare the upload video with the thumbnail as the final frame.");
+      }
+      shortsThumbnailApplied = true;
+      metadata.files.video = path.basename(uploadVideoPath);
+      metadata.youtube.shortsThumbnailFrameSeconds = shortsThumbnailFrameSeconds;
+    }
     const accessToken = await youtubeAccessToken();
     const video = await uploadYouTubeVideo({
       accessToken,
-      videoPath: finalVideoPath,
+      videoPath: uploadVideoPath,
       metadata
     });
     const videoId = String(video?.id || "").trim();
@@ -5012,6 +6344,9 @@ async function uploadYouTubePrivateDraft({ episode, show }) {
       studioUrl: `https://studio.youtube.com/video/${videoId}/edit`,
       privacyStatus: "private",
       requestedPrivacyStatus: metadata.youtube.privacyStatus,
+      shortsThumbnailApplied,
+      shortsThumbnailFrameSeconds: shortsThumbnailApplied ? shortsThumbnailFrameSeconds : 0,
+      uploadVideoFileName: path.basename(uploadVideoPath),
       thumbnailSet,
       thumbnailWarning,
       metadata,
@@ -5020,6 +6355,67 @@ async function uploadYouTubePrivateDraft({ episode, show }) {
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function prepareShortsThumbnailUploadVideo({ videoPath, thumbnailPath, tempDir, outputPath = "" }) {
+  const dimensions = await probeMediaDimensions(videoPath);
+  const probedWidth = Math.round(Number(dimensions.width) || 0);
+  const probedHeight = Math.round(Number(dimensions.height) || 0);
+  if (probedWidth <= 0 || probedHeight <= 0) {
+    throw new Error("Could not read final video dimensions before adding the Shorts thumbnail frame.");
+  }
+  const width = Math.max(2, probedWidth);
+  const height = Math.max(2, probedHeight);
+
+  const finalOutputPath = outputPath || path.join(tempDir, "youtube-shorts-thumbnail-upload.mp4");
+  const frameSeconds = shortsThumbnailFrameSeconds.toFixed(3);
+  const filter = [
+    `[0:v]setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v0]`,
+    `[1:v]scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height}:x=(in_w-out_w)/2:y=(in_h-out_h)/2,setsar=1,format=yuv420p,trim=0:${frameSeconds},setpts=PTS-STARTPTS[v1]`,
+    `[v0][v1]concat=n=2:v=1:a=0[vout]`
+  ].join(";");
+
+  await execFileAsync(
+    process.env.FFMPEG_PATH || "ffmpeg",
+    [
+      "-y",
+      "-i",
+      videoPath,
+      "-loop",
+      "1",
+      "-framerate",
+      "30",
+      "-t",
+      frameSeconds,
+      "-i",
+      thumbnailPath,
+      "-filter_complex",
+      filter,
+      "-map",
+      "[vout]",
+      "-map",
+      "0:a?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "medium",
+      "-crf",
+      "18",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "copy",
+      "-movflags",
+      "+faststart",
+      finalOutputPath
+    ],
+    {
+      timeout: 300000,
+      maxBuffer: 30 * 1024 * 1024
+    }
+  );
+
+  return finalOutputPath;
 }
 
 function youtubeOAuthClientConfigured() {
@@ -5814,6 +7210,49 @@ async function probeMediaDimensions(filePath) {
   }
 }
 
+async function readImageDimensions(filePath) {
+  try {
+    return imageDimensionsFromBuffer(await readFile(filePath));
+  } catch {
+    return { width: 0, height: 0 };
+  }
+}
+
+function imageDimensionsFromBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 24) return { width: 0, height: 0 };
+  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return {
+      width: buffer.readUInt32BE(16),
+      height: buffer.readUInt32BE(20)
+    };
+  }
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      while (offset < buffer.length && buffer[offset] !== 0xff) offset += 1;
+      while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+      const marker = buffer[offset];
+      offset += 1;
+      if (!marker || marker === 0xd9 || marker === 0xda) break;
+      if (offset + 2 > buffer.length) break;
+      const segmentLength = buffer.readUInt16BE(offset);
+      const isStartOfFrame =
+        (marker >= 0xc0 && marker <= 0xc3) ||
+        (marker >= 0xc5 && marker <= 0xc7) ||
+        (marker >= 0xc9 && marker <= 0xcb) ||
+        (marker >= 0xcd && marker <= 0xcf);
+      if (isStartOfFrame && offset + 7 < buffer.length) {
+        return {
+          width: buffer.readUInt16BE(offset + 5),
+          height: buffer.readUInt16BE(offset + 3)
+        };
+      }
+      offset += segmentLength;
+    }
+  }
+  return { width: 0, height: 0 };
+}
+
 async function attachPreviewToReport(report, preview) {
   const updated = {
     ...report,
@@ -5862,8 +7301,9 @@ function attachAudioTakesToProductionMap(productionMap = [], manifestLines = [])
       ["approved", "hold"].includes(normalized.audioStatus) && audioTake?.signature === lineAudioSignature(normalized)
         ? normalized.audioStatus
         : "pending";
+    const nextVideoTake = videoTake || normalized.videoTake;
     const videoStatus =
-      ["approved", "hold"].includes(normalized.videoStatus) && videoTake?.signature
+      ["approved", "hold"].includes(normalized.videoStatus) && nextVideoTake?.signature
         ? normalized.videoStatus
         : videoTake
           ? "generated"
@@ -5874,11 +7314,54 @@ function attachAudioTakesToProductionMap(productionMap = [], manifestLines = [])
         audioStatus,
         audioTake,
         videoStatus,
-        videoTake
+        videoTake: nextVideoTake,
+        videoTakes: normalizeVideoTakes(videoTake ? [videoTake, ...(normalized.videoTakes || [])] : normalized.videoTakes, nextVideoTake)
       },
       index
     );
   });
+}
+
+function attachRecoveredAudioTakesToProductionMap(productionMap = [], recoveredAudioTakes = new Map()) {
+  return (Array.isArray(productionMap) ? productionMap : []).map((line, index) => {
+    const normalized = normalizeProductionLine(line, index);
+    const audioTake = normalizeAudioTake(recoveredAudioTakes.get(normalized.id));
+    if (!audioTake) return normalized;
+    return normalizeProductionLine(
+      {
+        ...normalized,
+        audioTake,
+        audioStatus: ["approved", "hold"].includes(normalized.audioStatus) ? normalized.audioStatus : "pending"
+      },
+      index
+    );
+  });
+}
+
+async function recoverAudioTakeForLineFromManifests({ episode, line }) {
+  const expectedSignature = lineAudioSignature(line);
+  const manifestOutputs = (Array.isArray(episode.outputs) ? episode.outputs : [])
+    .filter((output) => ["final_render_manifest", "render_manifest"].includes(output.type))
+    .sort((a, b) => Date.parse(b.createdAt || "") - Date.parse(a.createdAt || ""));
+
+  for (const output of manifestOutputs) {
+    const manifestPath = outputFilePath(output);
+    if (!manifestPath) continue;
+    const manifest = await readJson(manifestPath, null);
+    const manifestLines = Array.isArray(manifest?.lines) ? manifest.lines : [];
+    const orderedLines = [
+      ...manifestLines.filter((candidate) => candidate.id === line.id),
+      ...manifestLines.filter((candidate) => candidate.id !== line.id)
+    ];
+
+    for (const candidate of orderedLines) {
+      const audioTake = normalizeAudioTake(candidate.audioTake || candidate.audio);
+      if (!audioTake || audioTake.signature !== expectedSignature) continue;
+      if (audioTakeFilePath(audioTake)) return audioTake;
+    }
+  }
+
+  return null;
 }
 
 function parseResolution(resolution, aspectRatio) {
@@ -5889,6 +7372,23 @@ function parseResolution(resolution, aspectRatio) {
   return aspectRatio === "16:9" ? { width: 1920, height: 1080 } : { width: 1080, height: 1920 };
 }
 
+function defaultResolutionForAspect(aspectRatio) {
+  return aspectRatio === "16:9" ? "1920x1080" : "1080x1920";
+}
+
+function normalizeResolutionValue(resolution) {
+  return String(resolution || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[×*]/g, "x")
+    .replace(/\s+/g, "");
+}
+
+function sanitizeFormatResolution(resolution, aspectRatio) {
+  const normalized = normalizeResolutionValue(resolution);
+  const allowed = standardFormatResolutions[aspectRatio] || standardFormatResolutions["9:16"];
+  return allowed.has(normalized) ? normalized : defaultResolutionForAspect(aspectRatio);
+}
 function roundSeconds(value) {
   return Math.round((Number(value) || 0) * 1000) / 1000;
 }
@@ -5917,6 +7417,7 @@ function createAudioTake({ line, filePath, localUrl, generatedAudio, source }) {
 
 function createVideoTake({ line, format, filePath, localUrl, proxyFilePath, proxyLocalUrl, remoteUrl, result, prompt, source }) {
   const mode = insertVideoModeForLine(line);
+  const { width, height } = parseResolution(format.resolution, format.aspectRatio);
   return normalizeVideoTake({
     id: randomUUID(),
     fileName: path.basename(filePath),
@@ -5931,6 +7432,10 @@ function createVideoTake({ line, format, filePath, localUrl, proxyFilePath, prox
     durationSeconds: 0,
     signature: lineVideoSignature(line, format),
     source,
+    width,
+    height,
+    resolution: `${width}x${height}`,
+    aspectRatio: format.aspectRatio || "",
     generatedAt: new Date().toISOString()
   });
 }
@@ -5995,10 +7500,53 @@ function reusableAudioTakeForLine(line) {
   return audioTakeFilePath(take) ? take : null;
 }
 
-function reusableVideoTakeForLine(line, imageAsset, endImageAsset, format) {
+function reusableVideoTakeForLine(line, imageAsset, endImageAsset, format, maskAsset = null, context = {}) {
   const take = normalizeVideoTake(line.videoTake);
   if (!take) return null;
   if (take.source === "user-upload") return videoTakeFilePath(take) ? take : null;
+  if (context.reuseExistingVideoTake && videoTakeFilePath(take)) return take;
+  if (line.lineType !== "insert") {
+    const maskPath = resolveAssetPath(maskAsset);
+    const visualLipSyncModel = sanitizeOptionalLipSyncModel(imageAsset?.metadata?.lipSyncModel);
+    const visualLipSyncPrompt = lineLipSyncInputPrompt(line, imageAsset);
+    const signatureLine = {
+      ...line,
+      visualLipSyncModel,
+      visualLipSyncPrompt,
+      image: imageAsset
+        ? {
+            assetId: imageAsset.id,
+            fileName: imageAsset.fileName,
+            localUrl: imageAsset.localUrl,
+            lipSyncModel: visualLipSyncModel,
+            lipSyncPrompt: visualLipSyncPrompt
+          }
+        : null,
+      needsMask: Boolean(maskPath),
+      mask: maskPath && maskAsset
+        ? {
+            assetId: maskAsset.id,
+            fileName: maskAsset.fileName,
+            localUrl: maskAsset.localUrl
+          }
+        : null,
+      infiniteTalkBackend: line.infiniteTalkBackend || infiniteTalkBackendForShow(context.show)
+    };
+    const provider = lipSyncModelForLine(signatureLine, {
+      imageAsset,
+      character: context.character,
+      show: context.show
+    });
+    const providerConfig = lipSyncProviderConfig(provider, { line: signatureLine });
+    const prompt = lipSyncPromptForLine(signatureLine, provider);
+    const signature = lineLipSyncSignature(signatureLine, format, {
+      provider,
+      modelId: providerConfig.modelId,
+      prompt
+    });
+    if (take.signature !== signature) return null;
+    return videoTakeFilePath(take) ? take : null;
+  }
   const signatureLine = {
     ...line,
     image: imageAsset
@@ -6084,8 +7632,183 @@ function seedanceResolution() {
   return process.env.FAL_SEEDANCE_RESOLUTION || "720p";
 }
 
-function lipSyncModelForLine(line) {
-  return sanitizeLipSyncModel(line?.lipSyncModel);
+function assetLipSyncPrompt(asset) {
+  return compactText(String(asset?.metadata?.lipSyncPrompt || "").trim(), lipSyncInputPromptMaxLength);
+}
+
+function lineLipSyncInputPrompt(line, imageAsset) {
+  return compactText(String(line?.lipSyncInputPromptOverride || "").trim(), lipSyncInputPromptMaxLength) || assetLipSyncPrompt(imageAsset);
+}
+
+function visualReferencePromptForLine(line) {
+  const prompt = compactText(
+    String(
+      line?.visualLipSyncPrompt ||
+        line?.lipSyncInputPromptOverride ||
+        line?.image?.lipSyncPrompt ||
+        line?.assetLipSyncPrompt ||
+        ""
+    ).trim(),
+    lipSyncInputPromptMaxLength
+  );
+  return prompt ? `Visual reference: ${prompt}` : "";
+}
+
+function sanitizeInfiniteTalkPositivePromptText(value) {
+  let text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  text = text
+    .replace(/\blarge expressive black eye disks?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\blarge expressive black eyes holes?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\bexpressive black eye disks?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\bblack eye disks?\b/gi, "flat matte black painted eye shapes")
+    .replace(/\bblack eyes holes?\b/gi, "flat matte black painted eye shapes")
+    .replace(
+      /\bthe eye (?:disks?|shapes?) may squint, blink, compress, stretch, or change shape for expression, but must always remain solid black painted eye (?:disks?|shapes?)\.?/gi,
+      "The painted eye shapes remain flat, matte, black, and unchanged."
+    );
+  const blockedPositiveTerms =
+    /\b(pupils?|irises?|eyeballs?|sclera|human eyes?|realistic eyes?|cg eyes?|3d eyes?|cartoon eyes?|animated eyes?|anime eyes?|cute eyes?|eye whites?|catchlights?|eye reflections?|glass eyes?|eyelids?)\b/i;
+  const blockedEyeActions = /\b(squint|blink|compress|stretch|change shape)\b/i;
+  const sentences = text.match(/[^.!?]+[.!?]?/g) || [text];
+  return sentences
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && !blockedPositiveTerms.test(sentence))
+    .filter((sentence) => !(sentence.toLowerCase().includes("eye") && blockedEyeActions.test(sentence)))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function infiniteTalkVisualReferencePromptForLine(line) {
+  const prompt = compactText(
+    sanitizeInfiniteTalkPositivePromptText(
+      String(
+        line?.visualLipSyncPrompt ||
+          line?.lipSyncInputPromptOverride ||
+          line?.image?.lipSyncPrompt ||
+          line?.assetLipSyncPrompt ||
+          ""
+      ).trim()
+    ),
+    lipSyncInputPromptMaxLength
+  );
+  return prompt ? `Visual reference: ${prompt}` : "";
+}
+
+function lipSyncPromptLengthForProvider(provider) {
+  const normalized = sanitizeLipSyncModel(provider);
+  if (normalized === "kling") return 3000;
+  if (normalized === "aurora") return lipSyncFullPromptMaxLength;
+  if (normalized === "infinitalk") return lipSyncFullPromptMaxLength;
+  return lipSyncFullPromptMaxLength;
+}
+
+function lipSyncModelForLine(line, context = {}) {
+  const shotOverride = sanitizeOptionalLipSyncModel(line?.lipSyncModelOverride || line?.lipSyncModel);
+  if (shotOverride) return shotOverride;
+  const assetModel = sanitizeOptionalLipSyncModel(context.imageAsset?.metadata?.lipSyncModel || line?.visualLipSyncModel || line?.image?.lipSyncModel);
+  if (assetModel) return assetModel;
+  const characterModel = sanitizeOptionalLipSyncModel(context.character?.lipSyncModel);
+  if (characterModel) return characterModel;
+  return sanitizeLipSyncModel(context.show?.production?.defaultLipSyncModel || defaultLipSyncModel());
+}
+
+function defaultLipSyncModel() {
+  return sanitizeLipSyncModel(process.env.NEWTBUILDER_DEFAULT_LIPSYNC_MODEL || "fabric");
+}
+
+function defaultInfiniteTalkBackend() {
+  return sanitizeInfiniteTalkBackend(process.env.NEWTBUILDER_INFINITALK_BACKEND || "fal");
+}
+
+function infiniteTalkBackendForShow(show) {
+  return sanitizeInfiniteTalkBackend(show?.production?.infiniteTalkBackend || defaultInfiniteTalkBackend());
+}
+
+function infiniteTalkBackendForLine(line = {}, manifest = {}) {
+  return sanitizeInfiniteTalkBackend(line.infiniteTalkBackend || manifest?.lipSync?.infiniteTalkBackend || defaultInfiniteTalkBackend());
+}
+
+function localInfiniteTalkConfigured() {
+  const repoDir = String(
+    process.env.LOCAL_INFINITALK_REPO_DIR ||
+      process.env.NEWTBUILDER_INFINITALK_REPO_DIR ||
+      process.env.INFINITALK_REPO_DIR ||
+      ""
+  ).trim();
+  return Boolean(repoDir && existsSync(path.resolve(repoDir)));
+}
+
+function comfyUiBaseUrl() {
+  return String(process.env.COMFYUI_BASE_URL || "http://127.0.0.1:8188").trim().replace(/\/+$/, "");
+}
+
+function comfyUiRootDir() {
+  const configured = String(process.env.COMFYUI_ROOT_DIR || process.env.COMFYUI_DIR || "").trim();
+  if (configured) return path.resolve(configured);
+  const desktopPath = "D:\\_AI\\Comfyui_1_0_4\\ComfyUI";
+  return existsSync(desktopPath) ? desktopPath : "";
+}
+
+function comfyUiInputDir() {
+  const configured = String(process.env.COMFYUI_INPUT_DIR || "").trim();
+  if (configured) return path.resolve(configured);
+  const root = comfyUiRootDir();
+  return root ? path.join(root, "input") : "";
+}
+
+function comfyUiOutputDir() {
+  const configured = String(process.env.COMFYUI_OUTPUT_DIR || "").trim();
+  if (configured) return path.resolve(configured);
+  const root = comfyUiRootDir();
+  return root ? path.join(root, "output") : "";
+}
+
+function comfyUiTempDir() {
+  const configured = String(process.env.COMFYUI_TEMP_DIR || "").trim();
+  if (configured) return path.resolve(configured);
+  const root = comfyUiRootDir();
+  return root ? path.join(root, "temp") : "";
+}
+
+function comfyUiInfiniteTalkWorkflowPath() {
+  const configured = String(process.env.COMFYUI_INFINITALK_WORKFLOW || "").trim();
+  return configured ? path.resolve(configured) : "";
+}
+
+function comfyUiInfiniteTalkConfigured() {
+  const workflowPath = comfyUiInfiniteTalkWorkflowPath();
+  const inputDir = comfyUiInputDir();
+  const outputDir = comfyUiOutputDir();
+  return Boolean(workflowPath && existsSync(workflowPath) && inputDir && existsSync(inputDir) && outputDir && existsSync(outputDir));
+}
+
+function comfyUiInfiniteTalkModelId() {
+  return process.env.COMFYUI_INFINITALK_MODEL_ID || "comfyui-infinitalk";
+}
+
+async function comfyUiHealthStatus() {
+  const baseUrl = comfyUiBaseUrl();
+  const configured = comfyUiInfiniteTalkConfigured();
+  let reachable = false;
+  let error = "";
+  try {
+    await fetchJsonWithTimeout(`${baseUrl}/system_stats`, {}, Number(process.env.COMFYUI_HEALTH_TIMEOUT_MS || 800));
+    reachable = true;
+  } catch (healthError) {
+    error = compactText(String(healthError?.message || healthError), 160);
+  }
+  return {
+    baseUrl,
+    reachable,
+    infinitalkConfigured: configured,
+    rootDir: comfyUiRootDir(),
+    workflow: comfyUiInfiniteTalkWorkflowPath(),
+    inputDir: comfyUiInputDir(),
+    outputDir: comfyUiOutputDir(),
+    error
+  };
 }
 
 function fabricModelId() {
@@ -6096,6 +7819,64 @@ function klingAvatarModelId() {
   return process.env.FAL_KLING_AVATAR_MODEL || "fal-ai/kling-video/ai-avatar/v2/pro";
 }
 
+function auroraModelId() {
+  return process.env.FAL_AURORA_MODEL || "fal-ai/creatify/aurora";
+}
+
+function infiniteTalkModelId() {
+  return process.env.FAL_INFINITALK_MODEL || "fal-ai/infinitalk";
+}
+
+function localInfiniteTalkModelId() {
+  return process.env.LOCAL_INFINITALK_MODEL_ID || "local-infinitalk";
+}
+
+function lipSyncProviderConfig(provider, context = {}) {
+  const normalizedProvider = sanitizeLipSyncModel(provider);
+  if (normalizedProvider === "kling") {
+    return {
+      provider: "kling",
+      outputFolder: "kling-renders",
+      source: "fal-kling-avatar",
+      modelId: klingAvatarModelId(),
+      label: "Kling avatar",
+      promptSummary: "Kling avatar lip-sync."
+    };
+  }
+  if (normalizedProvider === "aurora") {
+    return {
+      provider: "aurora",
+      outputFolder: "aurora-renders",
+      source: "fal-creatify-aurora",
+      modelId: auroraModelId(),
+      label: "Creatify Aurora",
+      promptSummary: "Creatify Aurora lip-sync."
+    };
+  }
+  if (normalizedProvider === "infinitalk") {
+    const backend = infiniteTalkBackendForLine(context.line, context.manifest);
+    const local = backend === "local";
+    const comfyUi = backend === "comfyui";
+    return {
+      provider: "infinitalk",
+      backend,
+      outputFolder: local ? "infinitalk-local-renders" : comfyUi ? "infinitalk-comfyui-renders" : "infinitalk-renders",
+      source: local ? "local-infinitalk" : comfyUi ? "comfyui-infinitalk" : "fal-infinitalk",
+      modelId: local ? localInfiniteTalkModelId() : comfyUi ? comfyUiInfiniteTalkModelId() : infiniteTalkModelId(),
+      label: local ? "InfiniteTalk local" : comfyUi ? "InfiniteTalk ComfyUI" : "InfiniteTalk",
+      promptSummary: local ? "Local InfiniteTalk lip-sync." : comfyUi ? "ComfyUI InfiniteTalk lip-sync." : "InfiniteTalk lip-sync."
+    };
+  }
+  return {
+    provider: "fabric",
+    outputFolder: "fabric-renders",
+    source: "fal-fabric",
+    modelId: fabricModelId(),
+    label: "Fabric",
+    promptSummary: "Fabric lip-sync."
+  };
+}
+
 function lipSyncDisabled() {
   const configured =
     process.env.NEWTBUILDER_LIPSYNC_ENABLED !== undefined
@@ -6103,6 +7884,46 @@ function lipSyncDisabled() {
       : process.env.NEWTBUILDER_FABRIC_ENABLED;
   const value = String(configured || "").trim().toLowerCase();
   return ["0", "false", "off", "no"].includes(value);
+}
+
+function allowLipSyncStillFallback() {
+  const value = String(process.env.NEWTBUILDER_ALLOW_LIPSYNC_FALLBACK || "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+function lipSyncProviderRequiresFal(provider, line = {}, manifest = {}) {
+  if (sanitizeLipSyncModel(provider) === "infinitalk") {
+    const backend = infiniteTalkBackendForLine(line, manifest);
+    if (backend === "local" || backend === "comfyui") return false;
+  }
+  return true;
+}
+
+function lipSyncProviderAvailable(provider, line = {}, manifest = {}) {
+  if (lipSyncDisabled()) return false;
+  if (sanitizeLipSyncModel(provider) === "infinitalk") {
+    const backend = infiniteTalkBackendForLine(line, manifest);
+    if (backend === "local") return localInfiniteTalkConfigured();
+    if (backend === "comfyui") return comfyUiInfiniteTalkConfigured();
+  }
+  return lipSyncProviderRequiresFal(provider, line, manifest) ? Boolean(falApiKey) : true;
+}
+
+function lipSyncProviderUnavailableMessage(provider, line = {}, manifest = {}) {
+  if (lipSyncDisabled()) return "Lip-sync rendering is disabled by NEWTBUILDER_LIPSYNC_ENABLED.";
+  if (sanitizeLipSyncModel(provider) === "infinitalk") {
+    const backend = infiniteTalkBackendForLine(line, manifest);
+    if (backend === "local") {
+      return "Local InfiniteTalk is selected, but LOCAL_INFINITALK_REPO_DIR is not set or does not point to an InfiniteTalk checkout.";
+    }
+    if (backend === "comfyui") {
+      return "ComfyUI InfiniteTalk is selected, but COMFYUI_INFINITALK_WORKFLOW is not set to an API-format workflow or ComfyUI input/output directories are unavailable.";
+    }
+  }
+  if (lipSyncProviderRequiresFal(provider, line, manifest) && !falApiKey) {
+    return "fal API key is not configured for this lip-sync provider.";
+  }
+  return "Lip-sync provider is not configured.";
 }
 
 function insertVideoDurationSeconds(line) {
@@ -6162,9 +7983,11 @@ function klingAvatarPromptForLine(line) {
     process.env.FAL_KLING_AVATAR_EXPRESSIVE_BODY_PROMPT ||
     "Allow natural expressive upper-body motion only when it supports the dialogue, while preserving the original character design and shot composition.";
   const shotPrompt = String(line.videoPrompt || "").trim();
+  const visualPrompt = visualReferencePromptForLine(line);
   return compactText(
     [
       "Create a polished lip-sync avatar animation for this cartoon episode shot.",
+      visualPrompt,
       `Speaker: ${String(line.speaker || "character").trim()}.`,
       `Dialogue: ${plainSpeechText(line)}`,
       shotPrompt ? `Shot direction: ${shotPrompt}` : "",
@@ -6172,23 +7995,158 @@ function klingAvatarPromptForLine(line) {
       "Keep facial motion natural and speech-synced. Avoid changing the character design, adding text, or changing the camera.",
       line.expressiveBodyMotion ? expressiveBodyPrompt : minimalMotionPrompt
     ].filter(Boolean).join(" "),
-    900
+    lipSyncPromptLengthForProvider("kling")
   );
+}
+
+function auroraPromptForLine(line) {
+  const shotPrompt = String(line.videoPrompt || "").trim();
+  const visualPrompt = visualReferencePromptForLine(line);
+  const basePrompt =
+    process.env.FAL_AURORA_PROMPT ||
+    "Create a polished studio-quality avatar lip-sync animation. Preserve the uploaded image composition, character identity, background, lighting, wardrobe, and camera framing.";
+  const motionPrompt =
+    line.expressiveBodyMotion
+      ? process.env.FAL_AURORA_EXPRESSIVE_BODY_PROMPT ||
+        "Allow restrained, natural facial and upper-body motion only when it supports the dialogue."
+      : process.env.FAL_AURORA_MINIMAL_BODY_PROMPT ||
+        "Keep the body, hands, arms, and camera very still; prioritize stable facial lip-sync.";
+  return compactText(
+    [
+      basePrompt,
+      visualPrompt,
+      `Speaker: ${String(line.speaker || "character").trim()}.`,
+      `Dialogue: ${plainSpeechText(line)}`,
+      shotPrompt ? `Shot direction: ${shotPrompt}` : "",
+      "Do not add text overlays or change the character design.",
+      motionPrompt
+    ].filter(Boolean).join(" "),
+    lipSyncPromptLengthForProvider("aurora")
+  );
+}
+
+function infiniteTalkPromptForLine(line) {
+  const shotPrompt = String(line.videoPrompt || "").trim();
+  const visualPrompt = infiniteTalkVisualReferencePromptForLine(line);
+  const basePrompt =
+    process.env.FAL_INFINITALK_PROMPT ||
+    "Animate the uploaded stylized puppet character speaking the dialogue while preserving the source image design.";
+  const motionPrompt =
+    line.expressiveBodyMotion
+      ? process.env.FAL_INFINITALK_EXPRESSIVE_BODY_PROMPT ||
+        "Use controlled puppet-style mouth movement, small head bobs, and restrained upper-body gestures when they support the dialogue; keep the painted eye shapes flat and unchanged."
+      : process.env.FAL_INFINITALK_MINIMAL_BODY_PROMPT ||
+        "Keep the body, camera, background, and painted eye shapes stable; focus motion on puppet-style mouth movement synced to speech.";
+  return compactText(
+    [
+      basePrompt,
+      visualPrompt,
+      `Speaker: ${String(line.speaker || "character").trim()}.`,
+      `Dialogue: ${plainSpeechText(line)}`,
+      shotPrompt ? `Shot direction: ${shotPrompt}` : "",
+      "Preserve the uploaded image composition, character identity, style, clothing, lighting, and background.",
+      "Do not add captions, logos, or text overlays.",
+      motionPrompt
+    ].filter(Boolean).join(" "),
+    lipSyncPromptLengthForProvider("infinitalk")
+  );
+}
+
+function lipSyncPromptForLine(line, provider) {
+  const reviewedPrompt = compactText(String(line.lipSyncFullPromptOverride || "").trim(), lipSyncPromptLengthForProvider(provider));
+  if (reviewedPrompt) return reviewedPrompt;
+  if (provider === "kling") return klingAvatarPromptForLine(line);
+  if (provider === "aurora") return auroraPromptForLine(line);
+  if (provider === "infinitalk") return infiniteTalkPromptForLine(line);
+  return "";
 }
 
 function klingAvatarMinimumAudioSeconds() {
   return boundedEnvNumber("FAL_KLING_AVATAR_MIN_AUDIO_SECONDS", 2, 0.5, 10);
 }
 
+function lipSyncMinimumAudioSeconds(provider) {
+  if (provider === "kling") return klingAvatarMinimumAudioSeconds();
+  if (provider === "aurora") return boundedEnvNumber("FAL_AURORA_MIN_AUDIO_SECONDS", 0, 0, 10);
+  if (provider === "infinitalk") return infiniteTalkMinimumAudioSeconds();
+  return 0;
+}
+
+function infiniteTalkModelFps() {
+  return boundedEnvNumber("FAL_INFINITALK_FRAME_RATE", 25, 12, 60);
+}
+
+function infiniteTalkMinimumAudioSeconds() {
+  return boundedEnvNumber("FAL_INFINITALK_MIN_AUDIO_SECONDS", 1.72, 1.64, 10);
+}
+
+function infiniteTalkNumFrames(line) {
+  const explicitFrames = Number(process.env.FAL_INFINITALK_NUM_FRAMES);
+  if (Number.isFinite(explicitFrames) && explicitFrames > 0) {
+    return Math.min(721, Math.max(41, Math.round(explicitFrames)));
+  }
+  const modelFps = infiniteTalkModelFps();
+  const durationSeconds = Number(line?.audio?.durationSeconds || line?.audioTake?.durationSeconds || line?.durationSeconds || 0);
+  const frameSafetyMargin = boundedEnvNumber("FAL_INFINITALK_FRAME_SAFETY_MARGIN", 2, 0, 12);
+  const safeFrames = Math.floor(Math.max(durationSeconds, infiniteTalkMinimumAudioSeconds()) * modelFps) - frameSafetyMargin;
+  return Math.min(721, Math.max(41, safeFrames));
+}
+
+function infiniteTalkRequiredAudioSeconds(line) {
+  const frames = infiniteTalkNumFrames(line);
+  const modelFps = infiniteTalkModelFps();
+  const framePaddingSeconds = boundedEnvNumber("FAL_INFINITALK_AUDIO_PAD_SECONDS", 0.12, 0, 1);
+  return Math.max(infiniteTalkMinimumAudioSeconds(), (frames + 1) / modelFps + framePaddingSeconds);
+}
+
+function infiniteTalkResolution() {
+  const configured = normalizeResolutionValue(process.env.FAL_INFINITALK_RESOLUTION || "");
+  if (configured === "720p" || configured === "480p") return configured;
+  if (configured) {
+    console.warn(`Ignoring unsupported FAL_INFINITALK_RESOLUTION="${process.env.FAL_INFINITALK_RESOLUTION}". InfiniteTalk currently accepts only 480p or 720p.`);
+  }
+  return "720p";
+}
+
+function infiniteTalkAcceleration() {
+  const value = String(process.env.FAL_INFINITALK_ACCELERATION || "regular").trim().toLowerCase();
+  return ["none", "regular", "high"].includes(value) ? value : "regular";
+}
+
+function infiniteTalkSeed() {
+  const seed = Number(process.env.FAL_INFINITALK_SEED);
+  return Number.isFinite(seed) ? Math.round(seed) : null;
+}
+
+function lipSyncProviderSignatureOptions(provider, line, format = {}) {
+  if (provider === "infinitalk") {
+    const backend = infiniteTalkBackendForLine(line);
+    return {
+      backend,
+      numFrames: infiniteTalkNumFrames(line),
+      requiredAudioSeconds: infiniteTalkRequiredAudioSeconds(line),
+      frameRate: infiniteTalkModelFps(),
+      frameSafetyMargin: boundedEnvNumber("FAL_INFINITALK_FRAME_SAFETY_MARGIN", 2, 0, 12),
+      resolution: infiniteTalkResolution(format),
+      acceleration: infiniteTalkAcceleration(),
+      seed: infiniteTalkSeed(),
+      comfyUiWorkflow: backend === "comfyui" ? comfyUiInfiniteTalkWorkflowPath() : "",
+      comfyUiMapping: backend === "comfyui" ? compactText(process.env.COMFYUI_INFINITALK_MAPPING_JSON || "", 500) : ""
+    };
+  }
+  return {};
+}
+
 function lineLipSyncSignature(line, format = {}, options = {}) {
   const masked = Boolean(line.needsMask);
   const provider = options.provider || lipSyncModelForLine(line);
-  const model = options.modelId || (provider === "kling" ? klingAvatarModelId() : fabricModelId());
+  const model = options.modelId || lipSyncProviderConfig(provider, { line }).modelId;
   return JSON.stringify({
     compositeVersion: 7,
     provider,
     model,
-    minAudioSeconds: provider === "kling" ? klingAvatarMinimumAudioSeconds() : 0,
+    providerOptions: lipSyncProviderSignatureOptions(provider, line, format),
+    minAudioSeconds: lipSyncMinimumAudioSeconds(provider),
     prompt: String(options.prompt || ""),
     speaker: String(line.speaker || "").trim(),
     text: plainSpeechText(line),
@@ -6205,6 +8163,9 @@ function lineLipSyncSignature(line, format = {}, options = {}) {
     maskRenderDilationPasses: Math.round(boundedEnvNumber("NEWTBUILDER_MASK_RENDER_DILATE_PASSES", 4, 0, 24)),
     maskRenderFeatherPixels: boundedEnvNumber("NEWTBUILDER_MASK_RENDER_FEATHER_PX", 1.5, 0, 12),
     aspectRatio: format.aspectRatio || "",
+    width: Number(format.width || parseResolution(format.resolution, format.aspectRatio).width || 0),
+    height: Number(format.height || parseResolution(format.resolution, format.aspectRatio).height || 0),
+    resolution: String(format.resolution || ""),
     fps: Number(format.fps || 30)
   });
 }
@@ -6254,15 +8215,17 @@ async function prepareLipSyncInputImage({ line, tempDir, signatureHash }) {
   return outputPath;
 }
 
-async function prepareLipSyncAudio({ line, tempDir, signatureHash }) {
+async function prepareLipSyncAudio({ line, tempDir, signatureHash, provider = "kling" }) {
   const sourcePath = line.audio?.filePath || "";
   const sourceDuration = Number(line.audio?.durationSeconds || 0) || (sourcePath ? await probeDuration(sourcePath) : 0);
-  const minimumDuration = klingAvatarMinimumAudioSeconds();
-  if (!sourcePath || sourceDuration >= minimumDuration) return sourcePath;
+  const requiredDuration = provider === "infinitalk"
+    ? infiniteTalkRequiredAudioSeconds(line)
+    : lipSyncMinimumAudioSeconds(provider);
+  if (!sourcePath || sourceDuration >= requiredDuration) return sourcePath;
 
   const lineLabel = `line-${String(line.index).padStart(3, "0")}-${signatureHash}`;
-  const outputPath = path.join(tempDir, `${lineLabel}-kling-audio.wav`);
-  const padDuration = Math.max(0.2, minimumDuration - sourceDuration + 0.2);
+  const outputPath = path.join(tempDir, `${lineLabel}-${provider}-audio.wav`);
+  const padDuration = Math.max(0.2, requiredDuration - sourceDuration + 0.2);
   await execFileAsync(
     process.env.FFMPEG_PATH || "ffmpeg",
     [
@@ -6270,7 +8233,7 @@ async function prepareLipSyncAudio({ line, tempDir, signatureHash }) {
       "-i",
       sourcePath,
       "-af",
-      `apad=pad_dur=${padDuration.toFixed(3)},atrim=0:${minimumDuration.toFixed(3)}`,
+      `apad=pad_dur=${padDuration.toFixed(3)},atrim=0:${requiredDuration.toFixed(3)}`,
       "-ar",
       "48000",
       "-ac",
@@ -6280,6 +8243,472 @@ async function prepareLipSyncAudio({ line, tempDir, signatureHash }) {
     { timeout: 90000, maxBuffer: 12 * 1024 * 1024 }
   );
   return outputPath;
+}
+
+async function runLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest }) {
+  if (provider === "infinitalk") {
+    const backend = infiniteTalkBackendForLine(line, manifest);
+    if (backend === "local") {
+      return runLocalInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath });
+    }
+    if (backend === "comfyui") {
+      return runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath });
+    }
+  }
+  return runFalLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir });
+}
+
+async function runFalLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir }) {
+  if (provider === "kling") {
+    return runFalKlingAvatar({ imagePath, audioPath, prompt, line, tempDir });
+  }
+  if (provider === "aurora") {
+    return runFalAurora({ imagePath, audioPath, prompt, line, tempDir });
+  }
+  if (provider === "infinitalk") {
+    return runFalInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir });
+  }
+  return runFalFabric({ imagePath, audioPath, line, tempDir });
+}
+
+async function runLocalInfiniteTalk({ imagePath, audioPath, prompt, line, tempDir, rawPath }) {
+  const repoDir = String(
+    process.env.LOCAL_INFINITALK_REPO_DIR ||
+      process.env.NEWTBUILDER_INFINITALK_REPO_DIR ||
+      process.env.INFINITALK_REPO_DIR ||
+      ""
+  ).trim();
+  if (!repoDir) {
+    throw new Error("Local InfiniteTalk is selected, but LOCAL_INFINITALK_REPO_DIR is not set.");
+  }
+  if (!existsSync(path.resolve(repoDir))) {
+    throw new Error(`Local InfiniteTalk repo was not found at ${repoDir}.`);
+  }
+
+  const seed = infiniteTalkSeed();
+  const timeoutMs = Number(process.env.LOCAL_INFINITALK_TIMEOUT_MS || process.env.FAL_INFINITALK_TIMEOUT_MS || 7200000);
+  const payload = {
+    image_path: imagePath,
+    audio_path: audioPath,
+    output_path: rawPath,
+    prompt,
+    repo_dir: repoDir,
+    script_path: process.env.LOCAL_INFINITALK_SCRIPT || "",
+    python: process.env.LOCAL_INFINITALK_PYTHON || process.env.INFINITALK_PYTHON || "",
+    ckpt_dir: process.env.LOCAL_INFINITALK_CKPT_DIR || "",
+    wav2vec_dir: process.env.LOCAL_INFINITALK_WAV2VEC_DIR || "",
+    infinitalk_dir: process.env.LOCAL_INFINITALK_DIR || "",
+    num_frames: infiniteTalkNumFrames(line),
+    frame_num: process.env.LOCAL_INFINITALK_FRAME_NUM || "",
+    resolution: infiniteTalkResolution(),
+    sample_steps: Number(process.env.LOCAL_INFINITALK_SAMPLE_STEPS || 0) || undefined,
+    motion_frame: Number(process.env.LOCAL_INFINITALK_MOTION_FRAME || 0) || undefined,
+    mode: process.env.LOCAL_INFINITALK_MODE || "streaming",
+    sample_text_guide_scale: process.env.LOCAL_INFINITALK_TEXT_GUIDE_SCALE || "",
+    sample_audio_guide_scale: process.env.LOCAL_INFINITALK_AUDIO_GUIDE_SCALE || "",
+    use_teacache: process.env.LOCAL_INFINITALK_USE_TEACACHE || "",
+    use_apg: process.env.LOCAL_INFINITALK_USE_APG || "",
+    low_vram: process.env.LOCAL_INFINITALK_LOW_VRAM || "",
+    quant: process.env.LOCAL_INFINITALK_QUANT || "",
+    quant_dir: process.env.LOCAL_INFINITALK_QUANT_DIR || "",
+    lora_dir: process.env.LOCAL_INFINITALK_LORA_DIR || "",
+    t5_cpu: process.env.LOCAL_INFINITALK_T5_CPU || "",
+    timeout_seconds: Math.max(60, Math.ceil(timeoutMs / 1000))
+  };
+  if (seed !== null) payload.seed = seed;
+
+  const payloadPath = path.join(tempDir, `local-infinitalk-payload-line-${String(line.index).padStart(3, "0")}.json`);
+  await writeFile(payloadPath, JSON.stringify(payload, null, 2));
+
+  let stdout = "";
+  let stderr = "";
+  try {
+    ({ stdout, stderr } = await execFileAsync(
+      process.env.NEWTBUILDER_PYTHON_PATH || "python3",
+      [localInfiniteTalkRunnerPath, payloadPath],
+      {
+        env: process.env,
+        timeout: timeoutMs,
+        maxBuffer: 64 * 1024 * 1024
+      }
+    ));
+  } catch (error) {
+    const timedOut =
+      error?.killed ||
+      error?.signal === "SIGTERM" ||
+      String(error?.message || "").toLowerCase().includes("timed out");
+    const detail = compactText(String(error?.stderr || error?.stdout || error?.message || error), 700);
+    const timeoutDetail = timedOut
+      ? `Timed out after ${Math.round(timeoutMs / 60000)} minutes. Increase LOCAL_INFINITALK_TIMEOUT_MS or lower LOCAL_INFINITALK_SAMPLE_STEPS.`
+      : "";
+    throw new Error(`Local InfiniteTalk request failed for line ${line.index}. ${[timeoutDetail, detail].filter(Boolean).join(" ")}`);
+  }
+
+  const lines = String(stdout || "")
+    .trim()
+    .split(/\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  try {
+    return JSON.parse(lines.at(-1) || "{}");
+  } catch {
+    throw new Error(`Unable to parse local InfiniteTalk response for line ${line.index}.${stderr ? ` ${compactText(stderr, 180)}` : ""}`);
+  }
+}
+
+async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, rawPath }) {
+  const workflowPath = comfyUiInfiniteTalkWorkflowPath();
+  if (!workflowPath || !existsSync(workflowPath)) {
+    throw new Error("ComfyUI InfiniteTalk is selected, but COMFYUI_INFINITALK_WORKFLOW does not point to an API-format workflow JSON file.");
+  }
+  const inputDir = comfyUiInputDir();
+  if (!inputDir || !existsSync(inputDir)) {
+    throw new Error("ComfyUI InfiniteTalk is selected, but the ComfyUI input directory was not found. Set COMFYUI_ROOT_DIR or COMFYUI_INPUT_DIR.");
+  }
+  const outputDir = comfyUiOutputDir();
+  if (!outputDir || !existsSync(outputDir)) {
+    throw new Error("ComfyUI InfiniteTalk is selected, but the ComfyUI output directory was not found. Set COMFYUI_ROOT_DIR or COMFYUI_OUTPUT_DIR.");
+  }
+
+  const timeoutMs = Number(process.env.COMFYUI_INFINITALK_TIMEOUT_MS || process.env.LOCAL_INFINITALK_TIMEOUT_MS || 7200000);
+  const graph = await loadComfyUiApiWorkflow(workflowPath);
+  const lineLabel = `line-${String(line.index).padStart(3, "0")}-${safeFileSegment(line.speaker)}`;
+  const prefix = `NewtBuilder_${lineLabel}_${Date.now()}`;
+  const imageName = await copyComfyUiInputFile(imagePath, `${prefix}-image`);
+  const audioName = await copyComfyUiInputFile(audioPath, `${prefix}-audio`);
+  const dimensions = parseResolution(format?.resolution, format?.aspectRatio);
+  const width = Number(format?.width || dimensions.width || 720);
+  const height = Number(format?.height || dimensions.height || 1280);
+  const seed = infiniteTalkSeed();
+
+  applyComfyUiWorkflowInputs(graph, {
+    imageName,
+    audioName,
+    prompt: prompt || ".",
+    negativePrompt: process.env.COMFYUI_INFINITALK_NEGATIVE_PROMPT || defaultComfyUiInfiniteTalkNegativePrompt,
+    width,
+    height,
+    numFrames: infiniteTalkNumFrames(line),
+    seed,
+    filenamePrefix: prefix
+  });
+
+  const queued = await queueComfyUiPrompt(graph, timeoutMs);
+  const promptId = queued.prompt_id || queued.promptId || "";
+  if (!promptId) {
+    throw new Error(`ComfyUI did not return a prompt id. ${compactText(JSON.stringify(queued), 260)}`);
+  }
+
+  const history = await waitForComfyUiPrompt(promptId, timeoutMs);
+  const output = findComfyUiVideoOutput(history, promptId);
+  if (!output) {
+    throw new Error(`ComfyUI completed prompt ${promptId}, but no MP4/video output was recorded in history.`);
+  }
+  const outputPath = resolveComfyUiOutputPath(output);
+  if (!outputPath || !existsSync(outputPath)) {
+    throw new Error(`ComfyUI reported an output that NewtBuilder could not find: ${compactText(JSON.stringify(output), 260)}`);
+  }
+  if (path.resolve(outputPath) !== path.resolve(rawPath)) {
+    await copyFile(outputPath, rawPath);
+  }
+
+  return {
+    video: { path: rawPath, url: "" },
+    backend: "comfyui",
+    model: comfyUiInfiniteTalkModelId(),
+    prompt_id: promptId,
+    workflow: workflowPath,
+    width,
+    height
+  };
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const detail = compactText(await response.text(), 500);
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const response = await fetchWithTimeout(url, options, timeoutMs);
+  const text = await response.text();
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Expected JSON from ${url}, received: ${compactText(text, 260)}`);
+  }
+}
+
+async function loadComfyUiApiWorkflow(workflowPath) {
+  const raw = await readFile(workflowPath, "utf8");
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Unable to parse ComfyUI workflow JSON at ${workflowPath}: ${error.message}`);
+  }
+  const graph = data?.prompt && comfyUiLooksLikeApiGraph(data.prompt) ? data.prompt : data;
+  if (Array.isArray(graph?.nodes)) {
+    throw new Error("COMFYUI_INFINITALK_WORKFLOW points to a visual ComfyUI workflow. Open it in ComfyUI and export/save it in API format for NewtBuilder.");
+  }
+  if (!comfyUiLooksLikeApiGraph(graph)) {
+    throw new Error("COMFYUI_INFINITALK_WORKFLOW must be a ComfyUI API-format graph keyed by node id.");
+  }
+  return JSON.parse(JSON.stringify(graph));
+}
+
+function comfyUiLooksLikeApiGraph(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value);
+  return entries.length > 0 && entries.every(([, node]) => node && typeof node === "object" && node.class_type && node.inputs);
+}
+
+async function copyComfyUiInputFile(sourcePath, label) {
+  const inputDir = comfyUiInputDir();
+  const extension = path.extname(sourcePath) || ".dat";
+  const fileName = `${safeFileSegment(label)}-${randomUUID().slice(0, 8)}${extension}`;
+  await mkdir(inputDir, { recursive: true });
+  await copyFile(sourcePath, path.join(inputDir, fileName));
+  return fileName;
+}
+
+function applyComfyUiWorkflowInputs(graph, values) {
+  setComfyUiWorkflowInput(graph, "image", values.imageName, {
+    required: true,
+    defaultInput: "image",
+    candidates: comfyUiCandidatesByInput(graph, ["image"], (node) => comfyUiNodeText(node).includes("loadimage"))
+  });
+  setComfyUiWorkflowInput(graph, "audio", values.audioName, {
+    required: true,
+    defaultInput: "audio",
+    candidates: comfyUiCandidatesByInput(
+      graph,
+      ["audio", "audio_file", "wav", "filename", "file", "path"],
+      (node) => comfyUiNodeText(node).includes("audio")
+    )
+  });
+  setComfyUiWorkflowInput(graph, "prompt", values.prompt, {
+    defaultInput: "text",
+    candidates: comfyUiCandidatesByInput(
+      graph,
+      ["prompt", "text", "positive"],
+      (node) => {
+        const text = comfyUiNodeText(node);
+        return text.includes("prompt") || text.includes("text") || text.includes("cliptextencode") || text.includes("string");
+      }
+    )
+  });
+  if (values.negativePrompt) {
+    setComfyUiWorkflowInput(graph, "negativePrompt", values.negativePrompt, {
+      defaultInput: "text",
+      candidates: comfyUiCandidatesByInput(
+        graph,
+        ["negative", "negative_prompt", "text"],
+        (node) => comfyUiNodeText(node).includes("negative")
+      )
+    });
+  }
+  applyComfyUiResolutionInputs(graph, values.width, values.height);
+  applyComfyUiNumericInputs(graph, "numFrames", values.numFrames, ["num_frames", "frame_num"]);
+  if (values.seed !== null && values.seed !== undefined) {
+    applyComfyUiNumericInputs(graph, "seed", values.seed, ["seed"]);
+  }
+  applyComfyUiStringInputs(graph, "filenamePrefix", values.filenamePrefix, ["filename_prefix"]);
+}
+
+function setComfyUiWorkflowInput(graph, field, value, options = {}) {
+  const mapping = comfyUiInputMapping(field);
+  if (mapping.node) {
+    const node = graph[String(mapping.node)];
+    if (!node) {
+      throw new Error(`COMFYUI_INFINITALK_${comfyUiFieldEnvKey(field)}_NODE=${mapping.node} does not exist in the API workflow.`);
+    }
+    const inputKey = mapping.input || options.defaultInput;
+    if (!inputKey) throw new Error(`Set COMFYUI_INFINITALK_${comfyUiFieldEnvKey(field)}_INPUT for node ${mapping.node}.`);
+    node.inputs[inputKey] = value;
+    return true;
+  }
+
+  const candidates = options.candidates || [];
+  if (candidates.length === 1) {
+    graph[candidates[0].id].inputs[candidates[0].input] = value;
+    return true;
+  }
+  if (candidates.length > 1 || options.required) {
+    const listed = candidates.length ? describeComfyUiCandidates(candidates) : "none found";
+    throw new Error(
+      `ComfyUI workflow input "${field}" could not be mapped automatically (${listed}). Set COMFYUI_INFINITALK_${comfyUiFieldEnvKey(field)}_NODE and COMFYUI_INFINITALK_${comfyUiFieldEnvKey(field)}_INPUT.`
+    );
+  }
+  return false;
+}
+
+function applyComfyUiResolutionInputs(graph, width, height) {
+  const mappedWidth = setComfyUiWorkflowInput(graph, "width", width, { defaultInput: "width" });
+  const mappedHeight = setComfyUiWorkflowInput(graph, "height", height, { defaultInput: "height" });
+  if (String(process.env.COMFYUI_INFINITALK_AUTO_RESOLUTION || "true").trim().toLowerCase() === "false") return;
+  if (!mappedWidth) setComfyUiInputsByName(graph, ["width", "image_width"], width);
+  if (!mappedHeight) setComfyUiInputsByName(graph, ["height", "image_height"], height);
+}
+
+function applyComfyUiNumericInputs(graph, field, value, inputNames) {
+  const mapped = setComfyUiWorkflowInput(graph, field, Number(value), { defaultInput: inputNames[0] });
+  if (!mapped) setComfyUiInputsByName(graph, inputNames, Number(value));
+}
+
+function applyComfyUiStringInputs(graph, field, value, inputNames) {
+  const mapped = setComfyUiWorkflowInput(graph, field, String(value || ""), { defaultInput: inputNames[0] });
+  if (!mapped) setComfyUiInputsByName(graph, inputNames, String(value || ""));
+}
+
+function setComfyUiInputsByName(graph, inputNames, value) {
+  const names = new Set(inputNames.map((item) => String(item).toLowerCase()));
+  let count = 0;
+  for (const node of Object.values(graph)) {
+    for (const inputName of Object.keys(node.inputs || {})) {
+      if (!names.has(inputName.toLowerCase())) continue;
+      if (!comfyUiInputIsLiteral(node.inputs[inputName])) continue;
+      node.inputs[inputName] = value;
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function comfyUiCandidatesByInput(graph, inputNames, predicate = () => true) {
+  const names = new Set(inputNames.map((item) => String(item).toLowerCase()));
+  const candidates = [];
+  for (const [id, node] of Object.entries(graph)) {
+    if (!predicate(node)) continue;
+    for (const [inputName, inputValue] of Object.entries(node.inputs || {})) {
+      if (!names.has(inputName.toLowerCase())) continue;
+      if (!comfyUiInputIsLiteral(inputValue)) continue;
+      candidates.push({ id, input: inputName, classType: node.class_type, title: node._meta?.title || "" });
+    }
+  }
+  return candidates;
+}
+
+function comfyUiInputIsLiteral(value) {
+  return !Array.isArray(value);
+}
+
+function comfyUiNodeText(node) {
+  return `${node?.class_type || ""} ${node?._meta?.title || ""}`.toLowerCase();
+}
+
+function comfyUiInputMapping(field) {
+  const envKey = comfyUiFieldEnvKey(field);
+  const directNode = String(process.env[`COMFYUI_INFINITALK_${envKey}_NODE`] || "").trim();
+  const directInput = String(process.env[`COMFYUI_INFINITALK_${envKey}_INPUT`] || "").trim();
+  const json = String(process.env.COMFYUI_INFINITALK_MAPPING_JSON || "").trim();
+  if (!json) return { node: directNode, input: directInput };
+  try {
+    const parsed = JSON.parse(json);
+    const fromJson = parsed?.[field] || parsed?.[envKey.toLowerCase()] || {};
+    return {
+      node: directNode || String(fromJson.node || fromJson.nodeId || "").trim(),
+      input: directInput || String(fromJson.input || fromJson.inputName || "").trim()
+    };
+  } catch (error) {
+    throw new Error(`COMFYUI_INFINITALK_MAPPING_JSON is not valid JSON: ${error.message}`);
+  }
+}
+
+function comfyUiFieldEnvKey(field) {
+  return String(field).replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
+}
+
+function describeComfyUiCandidates(candidates) {
+  return candidates
+    .slice(0, 8)
+    .map((candidate) => `${candidate.id}.${candidate.input} (${candidate.title || candidate.classType})`)
+    .join(", ");
+}
+
+async function queueComfyUiPrompt(graph, timeoutMs) {
+  return fetchJsonWithTimeout(
+    `${comfyUiBaseUrl()}/prompt`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: graph, client_id: randomUUID() })
+    },
+    Math.min(timeoutMs, Number(process.env.COMFYUI_REQUEST_TIMEOUT_MS || 30000))
+  );
+}
+
+async function waitForComfyUiPrompt(promptId, timeoutMs) {
+  const startedAt = Date.now();
+  const pollMs = Math.max(1000, Number(process.env.COMFYUI_POLL_INTERVAL_MS || 3000));
+  while (Date.now() - startedAt < timeoutMs) {
+    const history = await fetchJsonWithTimeout(
+      `${comfyUiBaseUrl()}/history/${encodeURIComponent(promptId)}`,
+      {},
+      Number(process.env.COMFYUI_REQUEST_TIMEOUT_MS || 30000)
+    );
+    const record = history?.[promptId];
+    const status = record?.status || {};
+    if (String(status.status_str || "").toLowerCase() === "error") {
+      throw new Error(`ComfyUI prompt ${promptId} failed. ${comfyUiExecutionErrorMessage(status)}`);
+    }
+    if (record?.outputs && status.completed !== false) return history;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  throw new Error(`ComfyUI prompt ${promptId} timed out after ${Math.round(timeoutMs / 60000)} minutes.`);
+}
+
+function comfyUiExecutionErrorMessage(status = {}) {
+  const messages = Array.isArray(status.messages) ? status.messages : [];
+  const executionError = messages
+    .map((entry) => (Array.isArray(entry) && entry[0] === "execution_error" ? entry[1] : null))
+    .filter(Boolean)
+    .at(-1);
+  if (!executionError) return compactText(JSON.stringify(status), 600);
+  const node = [executionError.node_id, executionError.node_type].filter(Boolean).join(" ");
+  const message = String(executionError.exception_message || executionError.exception_type || "").trim();
+  return compactText([node ? `Node ${node}:` : "", message].filter(Boolean).join(" "), 600);
+}
+
+function findComfyUiVideoOutput(history, promptId) {
+  const outputs = history?.[promptId]?.outputs || {};
+  const buckets = ["videos", "gifs", "animations", "files", "images"];
+  for (const nodeOutput of Object.values(outputs)) {
+    for (const bucket of buckets) {
+      const items = Array.isArray(nodeOutput?.[bucket]) ? nodeOutput[bucket] : [];
+      const match = items.find((item) => {
+        const filename = String(item?.filename || item?.name || "");
+        return /\.(mp4|mov|mkv|webm)$/i.test(filename) || String(item?.format || "").toLowerCase().includes("video");
+      });
+      if (match) return match;
+    }
+  }
+  return null;
+}
+
+function resolveComfyUiOutputPath(output) {
+  const filename = String(output?.filename || output?.name || "").trim();
+  if (!filename) return "";
+  if (path.isAbsolute(filename)) return filename;
+  const type = String(output?.type || "").trim().toLowerCase();
+  const baseDir = type === "temp" ? comfyUiTempDir() : comfyUiOutputDir();
+  const subfolder = String(output?.subfolder || "").trim();
+  const fullPath = path.resolve(baseDir, subfolder, filename);
+  const allowedBase = path.resolve(baseDir);
+  return fullPath === allowedBase || fullPath.startsWith(`${allowedBase}${path.sep}`) ? fullPath : "";
 }
 
 async function runFalKlingAvatar({ imagePath, audioPath, prompt, line, tempDir }) {
@@ -6328,6 +8757,116 @@ async function runFalKlingAvatar({ imagePath, audioPath, prompt, line, tempDir }
     return JSON.parse(lines.at(-1) || "{}");
   } catch {
     throw new Error(`Unable to parse Kling avatar response for line ${line.index}.${stderr ? ` ${compactText(stderr, 180)}` : ""}`);
+  }
+}
+
+async function runFalAurora({ imagePath, audioPath, prompt, line, tempDir }) {
+  const payloadPath = path.join(tempDir, `aurora-payload-line-${String(line.index).padStart(3, "0")}.json`);
+  await writeFile(
+    payloadPath,
+    JSON.stringify(
+      {
+        image_path: imagePath,
+        audio_path: audioPath,
+        prompt,
+        model: auroraModelId(),
+        resolution: process.env.FAL_AURORA_RESOLUTION || "720p",
+        guidance_scale: boundedEnvNumber("FAL_AURORA_GUIDANCE_SCALE", 1, 0, 20),
+        audio_guidance_scale: boundedEnvNumber("FAL_AURORA_AUDIO_GUIDANCE_SCALE", 2, 0, 20)
+      },
+      null,
+      2
+    )
+  );
+
+  let stdout = "";
+  let stderr = "";
+  try {
+    ({ stdout, stderr } = await execFileAsync(
+      process.env.NEWTBUILDER_PYTHON_PATH || "python3",
+      [falAuroraRunnerPath, payloadPath],
+      {
+        env: {
+          ...process.env,
+          FAL_KEY: falApiKey,
+          FAL_API_KEY: falApiKey
+        },
+        timeout: Number(process.env.FAL_AURORA_TIMEOUT_MS || process.env.FAL_LIPSYNC_TIMEOUT_MS || 900000),
+        maxBuffer: 12 * 1024 * 1024
+      }
+    ));
+  } catch (error) {
+    const detail = compactText(String(error?.stderr || error?.stdout || error?.message || error), 220);
+    throw new Error(`Creatify Aurora request failed for line ${line.index}. ${detail}`);
+  }
+
+  const lines = String(stdout || "")
+    .trim()
+    .split(/\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  try {
+    return JSON.parse(lines.at(-1) || "{}");
+  } catch {
+    throw new Error(`Unable to parse Creatify Aurora response for line ${line.index}.${stderr ? ` ${compactText(stderr, 180)}` : ""}`);
+  }
+}
+
+async function runFalInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir }) {
+  const seed = infiniteTalkSeed();
+  const timeoutMs = Number(process.env.FAL_INFINITALK_TIMEOUT_MS || process.env.FAL_LIPSYNC_TIMEOUT_MS || 1800000);
+  const resolution = infiniteTalkResolution(format);
+  const payload = {
+    image_path: imagePath,
+    audio_path: audioPath,
+    prompt,
+    model: infiniteTalkModelId(),
+    num_frames: infiniteTalkNumFrames(line),
+    resolution,
+    acceleration: infiniteTalkAcceleration()
+  };
+  if (seed !== null) payload.seed = seed;
+
+  const payloadPath = path.join(tempDir, `infinitalk-payload-line-${String(line.index).padStart(3, "0")}.json`);
+  await writeFile(payloadPath, JSON.stringify(payload, null, 2));
+
+  let stdout = "";
+  let stderr = "";
+  try {
+    ({ stdout, stderr } = await execFileAsync(
+      process.env.NEWTBUILDER_PYTHON_PATH || "python3",
+      [falInfiniteTalkRunnerPath, payloadPath],
+      {
+        env: {
+          ...process.env,
+          FAL_KEY: falApiKey,
+          FAL_API_KEY: falApiKey
+        },
+        timeout: timeoutMs,
+        maxBuffer: 12 * 1024 * 1024
+      }
+    ));
+  } catch (error) {
+    const timedOut =
+      error?.killed ||
+      error?.signal === "SIGTERM" ||
+      String(error?.message || "").toLowerCase().includes("timed out");
+    const detail = compactText(String(error?.stderr || error?.stdout || error?.message || error), 420);
+    const timeoutDetail = timedOut
+      ? `Timed out after ${Math.round(timeoutMs / 60000)} minutes. InfiniteTalk 720p jobs can queue or render slowly; increase FAL_INFINITALK_TIMEOUT_MS or use high acceleration for this model.`
+      : "";
+    throw new Error(`InfiniteTalk request failed for line ${line.index}. ${[timeoutDetail, detail].filter(Boolean).join(" ")}`);
+  }
+
+  const lines = String(stdout || "")
+    .trim()
+    .split(/\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  try {
+    return JSON.parse(lines.at(-1) || "{}");
+  } catch {
+    throw new Error(`Unable to parse InfiniteTalk response for line ${line.index}.${stderr ? ` ${compactText(stderr, 180)}` : ""}`);
   }
 }
 
@@ -6391,7 +8930,28 @@ function falVideoUrl(result) {
   );
 }
 
-async function normalizeLipSyncClip({ sourcePath, outputPath, fps }) {
+function localVideoPath(result) {
+  return (
+    result?.video?.path ||
+    result?.localPath ||
+    result?.local_path ||
+    result?.path ||
+    result?.output?.path ||
+    ""
+  );
+}
+
+async function normalizeLipSyncClip({ sourcePath, outputPath, fps, width, height }) {
+  const targetWidth = Math.max(0, Math.round(Number(width) || 0));
+  const targetHeight = Math.max(0, Math.round(Number(height) || 0));
+  const fitFilters =
+    targetWidth && targetHeight
+      ? [
+          `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=increase`,
+          `crop=${targetWidth}:${targetHeight}:x=(in_w-out_w)/2:y=(in_h-out_h)/2`,
+          "setsar=1"
+        ]
+      : ["setsar=1"];
   await execFileAsync(
     process.env.FFMPEG_PATH || "ffmpeg",
     [
@@ -6399,6 +8959,8 @@ async function normalizeLipSyncClip({ sourcePath, outputPath, fps }) {
       "-i",
       sourcePath,
       "-an",
+      "-vf",
+      fitFilters.join(","),
       "-c:v",
       "libx264",
       "-preset",
@@ -6417,9 +8979,15 @@ async function normalizeLipSyncClip({ sourcePath, outputPath, fps }) {
   );
 }
 
-async function compositeLipSyncClipWithMask({ lipSyncPath, stillPath, maskPath, outputPath, invertMask, fps, durationSeconds }) {
+async function compositeLipSyncClipWithMask({ lipSyncPath, stillPath, maskPath, outputPath, invertMask, fps, durationSeconds, width, height }) {
   const duration = roundSeconds(Math.max(0.35, Number(durationSeconds) || (await probeDuration(lipSyncPath)) || 0.35));
+  const targetWidth = Math.max(0, Math.round(Number(width) || 0));
+  const targetHeight = Math.max(0, Math.round(Number(height) || 0));
   const maskChain = renderMaskCleanupFilter({ invert: invertMask });
+  const outputFitChain =
+    targetWidth && targetHeight
+      ? `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=increase,crop=${targetWidth}:${targetHeight}:x=(in_w-out_w)/2:y=(in_h-out_h)/2,setsar=1`
+      : "setsar=1";
   const filterComplex = [
     "[0:v]format=rgba[fab0]",
     "[1:v]format=rgba[still0]",
@@ -6430,7 +8998,7 @@ async function compositeLipSyncClipWithMask({ lipSyncPath, stillPath, maskPath, 
     "[still]format=rgba,setsar=1[still_rgba]",
     "[maskg]format=gray[mask_gray]",
     "[fab_rgba][mask_gray]alphamerge[fab_a]",
-    "[still_rgba][fab_a]overlay=format=auto:shortest=1,setsar=1[outv]"
+    `[still_rgba][fab_a]overlay=format=auto:shortest=1,${outputFitChain}[outv]`
   ].join(";");
 
   await execFileAsync(
@@ -6562,6 +9130,137 @@ async function speakerMaskRegionForLine({ line, imageAsset, show, dimensions }) 
   const visionRegion = await openAiSpeakerMaskRegion({ line, imageAsset, show, dimensions }).catch(() => null);
   if (visionRegion) return visionRegion;
   return filenameSpeakerMaskRegion({ line, imageAsset, dimensions });
+}
+
+function castVisualPromptProfile(provider) {
+  const normalized = sanitizeLipSyncModel(provider);
+  if (normalized === "kling") {
+    return {
+      provider: "kling",
+      label: "Kling Avatar",
+      targetCharacters: 1300,
+      maxOutputTokens: 900,
+      guidance: [
+        "Kling Avatar works best with a direct cinematic instruction prompt.",
+        "Use a compact paragraph or short structured clauses that emphasize source-image preservation first, then visible character identity, framing, expression, and restrained avatar motion.",
+        "Avoid long negative lists; use concise prevention language such as no added text, no extra characters, no camera changes.",
+        "Keep it suitable to be followed by separate dialogue and shot-direction instructions."
+      ]
+    };
+  }
+  if (normalized === "aurora") {
+    return {
+      provider: "aurora",
+      label: "Creatify Aurora",
+      targetCharacters: 1600,
+      maxOutputTokens: 1100,
+      guidance: [
+        "Creatify Aurora works best with a polished talking-avatar prompt.",
+        "Use a stable visual-reference format that clearly separates identity, composition, style, lighting/background, and preservation constraints.",
+        "Favor concrete visible descriptors over abstract mood words.",
+        "Keep motion direction minimal because dialogue and per-shot motion instructions are added later."
+      ]
+    };
+  }
+  if (normalized === "infinitalk") {
+    return {
+      provider: "infinitalk",
+      label: "InfiniteTalk",
+      targetCharacters: 1500,
+      maxOutputTokens: 1000,
+      guidance: [
+        "InfiniteTalk works best with identity-first talking-head or talking-character reference prompts.",
+        "Use a concise but detailed visual identity paragraph with explicit stability instructions for face, body, outfit, art style, background, and camera framing.",
+        "Prioritize lip-sync reliability and source-image consistency over elaborate scene direction.",
+        "Avoid instructions that ask for new poses, new camera movement, or new objects."
+      ]
+    };
+  }
+  return {
+    provider: "fabric",
+    label: "Fabric",
+    targetCharacters: 1200,
+    maxOutputTokens: 800,
+    guidance: [
+      "Fabric does not currently submit a text prompt, but this Cast Visual prompt may be reused if the shot switches to a prompt-based renderer.",
+      "Generate a general image-to-video visual reference prompt focused on source-image preservation, visible character identity, composition, and style.",
+      "Do not include dialogue or per-shot action."
+    ]
+  };
+}
+
+async function generateCastVisualLipSyncPrompt({ asset, show, provider }) {
+  if (!openAiApiKey) {
+    throw new Error("OpenAI API key is not configured.");
+  }
+  const imagePath = resolveAssetPath(asset);
+  if (!imagePath) {
+    throw new Error("Cast Visual image file could not be found.");
+  }
+
+  const imageUrl = await imageDataUri(imagePath);
+  const characterNames = uniqueStrings((show?.characters || []).map((character) => character.name).filter(Boolean)).join(", ");
+  const visualStyle = show?.creative?.visualStyle || "expressive cinematic animated episodes";
+  const speakingTag = asset?.metadata?.speakingTag || asset?.metadata?.characterTags || "";
+  const profile = castVisualPromptProfile(provider);
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: process.env.NEWTBUILDER_VISION_MODEL || "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                `Create a reusable Cast Visual input prompt for the ${profile.label} lip-sync renderer.`,
+                "Inspect the uploaded image and first decide the ideal prompt format for this renderer and image.",
+                "Then output only the finished prompt text in that format. Do not explain your choice.",
+                "The prompt must be optimized for preserving the input image during lip-sync generation.",
+                "Describe only visible character identity, art style, framing, background, lighting, wardrobe, colors, expression, and source-image preservation details.",
+                "Do not invent unseen details, do not include dialogue, and do not include episode-specific shot action.",
+                `Target length: about ${profile.targetCharacters} characters; keep every important identity detail, but stay below ${lipSyncInputPromptMaxLength} characters.`,
+                ...profile.guidance,
+                `Show visual style: ${visualStyle}.`,
+                characterNames ? `Known cast names: ${characterNames}.` : "",
+                speakingTag ? `Image speaking tag: ${speakingTag}.` : "",
+                `Shot type: ${labelForShotRole(asset?.shotRole || "general")}.`,
+                `File name: ${asset?.fileName || "unknown"}.`
+              ].filter(Boolean).join("\n")
+            },
+            {
+              type: "input_image",
+              image_url: imageUrl,
+              detail: "high"
+            }
+          ]
+        }
+      ],
+      max_output_tokens: profile.maxOutputTokens
+    }),
+    signal:
+      typeof AbortSignal !== "undefined" && AbortSignal.timeout
+        ? AbortSignal.timeout(Number(process.env.OPENAI_VISION_TIMEOUT_MS || 45000))
+        : undefined
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`OpenAI visual prompt failed (${response.status})${detail ? `: ${compactText(detail, 220)}` : ""}`);
+  }
+  const payload = await response.json();
+  return compactText(
+    extractOpenAiResponseText(payload)
+      .replace(/^["'\s]*(?:prompt|visual prompt|input prompt|cast visual prompt)\s*:\s*/i, "")
+      .replace(/["'\s]+$/g, "")
+      .trim(),
+    lipSyncInputPromptMaxLength
+  );
 }
 
 async function openAiSpeakerMaskRegion({ line, imageAsset, show, dimensions }) {
@@ -7326,7 +10025,7 @@ function musicTagsFromInput(value) {
 }
 
 function cleanErrorMessage(error) {
-  return compactText(String(error?.message || error || "Unknown speech provider error").replace(/\s+/g, " "), 260);
+  return compactText(String(error?.message || error || "Unknown speech provider error").replace(/\s+/g, " "), 700);
 }
 
 function macVoiceForLine(line) {
@@ -7507,6 +10206,24 @@ function nextCurrentStage(approvals) {
   return gate ? gate.stage : "Ready";
 }
 
+function resetRenderApproval(approvals = [], note = "") {
+  return (Array.isArray(approvals) ? approvals : []).map((gate) =>
+    gate.id === "render_preview"
+      ? {
+          ...gate,
+          status: "pending",
+          approvedAt: "",
+          note: note || gate.note || ""
+        }
+      : gate
+  );
+}
+
+function renderApprovalApproved(approvals = []) {
+  const gate = (Array.isArray(approvals) ? approvals : []).find((item) => item.id === "render_preview");
+  return Boolean(gate && (gate.status === "approved" || gate.status === "auto"));
+}
+
 function deriveEpisodeStatus(approvals, currentStatus) {
   if (approvals.some((gate) => gate.status === "blocked")) return "blocked";
   if (approvals.every((gate) => gate.status === "approved" || gate.status === "auto")) return "approved";
@@ -7656,7 +10373,7 @@ function normalizeShortFormat(format = {}) {
     ...shortFormatDefaults,
     ...unboundedFormat,
     aspectRatio,
-    resolution: aspectRatio === "16:9" ? "1920x1080" : "1080x1920"
+    resolution: sanitizeFormatResolution(format.resolution, aspectRatio)
   };
 }
 
@@ -7681,12 +10398,23 @@ function normalizeAsset(asset) {
 
 function normalizeAssetMetadata(metadata) {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
-  return Object.fromEntries(
-    Object.entries(metadata)
-      .filter(([key]) => /^[A-Za-z0-9_-]{1,48}$/.test(key))
-      .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 500) : value])
-      .filter(([, value]) => ["string", "number", "boolean"].includes(typeof value) || value === null)
-  );
+  const normalized = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!/^[A-Za-z0-9_-]{1,48}$/.test(key)) continue;
+    if (!["string", "number", "boolean"].includes(typeof value) && value !== null) continue;
+    if (key === "lipSyncPrompt") {
+      normalized[key] = compactText(String(value || "").trim(), lipSyncInputPromptMaxLength);
+    } else if (key === "lipSyncModel") {
+      normalized[key] = sanitizeOptionalLipSyncModel(value);
+    } else if (key === "lipSyncPromptModel") {
+      normalized[key] = sanitizeOptionalLipSyncModel(value);
+    } else if (typeof value === "string") {
+      normalized[key] = value.slice(0, 500);
+    } else {
+      normalized[key] = value;
+    }
+  }
+  return normalized;
 }
 
 function normalizeFinishingLayers(layers = []) {
