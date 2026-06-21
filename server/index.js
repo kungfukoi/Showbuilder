@@ -4,10 +4,11 @@ import cors from "cors";
 import express from "express";
 import multer from "multer";
 import path from "node:path";
+import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { copyFile, mkdir, readFile, rm, writeFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
@@ -19,9 +20,11 @@ const falKlingAvatarRunnerPath = path.join(__dirname, "fal_kling_avatar_runner.p
 const falAuroraRunnerPath = path.join(__dirname, "fal_aurora_runner.py");
 const falInfiniteTalkRunnerPath = path.join(__dirname, "fal_infinitalk_runner.py");
 const localInfiniteTalkRunnerPath = path.join(__dirname, "local_infinitalk_runner.py");
+const defaultComfyUiStartScriptPath = path.join(rootDir, "scripts", process.platform === "win32" ? "start-comfyui-task.cmd" : "start-comfyui-task.sh");
 const dataDir = path.join(__dirname, "data");
 const uploadsDir = path.join(rootDir, "uploads");
 const outputsDir = path.join(rootDir, "outputs");
+const logsDir = path.join(rootDir, ".newtbuilder_logs");
 const showsPath = path.join(dataDir, "shows.json");
 const episodesPath = path.join(dataDir, "episodes.json");
 const jobsPath = path.join(dataDir, "jobs.json");
@@ -47,6 +50,8 @@ const youtubeScopes = youtubeScopeList.join(" ");
 const youtubeUploadScope = "https://www.googleapis.com/auth/youtube.upload";
 const youtubeReadScope = "https://www.googleapis.com/auth/youtube.readonly";
 const youtubeOAuthStates = new Map();
+let comfyUiAutoStartPromise = null;
+const comfyUiProgressEntries = new Map();
 
 const app = express();
 
@@ -139,6 +144,7 @@ const standardFormatResolutions = {
 };
 const lipSyncInputPromptMaxLength = 2400;
 const lipSyncFullPromptMaxLength = 3600;
+const animationStrengthDefault = 1;
 const defaultComfyUiInfiniteTalkNegativePrompt = [
   "pupils",
   "irises",
@@ -227,6 +233,15 @@ app.get("/api/health", async (_req, res) => {
     },
     youtube
   });
+});
+
+app.get("/api/episodes/:id/comfyui-progress", (req, res) => {
+  cleanupComfyUiProgressEntries();
+  const episodeId = String(req.params.id || "").trim();
+  const items = [...comfyUiProgressEntries.values()]
+    .filter((entry) => entry.episodeId === episodeId)
+    .sort((a, b) => Date.parse(b.updatedAt || b.startedAt || "") - Date.parse(a.updatedAt || a.startedAt || ""));
+  res.json({ items });
 });
 
 app.get("/api/youtube/connect-url", async (_req, res) => {
@@ -353,7 +368,11 @@ app.patch("/api/shows/:id", async (req, res) => {
     createdAt: current.createdAt,
     updatedAt: new Date().toISOString()
   });
+  const propagated = propagateShowFormatToEpisodes(await readEpisodes(), updated);
   await writeShows([updated, ...shows.filter((show) => show.id !== updated.id)]);
+  if (propagated.changedCount) {
+    await writeEpisodes(propagated.episodes);
+  }
   res.json(updated);
 });
 
@@ -387,7 +406,35 @@ app.delete("/api/shows/:id", async (req, res) => {
 app.get("/api/episodes", async (req, res) => {
   const episodes = await readEpisodes();
   const showId = String(req.query.showId || "");
-  res.json(showId ? episodes.filter((episode) => episode.showId === showId) : episodes);
+  res.json(sortEpisodesForShelf(showId ? episodes.filter((episode) => episode.showId === showId) : episodes));
+});
+
+app.patch("/api/episodes/reorder", async (req, res) => {
+  const episodes = await readEpisodes();
+  const showId = cleanId(req.body?.showId);
+  const requestedIds = Array.isArray(req.body?.episodeIds) ? req.body.episodeIds.map(cleanId).filter(Boolean) : [];
+  if (!showId || !requestedIds.length) {
+    return res.status(400).json({ error: "Send a showId and ordered episodeIds to reorder episodes." });
+  }
+
+  const showEpisodes = sortEpisodesForShelf(episodes.filter((episode) => episode.showId === showId));
+  const showEpisodeIds = new Set(showEpisodes.map((episode) => episode.id));
+  const orderedIds = [
+    ...requestedIds.filter((id) => showEpisodeIds.has(id)),
+    ...showEpisodes.map((episode) => episode.id).filter((id) => !requestedIds.includes(id))
+  ];
+  const orderById = new Map(orderedIds.map((id, index) => [id, index]));
+  const updatedEpisodes = episodes.map((episode) =>
+    episode.showId === showId && orderById.has(episode.id)
+      ? normalizeEpisode({ ...episode, sortOrder: orderById.get(episode.id) })
+      : episode
+  );
+
+  await writeEpisodes(updatedEpisodes);
+  res.json({
+    episodes: sortEpisodesForShelf(updatedEpisodes.filter((episode) => episode.showId === showId)),
+    allEpisodes: sortEpisodesForShelf(updatedEpisodes)
+  });
 });
 
 app.get("/api/episodes/:id", async (req, res) => {
@@ -406,10 +453,12 @@ app.post("/api/episodes", async (req, res) => {
   }
 
   const now = new Date().toISOString();
+  const episodes = await readEpisodes();
   const episode = normalizeEpisode({
     id: randomUUID(),
     showId: show.id,
     title: String(req.body.title || nextEpisodeTitle(show)).trim(),
+    sortOrder: nextEpisodeSortOrder(episodes, show.id),
     createdAt: now,
     updatedAt: now,
     scriptText: String(req.body.scriptText || ""),
@@ -426,7 +475,6 @@ app.post("/api/episodes", async (req, res) => {
     jobLog: []
   });
 
-  const episodes = await readEpisodes();
   await writeEpisodes([episode, ...episodes]);
   res.json(episode);
 });
@@ -444,7 +492,8 @@ app.post("/api/episodes/:id/duplicate", async (req, res) => {
     episode: current,
     show,
     episodes: episodes.filter((item) => item.showId === current.showId),
-    title: req.body?.title
+    title: req.body?.title,
+    sortOrder: nextEpisodeSortOrder(episodes, current.showId)
   });
 
   await writeEpisodes([duplicate, ...episodes]);
@@ -544,13 +593,12 @@ app.post("/api/episodes/:id/assets", upload.array("assets", 24), async (req, res
   const requestedShotRole = sanitizeShotRole(req.body.role || "general");
   const requestedRoleLabel = String(req.body.roleLabel || labelForShotRole(requestedShotRole)).trim();
   const assets = files.map((file) => {
-    const binding = shotFilenameBinding(file.originalname);
-    const shotRole = binding.shotRole && requestedShotRole !== "mask" ? binding.shotRole : requestedShotRole;
+    const shotRole = requestedShotRole;
     return {
       id: randomUUID(),
       type: mediaTypeForMime(file.mimetype),
       shotRole,
-      roleLabel: binding.shotRole ? labelForShotRole(shotRole) : requestedRoleLabel,
+      roleLabel: requestedRoleLabel,
       fileName: file.originalname,
       storedFileName: file.filename,
       mimeType: file.mimetype || "application/octet-stream",
@@ -601,10 +649,36 @@ app.patch("/api/episodes/:id/assets/:assetId", async (req, res) => {
   const hasLipSyncPrompt =
     Object.prototype.hasOwnProperty.call(req.body || {}, "lipSyncPrompt") ||
     Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "lipSyncPrompt");
+  const hasAnimationStrength =
+    Object.prototype.hasOwnProperty.call(req.body || {}, "animationStrength") ||
+    Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "animationStrength");
+  const previousAnimationStrength = animationStrengthForAsset(asset);
+  const requestedAnimationStrength = hasAnimationStrength
+    ? normalizeOptionalAnimationStrength(req.body?.animationStrength ?? req.body?.metadata?.animationStrength)
+    : null;
+  const nextAnimationStrength = hasAnimationStrength
+    ? requestedAnimationStrength ?? defaultAnimationStrength()
+    : previousAnimationStrength;
+  const animationStrengthChanged = hasAnimationStrength && nextAnimationStrength !== previousAnimationStrength;
+  const hasShotRole =
+    Object.prototype.hasOwnProperty.call(req.body || {}, "shotRole") ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, "role") ||
+    Object.prototype.hasOwnProperty.call(req.body?.metadata || {}, "shotRole");
+  const requestedShotRole = hasShotRole
+    ? sanitizeShotRole(req.body?.shotRole ?? req.body?.role ?? req.body?.metadata?.shotRole)
+    : "";
+  const nextShotRole = requestedShotRole && requestedShotRole !== "mask" ? requestedShotRole : sanitizeShotRole(asset.shotRole || "general");
+  const nextRoleLabel = hasShotRole ? labelForShotRole(nextShotRole) : asset.roleLabel;
   const updatedAssets = current.assets.map((item) =>
     item.id === assetId
       ? normalizeAsset({
           ...item,
+          ...(hasShotRole
+            ? {
+                shotRole: nextShotRole,
+                roleLabel: nextRoleLabel
+              }
+            : {}),
           metadata: {
             ...(item.metadata || {}),
             ...(hasSpeakingTag ? { speakingTag } : {}),
@@ -618,14 +692,15 @@ app.patch("/api/episodes/:id/assets/:assetId", async (req, res) => {
                     lipSyncInputPromptMaxLength
                   )
                 }
-              : {})
+              : {}),
+            ...(hasAnimationStrength ? { animationStrength: requestedAnimationStrength } : {})
           }
         })
       : item
   );
 
   const removedAutoMaskIds = new Set(
-    hasSpeakingTag
+    hasSpeakingTag || hasShotRole
       ? current.assets
           .filter(
             (item) =>
@@ -637,20 +712,57 @@ app.patch("/api/episodes/:id/assets/:assetId", async (req, res) => {
       : []
   );
   const remainingAssets = updatedAssets.filter((item) => !removedAutoMaskIds.has(item.id));
-  const productionMap = clearMaskAssetsFromProductionMap(current.productionMap, removedAutoMaskIds);
 
   const shows = await readShows();
   const show = shows.find((item) => item.id === current.showId) || shows[0];
+  const updatedAsset = remainingAssets.find((item) => item.id === assetId) || asset;
+  const characters = new Map((show?.characters || []).map((character) => [character.id, character]));
+  let productionMap = clearMaskAssetsFromProductionMap(current.productionMap, removedAutoMaskIds);
+  if (animationStrengthChanged) {
+    productionMap = productionMap.map((line, index) => {
+      const normalized = normalizeProductionLine(line, index);
+      if (
+        normalized.lineType === "insert" ||
+        normalized.assetId !== assetId ||
+        normalizeOptionalAnimationStrength(normalized.animationStrengthOverride) !== null
+      ) {
+        return normalized;
+      }
+      const provider = lipSyncModelForLine(normalized, {
+        imageAsset: updatedAsset,
+        character: characters.get(normalized.characterId),
+        show
+      });
+      if (provider !== "infinitalk") return normalized;
+      return normalizeProductionLine(
+        {
+          ...normalized,
+          videoStatus: "pending",
+          videoTake: null,
+          videoTakes: [],
+          videoError: "",
+          videoWarning: ""
+        },
+        index
+      );
+    });
+  }
   const updated = await ensureAutomaticSpeakerMasksForEpisode(normalizeEpisode({
     ...current,
-    approvals: (hasSpeakingTag || hasLipSyncModel || hasLipSyncPrompt)
+    approvals: (hasSpeakingTag || hasLipSyncModel || hasLipSyncPrompt || hasShotRole || hasAnimationStrength)
       ? resetRenderApproval(current.approvals, "Cast Visual defaults changed after render review.")
       : current.approvals,
     assets: remainingAssets,
     productionMap,
     jobLog: appendLog(
       current.jobLog,
-      hasSpeakingTag ? `Updated speaking tag for ${asset.fileName}.` : `Updated Cast Visual defaults for ${asset.fileName}.`
+      hasShotRole
+        ? `Updated shot type for ${asset.fileName}.`
+        : hasSpeakingTag
+          ? `Updated speaking tag for ${asset.fileName}.`
+          : hasAnimationStrength
+            ? `Updated animation strength for ${asset.fileName}.`
+            : `Updated Cast Visual defaults for ${asset.fileName}.`
     ),
     updatedAt: new Date().toISOString()
   }), show);
@@ -1538,7 +1650,7 @@ app.post("/api/episodes/:id/finishing-layers/assets", upload.array("assets", 12)
     if (!uploadedLayers.length) {
       throw new Error("Finishing layers support image, video, and audio files.");
     }
-    const currentLayers = normalizeFinishingLayers(current.drafts?.finishingLayers);
+    const currentLayers = finishingLayersFromRequestOrEpisode(req, current);
     const seenLayerKeys = new Set(currentLayers.map(finishingLayerImportKey).filter(Boolean));
     const createdLayers = [];
     let skippedCount = 0;
@@ -1600,7 +1712,7 @@ app.post("/api/episodes/:id/finishing/music", async (req, res) => {
 
   try {
     const music = await generateElevenVideoMusicLayer({ episode: current, brief: req.body || {} });
-    const currentLayers = normalizeFinishingLayers(current.drafts?.finishingLayers);
+    const currentLayers = finishingLayersFromRequestOrEpisode(req, current);
     const updated = normalizeEpisode({
       ...current,
       drafts: {
@@ -1636,11 +1748,11 @@ app.post("/api/episodes/:id/finishing/laugh-track", async (req, res) => {
   }
 
   try {
-    const laughTrack = await generateElevenLaughTrackLayer({ episode: current, brief: req.body || {} });
+    const currentLayers = finishingLayersFromRequestOrEpisode(req, current);
+    const laughTrack = await generateElevenLaughTrackLayer({ episode: current, brief: req.body || {}, currentLayers });
     const generatedLayers = Array.isArray(laughTrack.layers) && laughTrack.layers.length
       ? laughTrack.layers
       : [laughTrack.layer].filter(Boolean);
-    const currentLayers = normalizeFinishingLayers(current.drafts?.finishingLayers);
     const updated = normalizeEpisode({
       ...current,
       drafts: {
@@ -1650,7 +1762,9 @@ app.post("/api/episodes/:id/finishing/laugh-track", async (req, res) => {
       outputs: [laughTrack.output, ...(current.outputs || [])],
       jobLog: appendLog(
         current.jobLog,
-        generatedLayers.length > 1
+        generatedLayers.length === 0
+          ? "Generated ElevenLabs laugh track audio, but no new cue placements were available."
+          : generatedLayers.length > 1
           ? `Generated ElevenLabs laugh track and placed ${generatedLayers.length} cues.`
           : `Generated ElevenLabs laugh track layer: ${generatedLayers[0]?.fileName || laughTrack.output.fileName}.`
       ),
@@ -1681,11 +1795,11 @@ app.post("/api/episodes/:id/finishing/applause-track", async (req, res) => {
   }
 
   try {
-    const applauseTrack = await generateElevenApplauseTrackLayer({ episode: current, brief: req.body || {} });
+    const currentLayers = finishingLayersFromRequestOrEpisode(req, current);
+    const applauseTrack = await generateElevenApplauseTrackLayer({ episode: current, brief: req.body || {}, currentLayers });
     const generatedLayers = Array.isArray(applauseTrack.layers) && applauseTrack.layers.length
       ? applauseTrack.layers
       : [applauseTrack.layer].filter(Boolean);
-    const currentLayers = normalizeFinishingLayers(current.drafts?.finishingLayers);
     const updated = normalizeEpisode({
       ...current,
       drafts: {
@@ -1695,7 +1809,9 @@ app.post("/api/episodes/:id/finishing/applause-track", async (req, res) => {
       outputs: [applauseTrack.output, ...(current.outputs || [])],
       jobLog: appendLog(
         current.jobLog,
-        generatedLayers.length > 1
+        generatedLayers.length === 0
+          ? "Generated ElevenLabs applause track audio, but no new cue placements were available."
+          : generatedLayers.length > 1
           ? `Generated ElevenLabs applause track and placed ${generatedLayers.length} cues.`
           : `Generated ElevenLabs applause track layer: ${generatedLayers[0]?.fileName || applauseTrack.output.fileName}.`
       ),
@@ -1785,7 +1901,8 @@ app.post("/api/episodes/:id/thumbnails/generate", async (req, res) => {
       ...current,
       drafts: {
         ...(current.drafts || {}),
-        selectedThumbnailOutputId: ""
+        selectedThumbnailOutputId: "",
+        thumbnailBrief
       },
       outputs: [...thumbnails.outputs, ...(current.outputs || []).filter((output) => output.type !== "thumbnail_image")],
       jobLog: appendLog(
@@ -2196,11 +2313,82 @@ app.post("/api/episodes/:id/audio/rebuild-mix", async (req, res) => {
   }
 });
 
+app.post("/api/episodes/:id/audio/regenerate-all", async (req, res) => {
+  const shows = await readShows();
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+  const show = shows.find((item) => item.id === current.showId) || shows[0];
+  const format = normalizeShortFormat({
+    ...(show?.shortFormat || {}),
+    ...(current.format || {})
+  });
+  const reportId = randomUUID();
+
+  try {
+    const submittedMap = Array.isArray(req.body?.productionMap) ? req.body.productionMap : current.productionMap;
+    const productionMapEditedAt = String(req.body?.productionMapEditedAt ?? current.productionMapEditedAt ?? "");
+    const clearedProductionMap = normalizeProductionMapForFormat(submittedMap, format).map((line, index) =>
+      clearAudioForFullRegeneration(line, index)
+    );
+    const episodeForAudio = normalizeEpisode({
+      ...current,
+      format,
+      productionMap: clearedProductionMap,
+      productionMapEditedAt,
+      approvals: resetRenderApproval(current.approvals, "All dialogue audio changed after render review."),
+      updatedAt: new Date().toISOString()
+    });
+
+    let report = await writeLocalBuildReport({ reportId, episode: episodeForAudio, show, blockedGate: null });
+    const preview = await createLocalPreview({ previewId: reportId, episode: episodeForAudio, show, renderVideo: false });
+    report = await attachPreviewToReport(report, preview);
+    const productionMap = attachAudioTakesToProductionMap(episodeForAudio.productionMap, preview.manifest.lines);
+    const outputs = [
+      ...preview.outputs,
+      {
+        id: reportId,
+        type: "build_report",
+        name: report.fileName,
+        localUrl: report.localUrl,
+        createdAt: report.createdAt
+      }
+    ];
+    const updated = normalizeEpisode({
+      ...episodeForAudio,
+      productionMap,
+      status: current.status,
+      currentStage: current.currentStage,
+      outputs: [...outputs, ...(current.outputs || [])],
+      jobLog: appendLog(current.jobLog, `All dialogue audio regenerated. Report: ${report.localUrl}`),
+      updatedAt: new Date().toISOString()
+    });
+    const job = {
+      id: randomUUID(),
+      episodeId: current.id,
+      showId: show.id,
+      status: "audio_regenerated",
+      currentStage: updated.currentStage,
+      createdAt: new Date().toISOString(),
+      summary: "All dialogue audio regenerated and the audio review mix was rebuilt. No publishing was attempted.",
+      steps: [{ id: "audio_regenerate", label: "Regenerate all dialogue audio", enabled: true, status: "rendered" }]
+    };
+    const jobs = await readJobs();
+    await writeJobs([job, ...jobs].slice(0, 200));
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.json({ episode: updated, job, report });
+  } catch (error) {
+    res.status(400).json({ error: cleanErrorMessage(error) });
+  }
+});
+
 app.get("/api/jobs", async (_req, res) => {
   res.json(await readJobs());
 });
 
-app.listen(port, "127.0.0.1", () => {
+globalThis.newtBuilderApiServer = http.createServer(app).listen(port, "127.0.0.1", () => {
   console.log(`NewtBuilder API listening on http://127.0.0.1:${port}`);
 });
 
@@ -2225,6 +2413,36 @@ async function readEpisodes() {
 
 async function writeEpisodes(episodes) {
   await writeFile(episodesPath, JSON.stringify(episodes.map(normalizeEpisode), null, 2));
+}
+
+function episodeShelfOrderValue(episode) {
+  const sortOrder = Number(episode?.sortOrder);
+  if (Number.isFinite(sortOrder)) return sortOrder;
+  const timestamp = Date.parse(episode?.createdAt || episode?.updatedAt || "");
+  return Number.isFinite(timestamp) ? -timestamp : Number.MAX_SAFE_INTEGER;
+}
+
+function episodeTimestampValue(episode) {
+  const timestamp = Date.parse(episode?.updatedAt || episode?.createdAt || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sortEpisodesForShelf(episodes = []) {
+  return [...episodes].sort((a, b) => {
+    const showCompare = String(a.showId || "").localeCompare(String(b.showId || ""));
+    if (showCompare) return showCompare;
+    return (
+      episodeShelfOrderValue(a) - episodeShelfOrderValue(b) ||
+      episodeTimestampValue(b) - episodeTimestampValue(a) ||
+      String(a.title || "").localeCompare(String(b.title || ""))
+    );
+  });
+}
+
+function nextEpisodeSortOrder(episodes = [], showId = "") {
+  const showEpisodes = (Array.isArray(episodes) ? episodes : []).filter((episode) => episode.showId === showId);
+  if (!showEpisodes.length) return 0;
+  return Math.min(...showEpisodes.map(episodeShelfOrderValue)) - 1;
 }
 
 async function readJobs() {
@@ -2322,7 +2540,7 @@ function lineCanUseSpeakerMask(line, asset) {
 
 function lineExpectsSpeakerMask(line, asset) {
   if (!lineCanUseSpeakerMask(line, asset)) return false;
-  return shotFilenameBinding(asset?.fileName).roles.length > 1;
+  return assetShotBinding(asset).roles.length > 1;
 }
 
 function speakerMaskMatchesLine(maskAsset, line) {
@@ -2459,6 +2677,7 @@ function normalizeShow(show) {
 }
 
 function normalizeEpisode(episode) {
+  const sortOrder = Number(episode.sortOrder);
   const format = normalizeShortFormat(episode.format);
   const assets = Array.isArray(episode.assets) ? episode.assets.map(normalizeAsset) : [];
   const productionMap = Array.isArray(episode.productionMap)
@@ -2467,12 +2686,14 @@ function normalizeEpisode(episode) {
   const drafts = {
     ...emptyDrafts(defaultShow()),
     ...(episode.drafts || {}),
+    thumbnailBrief: sanitizeThumbnailBrief(episode.drafts?.thumbnailBrief || {}),
     finishingLayers: normalizeFinishingLayers(episode.drafts?.finishingLayers)
   };
   return {
     id: cleanId(episode.id) || randomUUID(),
     showId: cleanId(episode.showId),
     title: String(episode.title || "Untitled Episode").trim() || "Untitled Episode",
+    sortOrder: Number.isFinite(sortOrder) ? sortOrder : null,
     status: String(episode.status || "draft"),
     currentStage: String(episode.currentStage || "Planning"),
     createdAt: episode.createdAt || new Date().toISOString(),
@@ -2494,7 +2715,111 @@ function normalizeEpisode(episode) {
   };
 }
 
-function duplicateEpisodeForNextScript({ episode, show, episodes = [], title = "" }) {
+function shortFormatKey(format = {}) {
+  const normalized = normalizeShortFormat(format);
+  return JSON.stringify({
+    aspectRatio: normalized.aspectRatio,
+    resolution: normalized.resolution,
+    fps: Number(normalized.fps || 0),
+    wordsPerMinute: Number(normalized.wordsPerMinute || 0),
+    container: normalized.container || "",
+    videoCodec: normalized.videoCodec || "",
+    audioCodec: normalized.audioCodec || "",
+    audioSampleRate: Number(normalized.audioSampleRate || 0)
+  });
+}
+
+function videoTakeMatchesFormat(take, format = {}) {
+  const normalizedTake = normalizeVideoTake(take);
+  if (!normalizedTake) return false;
+  if (normalizedTake.source === "user-upload") return true;
+  const targetFormat = normalizeShortFormat(format);
+  const targetDimensions = parseResolution(targetFormat.resolution, targetFormat.aspectRatio);
+  const takeDimensions = parseResolution(normalizedTake.resolution, normalizedTake.aspectRatio || targetFormat.aspectRatio);
+  const takeWidth = Number(normalizedTake.width || takeDimensions.width || 0);
+  const takeHeight = Number(normalizedTake.height || takeDimensions.height || 0);
+  const takeResolution = normalizeResolutionValue(normalizedTake.resolution || `${takeWidth}x${takeHeight}`);
+  return (
+    normalizedTake.aspectRatio === targetFormat.aspectRatio &&
+    takeResolution === targetFormat.resolution &&
+    takeWidth === targetDimensions.width &&
+    takeHeight === targetDimensions.height
+  );
+}
+
+function propagateLineFormat(line, format, index = 0) {
+  const normalized = normalizeProductionLine(line, index);
+  const originalTakes = normalizeVideoTakes(normalized.videoTakes, normalized.videoTake);
+  const keptTakes = originalTakes.filter((take) => videoTakeMatchesFormat(take, format));
+  const activeTake = videoTakeMatchesFormat(normalized.videoTake, format) ? normalizeVideoTake(normalized.videoTake) : null;
+  const staleTakeCount = originalTakes.length - keptTakes.length + (normalized.videoTake && !activeTake && !originalTakes.length ? 1 : 0);
+  if (!staleTakeCount && activeTake) {
+    return {
+      line: normalizeProductionLine(
+        {
+          ...normalized,
+          videoTake: activeTake,
+          videoTakes: normalizeVideoTakes(keptTakes, activeTake)
+        },
+        index
+      ),
+      staleTakeCount: 0
+    };
+  }
+  return {
+    line: normalizeProductionLine(
+      {
+        ...normalized,
+        videoStatus: activeTake ? normalized.videoStatus : "pending",
+        videoTake: activeTake,
+        videoTakes: normalizeVideoTakes(keptTakes, activeTake),
+        videoError: activeTake ? normalized.videoError : "",
+        videoWarning: activeTake ? normalized.videoWarning : ""
+      },
+      index
+    ),
+    staleTakeCount
+  };
+}
+
+function propagateShowFormatToEpisodes(episodes = [], show = {}) {
+  const nextFormat = normalizeShortFormat(show.shortFormat);
+  const formatNote = `Show format changed to ${nextFormat.resolution} ${nextFormat.aspectRatio} at ${nextFormat.fps} fps.`;
+  let changedCount = 0;
+  const propagatedEpisodes = (Array.isArray(episodes) ? episodes : []).map((episode) => {
+    const normalized = normalizeEpisode(episode);
+    if (normalized.showId !== show.id) return normalized;
+
+    const formatChanged = shortFormatKey(normalized.format) !== shortFormatKey(nextFormat);
+    let staleTakeCount = 0;
+    const productionMap = normalized.productionMap.map((line, index) => {
+      const propagated = propagateLineFormat(line, nextFormat, index);
+      staleTakeCount += propagated.staleTakeCount;
+      return propagated.line;
+    });
+    if (!formatChanged && !staleTakeCount) return normalized;
+
+    const staleNote = staleTakeCount
+      ? ` Cleared ${staleTakeCount} generated shot video take${staleTakeCount === 1 ? "" : "s"} that no longer matched the show format.`
+      : "";
+    const note = formatChanged
+      ? formatNote
+      : `Show format reconciled episode shots to ${nextFormat.resolution} ${nextFormat.aspectRatio} at ${nextFormat.fps} fps.`;
+    changedCount += 1;
+
+    return normalizeEpisode({
+      ...normalized,
+      format: nextFormat,
+      productionMap,
+      approvals: resetRenderApproval(normalized.approvals, note),
+      updatedAt: show.updatedAt || new Date().toISOString(),
+      jobLog: appendLog(normalized.jobLog, `${note}${staleNote}`)
+    });
+  });
+  return { episodes: propagatedEpisodes, changedCount };
+}
+
+function duplicateEpisodeForNextScript({ episode, show, episodes = [], title = "", sortOrder = null }) {
   const source = normalizeEpisode(episode);
   const now = new Date().toISOString();
   const reusableAssets = source.assets.filter((asset) => asset.type !== "script");
@@ -2516,6 +2841,7 @@ function duplicateEpisodeForNextScript({ episode, show, episodes = [], title = "
     ...source,
     id: randomUUID(),
     title: String(title || "").trim() || nextEpisodeDuplicateTitle(source.title, episodes),
+    sortOrder: Number.isFinite(Number(sortOrder)) ? Number(sortOrder) : nextEpisodeSortOrder(episodes, source.showId),
     status: "draft",
     currentStage: "Script",
     createdAt: now,
@@ -2678,6 +3004,7 @@ function emptyDrafts(show) {
       }
     },
     thumbnails: [],
+    thumbnailBrief: sanitizeThumbnailBrief({}),
     finishingLayers: [],
     social: []
   };
@@ -2784,6 +3111,7 @@ function createProductionMap({ scriptText, show, format = show?.shortFormat, ass
           previous?.expressiveBodyMotion ?? Boolean(show.production?.defaultExpressiveBodyMotion),
         lipSyncModel: previous?.lipSyncModel || previous?.lipSyncModelOverride || "",
         lipSyncModelOverride: previous?.lipSyncModelOverride || "",
+        animationStrengthOverride: previous?.animationStrengthOverride ?? null,
         shotRole,
         assetId,
         maskAssetId,
@@ -2974,8 +3302,10 @@ function normalizeProductionLine(line, index = 0) {
     text: String(line.text || "").trim(),
     audioTags: sanitizeAudioTags(line.audioTags),
     expressiveBodyMotion: Boolean(line.expressiveBodyMotion),
+    audienceCue: normalizeAudienceCue(line.audienceCue),
     lipSyncModel: sanitizeOptionalLipSyncModel(line.lipSyncModel),
     lipSyncModelOverride: sanitizeOptionalLipSyncModel(line.lipSyncModelOverride),
+    animationStrengthOverride: normalizeOptionalAnimationStrength(line.animationStrengthOverride),
     shotRole: sanitizeShotRole(line.shotRole || "character_one_shot"),
     assetId: cleanId(line.assetId),
     maskAssetId,
@@ -3005,6 +3335,26 @@ function normalizeProductionLine(line, index = 0) {
   };
 }
 
+function sanitizeAudienceCueMode(value) {
+  const normalized = String(value || "auto").trim().toLowerCase();
+  if (["force", "laugh", "add", "on", "yes", "true"].includes(normalized)) return "force";
+  if (["none", "off", "no", "false", "never", "skip"].includes(normalized)) return "none";
+  return "auto";
+}
+
+function normalizeAudienceCue(cue = {}) {
+  const source = cue && typeof cue === "object" && !Array.isArray(cue) ? cue : {};
+  const rawIntensity = Number(source.intensity ?? source.laughIntensity);
+  const rawDuration = Number(source.durationSeconds ?? source.laughDurationSeconds);
+  const rawOffset = Number(source.offsetSeconds ?? source.laughOffsetSeconds);
+  return {
+    laugh: sanitizeAudienceCueMode(source.laugh ?? source.laughMode ?? source.mode),
+    intensity: Number.isFinite(rawIntensity) ? roundSeconds(clampNumber(rawIntensity, 0, 1)) : null,
+    durationSeconds: Number.isFinite(rawDuration) && rawDuration > 0 ? roundSeconds(clampNumber(rawDuration, 0.5, 30)) : null,
+    offsetSeconds: Number.isFinite(rawOffset) ? roundSeconds(clampNumber(rawOffset, -0.2, 2)) : null
+  };
+}
+
 function normalizeProductionMapForFormat(productionMap = [], format = {}) {
   return (Array.isArray(productionMap) ? productionMap : []).map((line, index) => {
     const normalized = normalizeProductionLine(line, index);
@@ -3018,6 +3368,23 @@ function normalizeProductionMapForFormat(productionMap = [], format = {}) {
       index
     );
   });
+}
+
+function clearAudioForFullRegeneration(line, index = 0) {
+  const normalized = normalizeProductionLine(line, index);
+  const nextLine = {
+    ...normalized,
+    audioStatus: "pending",
+    audioTake: null
+  };
+  if (normalized.lineType !== "insert") {
+    nextLine.videoStatus = "pending";
+    nextLine.videoTake = null;
+    nextLine.videoTakes = [];
+    nextLine.videoError = "";
+    nextLine.videoWarning = "";
+  }
+  return normalizeProductionLine(nextLine, index);
 }
 
 function applyStoredSpeakerMasks(productionMap = [], assets = []) {
@@ -3199,6 +3566,8 @@ function inferShotRole(line, index, total, wideIndexes = wideShotIndexes(total))
 function bestAssetForProductionLine({ assets = [], character, speaker, shotRole, speakerType, desiredRoles = [] }) {
   const imageAssets = assets.filter((asset) => asset.type === "image");
   const roleAssets = imageAssets.filter((asset) => effectiveAssetShotRole(asset) === shotRole);
+  const speakerTaggedAssets = imageAssets.filter((asset) => assetSpeakingRoles(asset).includes(speakerType));
+  const speakerTaggedRoleAssets = roleAssets.filter((asset) => assetSpeakingRoles(asset).includes(speakerType));
   const boundMatches = roleAssets
     .map((asset) => ({ asset, binding: assetShotBinding(asset) }))
     .filter(({ binding }) => binding.roles.length > 0)
@@ -3215,18 +3584,14 @@ function bestAssetForProductionLine({ assets = [], character, speaker, shotRole,
     .filter(({ score }) => score > Number.NEGATIVE_INFINITY)
     .sort((a, b) => b.score - a.score);
   if (boundMatches.length) return boundMatches[0].asset.id || "";
+  if (speakerTaggedRoleAssets.length) return speakerTaggedRoleAssets[0].id || "";
+  if (speakerTaggedAssets.length) return speakerTaggedAssets[0].id || "";
 
   const hasBoundAssetsForRole = roleAssets.some((asset) => assetShotBinding(asset).roles.length > 0);
   if (hasBoundAssetsForRole) return "";
 
-  const preferredNames = [speaker, character?.name, character?.role].map(keyForMatch).filter(Boolean);
-  const nameMatched = roleAssets.find((asset) =>
-    preferredNames.some((name) => keyForMatch(asset.fileName).includes(name))
-  );
-  const speakerMatched = roleAssets.find((asset) => keyForMatch(asset.fileName).includes(speakerType));
   const speakingTagged = roleAssets.find((asset) => assetSpeakingRoles(asset).includes(speakerType));
-  const prefixed = roleAssets.find((asset) => fileStartsWithShotPrefix(asset.fileName, shotRole));
-  return (speakingTagged || speakerMatched || nameMatched || prefixed || roleAssets[0] || imageAssets[0])?.id || "";
+  return (speakingTagged || roleAssets[0] || imageAssets[0])?.id || "";
 }
 
 function baseCastRolesForShow(show) {
@@ -3234,7 +3599,7 @@ function baseCastRolesForShow(show) {
   const roles = new Set();
   for (const character of characters) {
     const role = speakerTypeFor(character.name || character.role);
-    if (role === "max" || role === "pip") roles.add(role);
+    if (role) roles.add(role);
   }
   if (!roles.size) {
     roles.add("max");
@@ -3265,27 +3630,39 @@ function scoreBoundShotAsset({ binding, speakingRoles = [], shotRole, speakerTyp
   const desired = uniqueRoleList(desiredRoles);
   if (!roles.length) return Number.NEGATIVE_INFINITY;
   if (activeSpeakers.length && !activeSpeakers.includes(speakerType)) return Number.NEGATIVE_INFINITY;
+  if (!roles.includes(speakerType)) return Number.NEGATIVE_INFINITY;
 
   if (shotRole === "character_one_shot") {
-    if (roles.length !== 1 || roles[0] !== speakerType) return Number.NEGATIVE_INFINITY;
-    return 100 + (activeSpeakers.includes(speakerType) ? 30 : 0);
+    return 120 + (activeSpeakers.includes(speakerType) ? 30 : 0);
   }
 
-  const missingDesired = desired.filter((role) => !roles.includes(role));
-  if (missingDesired.length) return Number.NEGATIVE_INFINITY;
-  if (!desired.includes("guest") && roles.includes("guest")) return Number.NEGATIVE_INFINITY;
-
-  const exact = roles.length === desired.length;
-  return 80 + desired.length * 10 + (exact ? 20 : 0) + (activeSpeakers.includes(speakerType) ? 30 : 0) - Math.max(0, roles.length - desired.length);
+  const desiredBonus = desired.includes(speakerType) ? 20 : 0;
+  return 100 + desiredBonus + (activeSpeakers.includes(speakerType) ? 30 : 0);
 }
 
 function effectiveAssetShotRole(asset) {
-  const binding = shotFilenameBinding(asset?.fileName);
-  return binding.shotRole || sanitizeShotRole(asset?.shotRole || "general");
+  const storedRole = sanitizeShotRole(asset?.shotRole || asset?.role || "");
+  if (storedRole && storedRole !== "general") return storedRole;
+  return storedRole || "general";
 }
 
 function assetShotBinding(asset) {
-  return shotFilenameBinding(asset?.fileName);
+  const shotRole = effectiveAssetShotRole(asset);
+  return {
+    prefix: shotRolePrefixForRole(shotRole),
+    shotRole,
+    roles: assetSpeakingRoles(asset)
+  };
+}
+
+function shotRolePrefixForRole(role) {
+  return {
+    character_one_shot: "CU",
+    medium_two_shot: "MS",
+    wide_shot: "WS",
+    insert_shot: "INS",
+    mask: "MASK"
+  }[role] || "";
 }
 
 function assetSpeakingRoles(asset) {
@@ -3414,9 +3791,10 @@ function uniqueRoleList(roles = []) {
 
 function speakerTypeFor(speaker) {
   const key = keyForMatch(speaker);
+  if (!key) return "";
   if (key === "max") return "max";
   if (key === "pip" || key === "pop") return "pip";
-  return "guest";
+  return key;
 }
 
 function defaultVoiceForSpeakerType(type) {
@@ -4129,6 +4507,8 @@ function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistin
     const character = characters.get(normalized.characterId);
     const visualLipSyncModel = sanitizeOptionalLipSyncModel(imageAsset?.metadata?.lipSyncModel);
     const visualLipSyncPrompt = lineLipSyncInputPrompt(normalized, imageAsset);
+    const visualAnimationStrength = animationStrengthForAsset(imageAsset);
+    const resolvedAnimationStrength = animationStrengthForLine(normalized, imageAsset);
     const resolvedLipSyncModel = lipSyncModelForLine(normalized, { imageAsset, character, show });
     const videoTake = reusableVideoTakeForLine(normalized, imageAsset, endImageAsset, format, maskAsset, {
       show,
@@ -4152,11 +4532,15 @@ function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistin
       text: normalized.text,
       audioTags: normalized.audioTags,
       expressiveBodyMotion: Boolean(normalized.expressiveBodyMotion),
+      audienceCue: normalized.audienceCue,
       lipSyncModel: resolvedLipSyncModel,
       lipSyncModelOverride: sanitizeOptionalLipSyncModel(normalized.lipSyncModel || normalized.lipSyncModelOverride),
+      animationStrength: resolvedAnimationStrength,
+      animationStrengthOverride: normalizeOptionalAnimationStrength(normalized.animationStrengthOverride),
       infiniteTalkBackend,
       visualLipSyncModel,
       visualLipSyncPrompt,
+      visualAnimationStrength,
       audioStatus: normalized.audioStatus,
       audioTake: normalized.audioTake,
       videoStatus: normalized.videoStatus,
@@ -4181,7 +4565,8 @@ function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistin
             fileName: imageAsset.fileName,
             localUrl: imageAsset.localUrl,
             lipSyncModel: visualLipSyncModel,
-            lipSyncPrompt: visualLipSyncPrompt
+            lipSyncPrompt: visualLipSyncPrompt,
+            animationStrength: visualAnimationStrength
           }
         : null,
       imagePath: resolveAssetPath(imageAsset),
@@ -4329,7 +4714,8 @@ async function renderLipSyncClipsForManifest({
         aspectRatio: take.aspectRatio || manifest.format.aspectRatio || "",
         masked: Boolean(line.needsMask && line.maskPath),
         invertMask: Boolean(line.invertMask),
-        expressiveBodyMotion: Boolean(line.expressiveBodyMotion)
+        expressiveBodyMotion: Boolean(line.expressiveBodyMotion),
+        animationStrength: animationStrengthForLine(line)
       });
       continue;
     }
@@ -4446,7 +4832,8 @@ async function renderLipSyncClipsForManifest({
         aspectRatio: manifest.format.aspectRatio || "",
         masked,
         invertMask: Boolean(line.invertMask),
-        expressiveBodyMotion: Boolean(line.expressiveBodyMotion)
+        expressiveBodyMotion: Boolean(line.expressiveBodyMotion),
+        animationStrength: animationStrengthForLine(line)
       });
     } catch (error) {
       const message = compactText(String(error?.message || error || `Unknown ${providerLabel} error`).replace(/\s+/g, " "), 700);
@@ -4989,7 +5376,59 @@ async function generateElevenVideoMusicLayer({ episode, brief = {} }) {
   return { layer, output };
 }
 
-async function generateElevenLaughTrackLayer({ episode, brief = {} }) {
+function audienceReactionProfile(kind, value) {
+  const energy = Math.round(clampNumber(value ?? (kind === "applause" ? 60 : 55), 0, 100));
+  const normalized = energy / 100;
+  const high = energy >= 75;
+  const low = energy <= 30;
+  const medium = !high && !low;
+  const label = high ? "high energy" : low ? "low energy" : "medium energy";
+  const laugh = kind === "laugh";
+  return {
+    kind,
+    energy,
+    normalized,
+    label,
+    prompt:
+      laugh
+        ? high
+          ? "Audience energy: high. Big responsive studio laughs, lively crowd texture, occasional delighted whoops, clean comedy timing, no applause and no spoken words."
+          : low
+            ? "Audience energy: low. Sparse natural chuckles, restrained audience response, intimate room feel, no applause and no spoken words."
+            : "Audience energy: medium. Natural late-night studio laughs, warm chuckles, responsive but not overwhelming, no applause and no spoken words."
+        : high
+          ? "Audience energy: high. Strong enthusiastic applause, dense clapping, light cheering, celebratory room energy, no laughter and no spoken words."
+          : low
+            ? "Audience energy: low. Polite restrained applause, small studio audience, short clean claps, no laughter and no spoken words."
+            : "Audience energy: medium. Warm studio applause, clean clapping, light crowd excitement, no laughter and no spoken words.",
+    scoreThreshold: laugh ? 1.55 - normalized * 0.45 : 1.35 - normalized * 0.25,
+    minCueDuration: laugh ? (low ? 0.55 : 0.75) : low ? 0.75 : 1,
+    minSpacing: laugh ? Math.max(1.25, 2.6 - normalized * 1.1) : Math.max(3.5, 6.4 - normalized * 2.0),
+    postLineDelay: laugh ? Math.max(0.04, 0.16 - normalized * 0.08) : Math.max(0.08, 0.2 - normalized * 0.08),
+    fadeInSeconds: laugh ? (high ? 0.08 : medium ? 0.12 : 0.16) : high ? 0.12 : medium ? 0.18 : 0.24,
+    fadeOutSeconds: laugh ? (high ? 0.42 : medium ? 0.35 : 0.28) : high ? 0.72 : medium ? 0.55 : 0.42
+  };
+}
+
+function audienceReactionPrompt({ kind, description, profile }) {
+  const base = String(description || "").replace(/\s+/g, " ").trim();
+  const guardrails =
+    kind === "laugh"
+      ? "Generate only audience laughter and chuckles. Avoid applause, music, speech, words, narration, and sound logos."
+      : "Generate only audience applause. Avoid laughter, music, speech, words, narration, and sound logos.";
+  return [base, profile.prompt, guardrails].filter(Boolean).join(" ");
+}
+
+function audienceCueFadeOutSeconds(profile, durationSeconds, placement = null) {
+  const duration = Math.max(0.1, Number(durationSeconds) || 0.1);
+  const intensity = placement ? clampNumber(placement.intensity ?? 0.5, 0, 1) : 0.5;
+  const baseFade = placement?.cueKind === "laugh" || profile.kind === "laugh"
+    ? profile.fadeOutSeconds * (0.85 + intensity * 0.65)
+    : profile.fadeOutSeconds;
+  return roundSeconds(clampNumber(duration * 0.18, baseFade * 0.65, Math.max(baseFade, 1.2)));
+}
+
+async function generateElevenLaughTrackLayer({ episode, brief = {}, currentLayers = [] }) {
   const sourceOutput = latestFinalVideoOutput(episode);
   const sourcePath = outputFilePath(sourceOutput);
   if (!sourcePath) {
@@ -5008,11 +5447,15 @@ async function generateElevenLaughTrackLayer({ episode, brief = {} }) {
   const url = new URL("https://api.elevenlabs.io/v1/sound-generation");
   if (outputFormat) url.searchParams.set("output_format", outputFormat);
 
+  const energyProfile = audienceReactionProfile("laugh", brief.energy ?? 55);
   const description = compactText(
-    String(
-      brief.description ||
-        "Warm studio audience laugh track for a late-night comedy monologue: natural laughs, small chuckles, no words, no applause."
-    ).trim(),
+    audienceReactionPrompt({
+      kind: "laugh",
+      description:
+        brief.description ||
+        "Warm studio audience laugh track for a late-night comedy monologue: natural laughs, small chuckles, no words, no applause.",
+      profile: energyProfile
+    }),
     1000
   );
   const requestedDuration = clampNumber(brief.durationSeconds ?? Math.min(8, sourceDuration || 8), 0.5, 30);
@@ -5055,29 +5498,105 @@ async function generateElevenLaughTrackLayer({ episode, brief = {} }) {
 
   const audioDuration = Number((await probeDuration(outputPath)) || 0);
   const autoPlace = brief.autoPlace !== false;
-  const maxCues = Math.round(clampNumber(brief.maxCues ?? 4, 1, 8));
+  const autoCueCount = brief.autoCueCount !== false;
+  const maxCues = Math.round(clampNumber(brief.maxCues ?? 100, 1, 100));
   const cueDuration = clampNumber(
     brief.cueDurationSeconds ?? Math.min(2.4, audioDuration || requestedDuration),
     0.5,
     Math.max(0.5, audioDuration || requestedDuration)
   );
+  const startNudgeSeconds = roundSeconds(clampNumber(brief.startNudgeSeconds ?? -0.1, -0.5, 1));
   const fallbackLayerDuration = Math.min(sourceDuration || audioDuration || requestedDuration, audioDuration || requestedDuration);
-  const placements = autoPlace
-    ? await laughTrackPlacementsForEpisode({
+  const cueTimeline = autoPlace ? await laughTrackTimelineLinesForEpisode(episode) : { lines: [], totalSeconds: 0 };
+  const currentCueExclusions = audienceCueExclusionsForGeneration({ episode, layers: currentLayers, kind: "laugh" });
+  const productionCueExclusions = autoPlace ? productionMapAudienceCueExclusions(cueTimeline.lines, "laugh") : [];
+  const cueExclusions = [...currentCueExclusions, ...productionCueExclusions];
+  const forcedCueResult = autoPlace
+    ? forcedAudienceCuePlacementsForLines({
+        lines: cueTimeline.lines,
+        totalDuration: sourceDuration || cueTimeline.totalSeconds,
+        cueDuration,
+        energy: energyProfile.energy,
+        startNudgeSeconds,
+        cueExclusions: currentCueExclusions
+      })
+    : { placements: [], warning: "" };
+  const scriptPlacements = autoPlace
+    ? await scriptCueDirectorPlacementsForEpisode({
+        episode,
+        kind: "laugh",
+        baseDuration: sourceDuration,
+        cueDuration,
+        maxCues,
+        energy: energyProfile.energy,
+        autoCueCount,
+        startNudgeSeconds,
+        cueExclusions
+      })
+    : { placements: [], warning: "", source: "" };
+  const directedPlacements = autoPlace && scriptPlacements.placements.length
+    ? scriptPlacements
+    : autoPlace && String(process.env.NEWTBUILDER_ALLOW_LAUGH_AUDIO_CUE_FALLBACK || "").toLowerCase() === "true"
+      ? await audioCueDirectorPlacementsForEpisode({
+        episode,
+        kind: "laugh",
+        baseDuration: sourceDuration,
+        cueDuration,
+        maxCues,
+        energy: energyProfile.energy,
+        autoCueCount,
+        startNudgeSeconds,
+        cueExclusions
+      })
+      : {
+        placements: [],
+        warning: scriptPlacements.warning || "Script cue director found no punchlines; no laugh cues were placed.",
+        source: scriptPlacements.source || "openai-script-punchline-director"
+      };
+  const allowLaughHeuristicFallback =
+    String(process.env.NEWTBUILDER_ALLOW_LAUGH_HEURISTIC_FALLBACK || "").toLowerCase() === "true" || !openAiApiKey;
+  const placements = autoPlace && directedPlacements.placements.length
+    ? directedPlacements.placements
+    : autoPlace && allowLaughHeuristicFallback
+      ? await laughTrackPlacementsForEpisode({
         episode,
         baseDuration: sourceDuration,
         cueDuration,
-        maxCues
+        maxCues,
+        energy: energyProfile.energy,
+        autoCueCount,
+        startNudgeSeconds,
+        cueExclusions
       })
     : [];
-  const effectivePlacements = placements.length
-    ? placements
-    : [
+  const effectiveAutoPlacements = placements;
+  const mergedPlacements = autoPlace
+    ? mergeAudienceCuePlacements({
+        forcedPlacements: forcedCueResult.placements,
+        autoPlacements: effectiveAutoPlacements,
+        maxCues
+      })
+    : placements;
+  const placementSource = forcedCueResult.placements.length
+    ? directedPlacements.placements.length
+      ? `production-map-laugh-marker + ${directedPlacements.source}`
+      : "production-map-laugh-marker"
+    : directedPlacements.placements.length
+    ? directedPlacements.source
+    : autoPlace && allowLaughHeuristicFallback
+      ? "script-heuristic"
+      : directedPlacements.source || "openai-script-punchline-director";
+  const placementWarning = [forcedCueResult.warning, directedPlacements.warning].filter(Boolean).join(" ");
+  const effectivePlacements = mergedPlacements.length
+    ? mergedPlacements
+    : autoPlace
+      ? []
+      : [
         {
           startSeconds: 0,
-          durationSeconds: autoPlace ? Math.min(cueDuration, fallbackLayerDuration) : fallbackLayerDuration,
+          durationSeconds: fallbackLayerDuration,
           lineIndex: 0,
-          reason: autoPlace ? "No punchline timing found; placed at the start." : "Manual placement."
+          reason: "Manual placement."
         }
       ];
   const layers = effectivePlacements.map((placement, index) =>
@@ -5091,14 +5610,23 @@ async function generateElevenLaughTrackLayer({ episode, brief = {} }) {
       storedFileName: "",
       mimeType: contentType,
       localUrl: `/outputs/laugh-tracks/${fileName}`,
+      cueKind: "laugh",
+      cueLineId: placement.lineId || "",
+      cueLineIndex: placement.lineIndex || 0,
+      cueScore: placement.score || 0,
+      cueReason: placement.reason || "",
+      cueIntensity: placement.intensity || 0,
+      cueConfidence: placement.confidence || 0,
+      cueSource: placement.source || placementSource,
+      cueStartNudgeSeconds: startNudgeSeconds,
       enabled: true,
       startSeconds: placement.startSeconds,
       durationSeconds: placement.durationSeconds,
       sourceDurationSeconds: audioDuration || requestedDuration,
       sourceFileSize: audioBytes.length,
-      volume: clampNumber(brief.volume ?? 0.22, 0, 2),
-      fadeInSeconds: 0.12,
-      fadeOutSeconds: 0.35,
+      volume: audienceCueVolume(brief.volume ?? 0.22, placement, "laugh"),
+      fadeInSeconds: audienceCueFadeInSeconds(energyProfile, placement),
+      fadeOutSeconds: audienceCueFadeOutSeconds(energyProfile, placement.durationSeconds, placement),
       createdAt: new Date().toISOString()
     })
   );
@@ -5115,14 +5643,21 @@ async function generateElevenLaughTrackLayer({ episode, brief = {} }) {
     outputFormat: outputFormat || "default",
     durationSeconds: audioDuration || requestedDuration,
     promptInfluence,
+    energy: energyProfile.energy,
+    energyLabel: energyProfile.label,
     autoPlaced: autoPlace,
+    autoCueCount,
+    startNudgeSeconds,
+    placementSource,
+    placementWarning,
+    excludedCueCount: cueExclusions.length,
     placements: effectivePlacements,
     createdAt: new Date().toISOString()
   };
   return { layer: layers[0] || null, layers, output };
 }
 
-async function generateElevenApplauseTrackLayer({ episode, brief = {} }) {
+async function generateElevenApplauseTrackLayer({ episode, brief = {}, currentLayers = [] }) {
   const sourceOutput = latestFinalVideoOutput(episode);
   const sourcePath = outputFilePath(sourceOutput);
   if (!sourcePath) {
@@ -5141,11 +5676,15 @@ async function generateElevenApplauseTrackLayer({ episode, brief = {} }) {
   const url = new URL("https://api.elevenlabs.io/v1/sound-generation");
   if (outputFormat) url.searchParams.set("output_format", outputFormat);
 
+  const energyProfile = audienceReactionProfile("applause", brief.energy ?? 60);
   const description = compactText(
-    String(
-      brief.description ||
-        "Warm studio audience applause for a late-night show: clean clapping, light cheering, no laughter, no words, no music."
-    ).trim(),
+    audienceReactionPrompt({
+      kind: "applause",
+      description:
+        brief.description ||
+        "Warm studio audience applause for a late-night show: clean clapping, light cheering, no laughter, no words, no music.",
+      profile: energyProfile
+    }),
     1000
   );
   const requestedDuration = clampNumber(brief.durationSeconds ?? Math.min(10, sourceDuration || 10), 0.5, 30);
@@ -5188,29 +5727,56 @@ async function generateElevenApplauseTrackLayer({ episode, brief = {} }) {
 
   const audioDuration = Number((await probeDuration(outputPath)) || 0);
   const autoPlace = brief.autoPlace !== false;
-  const maxCues = Math.round(clampNumber(brief.maxCues ?? 3, 1, 8));
+  const autoCueCount = brief.autoCueCount !== false;
+  const maxCues = Math.round(clampNumber(brief.maxCues ?? 12, 1, 100));
   const cueDuration = clampNumber(
     brief.cueDurationSeconds ?? Math.min(3.2, audioDuration || requestedDuration),
     0.5,
     Math.max(0.5, audioDuration || requestedDuration)
   );
   const fallbackLayerDuration = Math.min(sourceDuration || audioDuration || requestedDuration, audioDuration || requestedDuration);
-  const placements = autoPlace
-    ? await applauseTrackPlacementsForEpisode({
+  const cueExclusions = audienceCueExclusionsForGeneration({ episode, layers: currentLayers, kind: "applause" });
+  const directedPlacements = autoPlace
+    ? await audioCueDirectorPlacementsForEpisode({
+        episode,
+        kind: "applause",
+        baseDuration: sourceDuration,
+        cueDuration,
+        maxCues,
+        energy: energyProfile.energy,
+        autoCueCount,
+        cueExclusions
+      })
+    : { placements: [], warning: "", source: "" };
+  const placements = autoPlace && directedPlacements.placements.length
+    ? directedPlacements.placements
+    : autoPlace
+      ? await applauseTrackPlacementsForEpisode({
         episode,
         baseDuration: sourceDuration,
         cueDuration,
-        maxCues
+        maxCues,
+        energy: energyProfile.energy,
+        autoCueCount,
+        cueExclusions
       })
     : [];
+  const placementSource = directedPlacements.placements.length
+    ? directedPlacements.source
+    : autoPlace
+      ? "script-heuristic"
+      : "manual";
+  const placementWarning = directedPlacements.warning || "";
   const effectivePlacements = placements.length
     ? placements
-    : [
+    : autoPlace
+      ? []
+      : [
         {
           startSeconds: 0,
-          durationSeconds: autoPlace ? Math.min(cueDuration, fallbackLayerDuration) : fallbackLayerDuration,
+          durationSeconds: fallbackLayerDuration,
           lineIndex: 0,
-          reason: autoPlace ? "No applause timing found; placed at the start." : "Manual placement."
+          reason: "Manual placement."
         }
       ];
   const layers = effectivePlacements.map((placement, index) =>
@@ -5224,14 +5790,22 @@ async function generateElevenApplauseTrackLayer({ episode, brief = {} }) {
       storedFileName: "",
       mimeType: contentType,
       localUrl: `/outputs/applause-tracks/${fileName}`,
+      cueKind: "applause",
+      cueLineId: placement.lineId || "",
+      cueLineIndex: placement.lineIndex || 0,
+      cueScore: placement.score || 0,
+      cueReason: placement.reason || "",
+      cueIntensity: placement.intensity || 0,
+      cueConfidence: placement.confidence || 0,
+      cueSource: placement.source || placementSource,
       enabled: true,
       startSeconds: placement.startSeconds,
       durationSeconds: placement.durationSeconds,
       sourceDurationSeconds: audioDuration || requestedDuration,
       sourceFileSize: audioBytes.length,
-      volume: clampNumber(brief.volume ?? 0.24, 0, 2),
-      fadeInSeconds: 0.18,
-      fadeOutSeconds: 0.55,
+      volume: audienceCueVolume(brief.volume ?? 0.24, placement, "applause"),
+      fadeInSeconds: audienceCueFadeInSeconds(energyProfile, placement),
+      fadeOutSeconds: audienceCueFadeOutSeconds(energyProfile, placement.durationSeconds, placement),
       createdAt: new Date().toISOString()
     })
   );
@@ -5248,14 +5822,896 @@ async function generateElevenApplauseTrackLayer({ episode, brief = {} }) {
     outputFormat: outputFormat || "default",
     durationSeconds: audioDuration || requestedDuration,
     promptInfluence,
+    energy: energyProfile.energy,
+    energyLabel: energyProfile.label,
     autoPlaced: autoPlace,
+    autoCueCount,
+    placementSource,
+    placementWarning,
+    excludedCueCount: cueExclusions.length,
     placements: effectivePlacements,
     createdAt: new Date().toISOString()
   };
   return { layer: layers[0] || null, layers, output };
 }
 
-async function laughTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDuration = 2.4, maxCues = 4 }) {
+function audienceCueExclusionsForGeneration({ episode, layers = [], kind = "laugh" }) {
+  const cueKind = kind === "applause" ? "applause" : "laugh";
+  const exclusionsByKey = new Map();
+
+  function addExclusion(source, cue, fallbackReason) {
+    const normalized = {
+      lineId: cleanId(cue?.cueLineId || cue?.lineId),
+      lineIndex: Math.max(0, Math.round(Number(cue?.cueLineIndex ?? cue?.lineIndex) || 0)),
+      startSeconds: roundSeconds(cue?.startSeconds),
+      reason: fallbackReason
+    };
+    const keys = audienceCueKeys(normalized);
+    for (const key of keys) {
+      if (!exclusionsByKey.has(key)) {
+        exclusionsByKey.set(key, {
+          ...normalized,
+          source,
+          reason: fallbackReason
+        });
+      }
+    }
+  }
+
+  for (const layer of normalizeFinishingLayers(layers)) {
+    if (layer.cueKind !== cueKind) continue;
+    addExclusion("timeline", layer, "already on timeline");
+  }
+
+  return [...exclusionsByKey.values()];
+}
+
+function audienceCueKeys(cue) {
+  const keys = [];
+  const lineId = cleanId(cue?.cueLineId || cue?.lineId);
+  const lineIndex = Math.max(0, Math.round(Number(cue?.cueLineIndex ?? cue?.lineIndex) || 0));
+  if (lineId) keys.push(`lineId:${lineId}`);
+  if (lineIndex) keys.push(`lineIndex:${lineIndex}`);
+  return keys;
+}
+
+function audienceCueExclusionKeySet(cueExclusions = []) {
+  const keys = new Set();
+  for (const cue of Array.isArray(cueExclusions) ? cueExclusions : []) {
+    for (const key of audienceCueKeys(cue)) keys.add(key);
+  }
+  return keys;
+}
+
+function audienceCueIsExcluded(cue, exclusionKeys) {
+  if (!exclusionKeys?.size) return false;
+  return audienceCueKeys(cue).some((key) => exclusionKeys.has(key));
+}
+
+function audienceCueModeForLine(line, kind = "laugh") {
+  if (kind !== "laugh") return "auto";
+  return normalizeAudienceCue(line?.audienceCue).laugh;
+}
+
+function productionMapAudienceCueExclusions(lines = [], kind = "laugh") {
+  const exclusions = [];
+  for (const line of timelineDialogueLines(lines)) {
+    const mode = audienceCueModeForLine(line, kind);
+    if (mode === "auto") continue;
+    exclusions.push({
+      lineId: line.id || "",
+      lineIndex: Number(line.index) || 0,
+      startSeconds: roundSeconds(line.startSeconds),
+      source: "production_map",
+      reason: mode === "force" ? "handled by production-map laugh marker" : "blocked by production-map no-laugh marker"
+    });
+  }
+  return exclusions;
+}
+
+function fittedAudienceCueForLine({ line, totalDuration, requestedCueDuration, profile, startNudgeSeconds = 0 }) {
+  const lineStart = Number(line.audioStartSeconds ?? line.startSeconds ?? 0);
+  const lineDuration = Number(line.durationSeconds || 0);
+  const lineEnd = Number(line.audioEndSeconds ?? (lineStart + lineDuration));
+  const startSeconds = roundSeconds(Math.max(0, lineEnd + profile.postLineDelay + clampNumber(startNudgeSeconds, -0.5, 1)));
+  const endLimit = Number(totalDuration || 0);
+  const availableSeconds = roundSeconds(endLimit - startSeconds);
+  if (availableSeconds < Math.min(profile.minCueDuration, 0.25)) return null;
+  return {
+    startSeconds,
+    durationSeconds: roundSeconds(Math.max(Math.min(requestedCueDuration, availableSeconds), Math.min(profile.minCueDuration, availableSeconds))),
+    availableSeconds
+  };
+}
+
+function forcedAudienceCuePlacementsForLines({ lines = [], totalDuration = 0, cueDuration = 2.4, energy = 55, startNudgeSeconds = 0, cueExclusions = [] }) {
+  const profile = audienceReactionProfile("laugh", energy);
+  const dialogueLines = timelineDialogueLines(lines);
+  const exclusionKeys = audienceCueExclusionKeySet(cueExclusions);
+  const requestedCueDuration = clampNumber(cueDuration, profile.minCueDuration, 30);
+  const placements = [];
+  const skipped = [];
+
+  for (const line of dialogueLines) {
+    const audienceCue = normalizeAudienceCue(line.audienceCue);
+    if (audienceCue.laugh !== "force") continue;
+    if (audienceCueIsExcluded({ lineId: line.id || "", lineIndex: Number(line.index) || 0 }, exclusionKeys)) continue;
+
+    const lineStart = Number(line.audioStartSeconds ?? line.startSeconds ?? 0);
+    const lineDuration = Number(line.durationSeconds || 0);
+    const lineEnd = Number(line.audioEndSeconds ?? (lineStart + lineDuration));
+    const offsetSeconds = Number.isFinite(audienceCue.offsetSeconds)
+      ? audienceCue.offsetSeconds
+      : profile.postLineDelay + clampNumber(startNudgeSeconds, -0.5, 1);
+    const startSeconds = roundSeconds(Math.max(0, lineEnd + offsetSeconds));
+    const availableSeconds = roundSeconds(Number(totalDuration || 0) - startSeconds);
+    if (availableSeconds < Math.min(profile.minCueDuration, 0.25)) {
+      skipped.push(Number(line.index) || 0);
+      continue;
+    }
+
+    const intensity = Number.isFinite(audienceCue.intensity) ? audienceCue.intensity : Math.max(0.52, profile.normalized);
+    const shapedDuration = audienceCue.durationSeconds || requestedCueDuration * (0.58 + intensity * 0.72);
+    placements.push({
+      startSeconds,
+      durationSeconds: roundSeconds(clampNumber(shapedDuration, profile.minCueDuration, Math.min(availableSeconds, requestedCueDuration * 1.75))),
+      lineId: line.id || "",
+      lineIndex: Number(line.index) || 0,
+      score: roundSeconds(profile.scoreThreshold + 1.2),
+      confidence: 1,
+      intensity,
+      energy: profile.energy,
+      energyLabel: profile.label,
+      reason: compactText(String(line.text || "Production-map laugh marker.").trim(), 160),
+      source: "production-map-laugh-marker"
+    });
+  }
+
+  return {
+    placements,
+    warning: skipped.length
+      ? `Production-map laugh marker could not fit after line${skipped.length === 1 ? "" : "s"} ${skipped.join(", ")}. Add tail time or shorten the cue.`
+      : ""
+  };
+}
+
+function mergeAudienceCuePlacements({ forcedPlacements = [], autoPlacements = [], maxCues = 100 }) {
+  const selected = [];
+  const keys = new Set();
+  const addPlacement = (placement, force = false) => {
+    if (!placement) return;
+    const placementKeys = audienceCueKeys(placement);
+    if (placementKeys.some((key) => keys.has(key))) return;
+    if (!force && selected.length >= Math.max(0, Math.round(Number(maxCues) || 0))) return;
+    selected.push(placement);
+    for (const key of placementKeys) keys.add(key);
+  };
+
+  for (const placement of forcedPlacements) addPlacement(placement, true);
+  for (const placement of autoPlacements) addPlacement(placement, false);
+  return selected.sort((a, b) => a.startSeconds - b.startSeconds);
+}
+
+async function scriptCueDirectorPlacementsForEpisode({
+  episode,
+  kind = "laugh",
+  baseDuration = 0,
+  cueDuration = 2.4,
+  maxCues = 100,
+  energy = 55,
+  autoCueCount = true,
+  startNudgeSeconds = 0,
+  cueExclusions = []
+}) {
+  const source = kind === "applause" ? "openai-script-applause-director" : "openai-script-punchline-director";
+  if (!openAiApiKey || String(process.env.NEWTBUILDER_DISABLE_SCRIPT_CUE_DIRECTOR || "").toLowerCase() === "true") {
+    return { placements: [], warning: "", source };
+  }
+
+  const timeline = await laughTrackTimelineLinesForEpisode(episode);
+  const lines = timeline.lines;
+  if (!lines.length) {
+    return {
+      placements: [],
+      warning: "Script cue director skipped because no timed dialogue lines were found.",
+      source
+    };
+  }
+
+  const totalDuration = Number(baseDuration) || Number(timeline.totalSeconds) || 0;
+  if (!totalDuration) {
+    return {
+      placements: [],
+      warning: "Script cue director skipped because the final timeline duration could not be measured.",
+      source
+    };
+  }
+
+  try {
+    const response = await runOpenAiScriptCueDirector({
+      episode,
+      kind,
+      lines,
+      totalDuration,
+      cueDuration,
+      maxCues,
+      energy,
+      autoCueCount,
+      startNudgeSeconds,
+      cueExclusions
+    });
+    const placements = validateAudioCueDirectorPlacements({
+      response,
+      lines,
+      totalDuration,
+      kind,
+      cueDuration,
+      maxCues,
+      energy,
+      source,
+      startNudgeSeconds,
+      cueExclusions
+    });
+    const expectedCueCount = Math.round(
+      Number(response?.expectedCueCount ?? response?.expectedCount ?? response?.cueCount ?? response?.punchlineCount ?? 0)
+    );
+    const countWarning =
+      expectedCueCount > 0 && placements.length !== Math.min(expectedCueCount, Math.round(clampNumber(maxCues, 1, 100)))
+        ? `Script cue director found ${expectedCueCount} ${kind === "laugh" ? "punchline" : "applause"} cue${expectedCueCount === 1 ? "" : "s"} but ${placements.length} could be placed after timing and timeline exclusions.`
+        : "";
+    return {
+      placements,
+      warning: placements.length ? countWarning : "Script cue director returned no usable punchline placements; trying audio cue director.",
+      source
+    };
+  } catch (error) {
+    return {
+      placements: [],
+      warning: `Script cue director failed; trying audio cue director. ${cleanErrorMessage(error)}`,
+      source
+    };
+  }
+}
+
+async function runOpenAiScriptCueDirector({
+  episode,
+  kind,
+  lines,
+  totalDuration,
+  cueDuration,
+  maxCues,
+  energy,
+  autoCueCount,
+  startNudgeSeconds,
+  cueExclusions = []
+}) {
+  const model =
+    String(
+      process.env.NEWTBUILDER_SCRIPT_CUE_DIRECTOR_MODEL ||
+        process.env.NEWTBUILDER_CUE_DIRECTOR_TEXT_MODEL ||
+        "gpt-4.1-mini"
+    ).trim() || "gpt-4.1-mini";
+  const prompt = scriptCueDirectorPrompt({
+    episode,
+    kind,
+    lines,
+    totalDuration,
+    cueDuration,
+    maxCues,
+    energy,
+    autoCueCount,
+    startNudgeSeconds,
+    cueExclusions
+  });
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: prompt
+            }
+          ]
+        }
+      ],
+      max_output_tokens: 2200
+    }),
+    signal:
+      typeof AbortSignal !== "undefined" && AbortSignal.timeout
+        ? AbortSignal.timeout(Number(process.env.NEWTBUILDER_SCRIPT_CUE_DIRECTOR_TIMEOUT_MS || 90000))
+        : undefined
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`OpenAI script cue director returned ${response.status}${detail ? `: ${compactText(detail, 240)}` : ""}`);
+  }
+
+  const payload = await response.json();
+  const parsed = parseResponseJsonObject(extractOpenAiResponseText(payload));
+  if (!parsed || !Array.isArray(parsed.cues)) {
+    throw new Error("OpenAI script cue director did not return a JSON object with a cues array.");
+  }
+  return parsed;
+}
+
+function scriptCueDirectorPrompt({ episode, kind, lines, totalDuration, cueDuration, maxCues, energy, autoCueCount, cueExclusions = [] }) {
+  const profile = audienceReactionProfile(kind, energy);
+  const dialogueLines = timelineDialogueLines(lines).map((line, index, allLines) => {
+    const startSeconds = roundSeconds(line.startSeconds);
+    const durationSeconds = roundSeconds(line.durationSeconds);
+    const cueScoreLine = kind === "applause" ? applauseTrackLineScore : laughTrackLineScore;
+    return {
+      lineIndex: Number(line.index) || 0,
+      lineId: line.id || "",
+      speaker: compactText(line.speaker || line.character || "", 60),
+      audioStartSeconds: roundSeconds(line.audioStartSeconds ?? startSeconds),
+      audioEndSeconds: roundSeconds(line.audioEndSeconds ?? startSeconds + durationSeconds),
+      previousText: compactText(line.previousText || "", 220),
+      text: compactText(line.text || "", 420),
+      nextText: compactText(line.nextText || "", 220),
+      scriptCueScore: roundSeconds(cueScoreLine(line, index, allLines.length, allLines))
+    };
+  });
+  const excludedCues = (Array.isArray(cueExclusions) ? cueExclusions : []).map((cue) => ({
+    lineIndex: Number(cue.lineIndex) || 0,
+    lineId: cue.lineId || "",
+    reason: cue.reason || "already generated"
+  }));
+  const laughInstructions = [
+    "Select EVERY line that functions as a punchline, button, tag, callback payoff, absurd reversal, escalation payoff, or joke-closing beat.",
+    "A cue belongs on the payoff line, not the setup line before it.",
+    "If a joke spans several short lines, select the final payoff line where the audience would laugh.",
+    "Do not select topic headings, setup questions, exposition, transitions, or lines that merely continue the setup.",
+    "For a late-night monologue, include dry/ironic punchlines and short deadpan buttons even if the wording is subtle.",
+    "The audience laugh will be placed immediately after the selected line's audioEndSeconds by NewtBuilder."
+  ];
+  const applauseInstructions = [
+    "Select applause-worthy lines only: greeting/opening, big reveal, segment transition, strong closing thanks, or celebratory declaration.",
+    "Do not select ordinary jokes that should get laughter rather than applause.",
+    "The applause will be placed immediately after the selected line's audioEndSeconds by NewtBuilder."
+  ];
+
+  return [
+    "You are NewtBuilder's script punchline director for finishing-layer audience cues.",
+    "Your job is line selection, not timestamp calculation.",
+    "Return JSON only. Do not use markdown.",
+    `Schema: {"expectedCueCount":0,"cues":[{"lineIndex":1,"lineId":"exact lineId from Timed dialogue lines JSON","quote":"short exact payoff quote","durationSeconds":1.2,"intensity":0.0,"confidence":0.0,"reason":"why this exact line is the payoff"}]}`,
+    `Cue kind: ${kind}`,
+    `Episode title: ${compactText(episode?.title || "Untitled Episode", 120)}`,
+    `Energy setting: ${profile.label} (${profile.energy}/100)`,
+    `Preferred cue duration seconds: ${roundSeconds(cueDuration)}`,
+    `maxCues: ${Math.round(maxCues)}. This is only a safety cap. ${autoCueCount ? "For laughter, return every genuine punchline up to the cap. This is an exact count task, not a rough density estimate." : "Return up to maxCues, but skip weak cues."}`,
+    "Do not choose excluded cue lines. Excluded cue lines are already visible on the current timeline or controlled by Production Map laugh markers.",
+    "expectedCueCount must equal cues.length after exclusions.",
+    "Copy lineId exactly from the selected Timed dialogue line. lineIndex must be the visible 1-based lineIndex field from that same object; do not zero-base or renumber.",
+    "Do not return a conservative sample. Build the complete cue map: if the script has 10 punchlines, return exactly 10 cue objects.",
+    ...(kind === "applause" ? applauseInstructions : laughInstructions),
+    "Set confidence below 0.55 for weak or debatable candidates. Strong punchlines should be 0.78 or higher.",
+    "Set intensity based on how big the audience response should be: 0.2 small chuckle, 0.5 normal laugh, 0.8 big laugh/applause.",
+    `Total duration seconds: ${roundSeconds(totalDuration)}`,
+    `Excluded cue lines JSON: ${JSON.stringify(excludedCues)}`,
+    `Timed dialogue lines JSON: ${JSON.stringify(dialogueLines)}`
+  ].join("\n");
+}
+
+async function audioCueDirectorPlacementsForEpisode({
+  episode,
+  kind = "laugh",
+  baseDuration = 0,
+  cueDuration = 2.4,
+  maxCues = 12,
+  energy = 55,
+  autoCueCount = true,
+  startNudgeSeconds = 0,
+  cueExclusions = []
+}) {
+  const source = "openai-audio-cue-director";
+  if (!openAiApiKey || String(process.env.NEWTBUILDER_DISABLE_CUE_DIRECTOR || "").toLowerCase() === "true") {
+    return { placements: [], warning: "", source };
+  }
+
+  const audioOutput = latestFinalAudioOutput(episode);
+  const audioPath = outputFilePath(audioOutput);
+  if (!audioPath) {
+    return {
+      placements: [],
+      warning: "Cue director skipped because the clean final audio mix was not found.",
+      source
+    };
+  }
+
+  const timeline = await laughTrackTimelineLinesForEpisode(episode);
+  const lines = timeline.lines;
+  if (!lines.length) {
+    return {
+      placements: [],
+      warning: "Cue director skipped because no timed dialogue lines were found.",
+      source
+    };
+  }
+
+  const totalDuration =
+    Number(baseDuration) ||
+    Number(timeline.totalSeconds) ||
+    Number(audioOutput?.durationSeconds) ||
+    Number(await probeDuration(audioPath)) ||
+    0;
+  if (!totalDuration) {
+    return {
+      placements: [],
+      warning: "Cue director skipped because the final timeline duration could not be measured.",
+      source
+    };
+  }
+
+  try {
+    const response = await runOpenAiAudioCueDirector({
+      episode,
+      kind,
+      audioPath,
+      lines,
+      totalDuration,
+      cueDuration,
+      maxCues,
+      energy,
+      autoCueCount,
+      startNudgeSeconds,
+      cueExclusions
+    });
+    const placements = validateAudioCueDirectorPlacements({
+      response,
+      lines,
+      totalDuration,
+      kind,
+      cueDuration,
+      maxCues,
+      energy,
+      source,
+      startNudgeSeconds,
+      cueExclusions
+    });
+    return {
+      placements,
+      warning: placements.length ? "" : "Cue director returned no usable cue placements; using script heuristic.",
+      source
+    };
+  } catch (error) {
+    return {
+      placements: [],
+      warning: `Cue director failed; using script heuristic. ${cleanErrorMessage(error)}`,
+      source
+    };
+  }
+}
+
+async function runOpenAiAudioCueDirector({
+  episode,
+  kind,
+  audioPath,
+  lines,
+  totalDuration,
+  cueDuration,
+  maxCues,
+  energy,
+  autoCueCount,
+  startNudgeSeconds,
+  cueExclusions = []
+}) {
+  const prepared = await prepareOpenAiCueDirectorAudio(audioPath);
+  try {
+    const audioStat = await stat(prepared.filePath);
+    const maxBytes = Math.round(
+      clampNumber(
+        process.env.NEWTBUILDER_CUE_DIRECTOR_MAX_AUDIO_BYTES || 22 * 1024 * 1024,
+        1024 * 1024,
+        80 * 1024 * 1024
+      )
+    );
+    if (audioStat.size > maxBytes) {
+      throw new Error(`Cue director audio is too large after preparation (${Math.round(audioStat.size / 1024 / 1024)} MB).`);
+    }
+
+    const model =
+      String(process.env.NEWTBUILDER_CUE_DIRECTOR_MODEL || process.env.OPENAI_CUE_DIRECTOR_MODEL || "gpt-audio-1.5").trim() ||
+      "gpt-audio-1.5";
+    const prompt = audioCueDirectorPrompt({
+      episode,
+      kind,
+      lines,
+      totalDuration,
+      cueDuration,
+      maxCues,
+      energy,
+      autoCueCount,
+      cueExclusions
+    });
+    const audioBytes = await readFile(prepared.filePath);
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openAiApiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "input_audio",
+                input_audio: {
+                  data: audioBytes.toString("base64"),
+                  format: prepared.format
+                }
+              }
+            ]
+          }
+        ]
+      }),
+      signal:
+        typeof AbortSignal !== "undefined" && AbortSignal.timeout
+          ? AbortSignal.timeout(Number(process.env.NEWTBUILDER_CUE_DIRECTOR_TIMEOUT_MS || 180000))
+          : undefined
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`OpenAI cue director returned ${response.status}${detail ? `: ${compactText(detail, 240)}` : ""}`);
+    }
+
+    const payload = await response.json();
+    const text = extractOpenAiChatResponseText(payload);
+    const parsed = parseResponseJsonObject(text);
+    if (!parsed || !Array.isArray(parsed.cues)) {
+      throw new Error("OpenAI cue director did not return a JSON object with a cues array.");
+    }
+    return parsed;
+  } finally {
+    if (prepared.cleanupDir) {
+      await rm(prepared.cleanupDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+async function prepareOpenAiCueDirectorAudio(audioPath) {
+  const tempDir = path.join(outputsDir, "tmp", `cue-director-${randomUUID()}`);
+  const preparedPath = path.join(tempDir, "final-audio-director.mp3");
+  await mkdir(tempDir, { recursive: true });
+  try {
+    await execFileAsync(
+      process.env.FFMPEG_PATH || "ffmpeg",
+      [
+        "-y",
+        "-i",
+        audioPath,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        "64k",
+        preparedPath
+      ],
+      { timeout: 180000, maxBuffer: 20 * 1024 * 1024 }
+    );
+    return { filePath: preparedPath, format: "mp3", cleanupDir: tempDir };
+  } catch {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    const ext = path.extname(audioPath).toLowerCase().replace(".", "");
+    return {
+      filePath: audioPath,
+      format: ext === "mp3" ? "mp3" : "wav",
+      cleanupDir: ""
+    };
+  }
+}
+
+function audioCueDirectorPrompt({ episode, kind, lines, totalDuration, cueDuration, maxCues, energy, autoCueCount, cueExclusions = [] }) {
+  const profile = audienceReactionProfile(kind, energy);
+  const scoredDialogueLines = timelineDialogueLines(lines);
+  const cueScoreLine = kind === "applause" ? applauseTrackLineScore : laughTrackLineScore;
+  const dialogueLines = scoredDialogueLines.map((line, index) => {
+    const startSeconds = roundSeconds(line.startSeconds);
+    const durationSeconds = roundSeconds(line.durationSeconds);
+    const audioStartSeconds = roundSeconds(line.audioStartSeconds ?? startSeconds);
+    const audioEndSeconds = roundSeconds(line.audioEndSeconds ?? startSeconds + durationSeconds);
+    return {
+      lineIndex: Number(line.index) || 0,
+      lineId: line.id || "",
+      speaker: compactText(line.speaker || line.character || "", 60),
+      startSeconds,
+      endSeconds: roundSeconds(startSeconds + durationSeconds),
+      audioStartSeconds,
+      audioEndSeconds,
+      durationSeconds,
+      visualStartSeconds: roundSeconds(line.visualStartSeconds ?? startSeconds),
+      visualEndSeconds: roundSeconds(line.visualEndSeconds ?? startSeconds + durationSeconds),
+      visualStartFrame: Math.max(0, Math.round(Number(line.visualStartFrame) || 0)),
+      visualEndFrame: Math.max(0, Math.round(Number(line.visualEndFrame) || 0)),
+      framesPerSecond: Math.max(1, Math.round(Number(line.framesPerSecond) || 30)),
+      sourceTrimStartSeconds: roundSeconds(line.sourceTrimStartSeconds || 0),
+      sourceTrimEndSeconds: roundSeconds(line.sourceTrimEndSeconds || 0),
+      assemblyCutStartFrames: Math.max(0, Math.round(Number(line.assemblyCutStartFrames) || 0)),
+      assemblyCutEndFrames: Math.max(0, Math.round(Number(line.assemblyCutEndFrames) || 0)),
+      scriptCueScore: roundSeconds(cueScoreLine(line, index, scoredDialogueLines.length, scoredDialogueLines)),
+      text: compactText(line.text || "", 320)
+    };
+  });
+  const cueLabel = kind === "laugh" ? "audience laughter" : "audience applause";
+  const excludedCues = (Array.isArray(cueExclusions) ? cueExclusions : []).map((cue) => ({
+    lineIndex: Number(cue.lineIndex) || 0,
+    lineId: cue.lineId || "",
+    startSeconds: roundSeconds(cue.startSeconds || 0),
+    reason: cue.reason || "already generated"
+  }));
+  const selectionGuidance =
+    kind === "laugh"
+      ? [
+          "For laughter, choose only real punchlines, tags, absurd reversals, callbacks, or clearly funny payoffs.",
+          "Avoid setup lines, topic-introduction lines, exposition, and lines that merely continue a sentence.",
+          "The start time is the most important choice: begin immediately after the punchline lands, usually 0.04 to 0.35 seconds after that line ends."
+        ]
+      : [
+          "For applause, choose only true show applause moments: greeting/opening, segment transitions, reveals, strong closing thanks, or applause-worthy declarations.",
+          "Avoid placing applause on ordinary jokes unless the audience would naturally clap rather than laugh.",
+          "The start time should be just after the applause-worthy phrase lands, usually 0.08 to 0.45 seconds after that line ends."
+        ];
+
+  return [
+    "You are NewtBuilder's first-pass cue director for a finished late-night style episode.",
+    "Analyze the attached clean final VO/audio mix together with the exact script timing JSON.",
+    `Your job is to choose where generated ${cueLabel} clips should begin, how long they should last, and how strong each cue should be.`,
+    "Return JSON only. Do not use markdown.",
+    `Schema: {"cues":[{"lineIndex":1,"lineId":"optional","startSeconds":0.0,"durationSeconds":1.2,"intensity":0.0,"confidence":0.0,"reason":"short reason"}]}`,
+    `The maxCues value is a hard ceiling, not a target. ${autoCueCount ? "Infer the natural cue count from the episode." : "Use up to maxCues, but still skip weak cues."}`,
+    "Do not choose excluded cues. Excluded cues are already on the timeline or controlled by Production Map laugh markers.",
+    "scriptCueScore is a rough helper from the script. Prefer high scores when the audio performance agrees, but do not use low-confidence moments just to fill the cap.",
+    "Use audioEndSeconds as the payoff landing point for timing. The visual fields describe the already-assembled video after source frames were trimmed/padded.",
+    "If assemblyCutStartFrames or assemblyCutEndFrames are nonzero, account for the fact that those source frames are not visible in the final assembled video.",
+    "It is acceptable for a cue to overlap the next spoken line after it starts. Do not wait for silence if that makes the cue late.",
+    "Never start a cue before the selected line's payoff has landed.",
+    "Use intensity from 0.0 to 1.0. Use confidence from 0.0 to 1.0. Prefer fewer high-confidence cues over many questionable cues.",
+    ...selectionGuidance,
+    `Episode title: ${compactText(episode?.title || "Untitled Episode", 120)}`,
+    `Cue kind: ${kind}`,
+    `Energy setting: ${profile.label} (${profile.energy}/100)`,
+    `Total duration seconds: ${roundSeconds(totalDuration)}`,
+    `Preferred individual cue duration seconds: ${roundSeconds(cueDuration)}`,
+    `maxCues: ${Math.round(maxCues)}`,
+    `Excluded cue lines JSON: ${JSON.stringify(excludedCues)}`,
+    `Timed dialogue lines JSON: ${JSON.stringify(dialogueLines)}`
+  ].join("\n");
+}
+
+const cueLineMatchStopwords = new Set([
+  "about",
+  "after",
+  "again",
+  "already",
+  "because",
+  "being",
+  "could",
+  "exact",
+  "from",
+  "have",
+  "into",
+  "line",
+  "only",
+  "payoff",
+  "punchline",
+  "reason",
+  "should",
+  "that",
+  "their",
+  "there",
+  "these",
+  "this",
+  "where",
+  "which",
+  "with",
+  "would"
+]);
+
+function cueLineMatchTokens(text = "") {
+  return String(text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9']+/)
+    .map((token) => token.replace(/^'+|'+$/g, ""))
+    .filter((token) => token.length >= 4 && !cueLineMatchStopwords.has(token));
+}
+
+function cueLineMatchScore(cue, line) {
+  const cueText = [
+    cue?.quote,
+    cue?.lineText,
+    cue?.text,
+    cue?.punchline,
+    cue?.reason
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const cueTokens = cueLineMatchTokens(cueText);
+  if (!cueTokens.length) return 0;
+  const lineTokens = new Set(cueLineMatchTokens(line?.text || ""));
+  if (!lineTokens.size) return 0;
+  const uniqueCueTokens = [...new Set(cueTokens)];
+  const matches = uniqueCueTokens.filter((token) => lineTokens.has(token)).length;
+  return matches / uniqueCueTokens.length;
+}
+
+function resolveCueDirectorLine({ cue, byId, byIndex, scriptDirectorSource = false }) {
+  const lineId = String(cue?.lineId || cue?.id || "").trim();
+  if (!scriptDirectorSource && lineId && byId.has(lineId)) {
+    return byId.get(lineId);
+  }
+
+  const lineIndex = Math.round(Number(cue?.lineIndex ?? cue?.lineNumber ?? cue?.index ?? 0));
+  const candidateIndexes = scriptDirectorSource
+    ? [lineIndex, lineIndex + 1, lineIndex - 1, lineIndex + 2, lineIndex - 2]
+    : [lineIndex];
+  const candidates = [];
+  const idLine = lineId ? byId.get(lineId) : null;
+  if (idLine) {
+    candidates.push({
+      line: idLine,
+      matchScore: cueLineMatchScore(cue, idLine),
+      indexDistance: Math.abs((Number(idLine.index) || lineIndex) - lineIndex),
+      idMatch: true
+    });
+  }
+  for (const index of candidateIndexes) {
+    const line = byIndex.get(index);
+    if (line && !candidates.some((candidate) => candidate.line === line)) {
+      candidates.push({
+        line,
+        matchScore: cueLineMatchScore(cue, line),
+        indexDistance: Math.abs(index - lineIndex),
+        idMatch: Boolean(lineId && String(line.id || "") === lineId)
+      });
+    }
+  }
+  if (!candidates.length) return null;
+
+  const best = candidates.sort(
+    (a, b) =>
+      b.matchScore - a.matchScore ||
+      Number(b.idMatch) - Number(a.idMatch) ||
+      a.indexDistance - b.indexDistance ||
+      Number(a.line.startSeconds || 0) - Number(b.line.startSeconds || 0)
+  )[0];
+  const direct = candidates.find((candidate) => Number(candidate.line.index) === lineIndex);
+  if (!scriptDirectorSource || !direct) return best.line;
+  if (best.matchScore > 0 && direct.matchScore <= 0 && !best.idMatch) return best.line;
+  return best.matchScore >= Math.max(0.34, direct.matchScore + 0.18) ? best.line : direct.line;
+}
+
+function validateAudioCueDirectorPlacements({
+  response,
+  lines,
+  totalDuration,
+  kind,
+  cueDuration,
+  maxCues,
+  energy,
+  source,
+  startNudgeSeconds = 0,
+  cueExclusions = []
+}) {
+  const profile = audienceReactionProfile(kind, energy);
+  const scriptDirectorSource = String(source || "").includes("script-");
+  const dialogueLines = timelineDialogueLines(lines);
+  const byIndex = new Map(dialogueLines.map((line) => [Number(line.index) || 0, line]));
+  const byId = new Map(dialogueLines.map((line) => [String(line.id || ""), line]).filter(([id]) => id));
+  const exclusionKeys = audienceCueExclusionKeySet(cueExclusions);
+  const requestedCueDuration = clampNumber(cueDuration, profile.minCueDuration, 30);
+  const cap = Math.round(clampNumber(maxCues, 1, 100));
+  const minConfidence = boundedEnvNumber(
+    kind === "laugh" ? "NEWTBUILDER_CUE_DIRECTOR_LAUGH_MIN_CONFIDENCE" : "NEWTBUILDER_CUE_DIRECTOR_APPLAUSE_MIN_CONFIDENCE",
+    scriptDirectorSource ? (kind === "laugh" ? 0.5 : 0.55) : kind === "laugh" ? 0.58 : 0.55,
+    0,
+    1
+  );
+  const rawCues = Array.isArray(response?.cues) ? response.cues : [];
+  const candidates = rawCues
+    .map((cue) => {
+      const lineIndex = Math.round(Number(cue?.lineIndex ?? cue?.lineNumber ?? cue?.index ?? 0));
+      const line = resolveCueDirectorLine({ cue, byId, byIndex, scriptDirectorSource });
+      if (!line) return null;
+      if (audienceCueIsExcluded({ lineId: line.id || "", lineIndex: Number(line.index) || lineIndex }, exclusionKeys)) return null;
+
+      const confidence = clampNumber(
+        Number.isFinite(Number(cue?.confidence)) ? Number(cue.confidence) : 0.7,
+        0,
+        1
+      );
+      if (confidence < minConfidence) return null;
+      const cueScoreLine = kind === "applause" ? applauseTrackLineScore : laughTrackLineScore;
+      const scriptScore = cueScoreLine(line, Number(line.timelineIndex) || 0, dialogueLines.length, dialogueLines);
+      const scriptFloor = profile.scoreThreshold - (kind === "laugh" ? 0.55 : 0.35);
+      if (!scriptDirectorSource && scriptScore < scriptFloor && confidence < 0.86) return null;
+
+      const intensity = clampNumber(
+        Number.isFinite(Number(cue?.intensity ?? cue?.strength)) ? Number(cue?.intensity ?? cue?.strength) : confidence,
+        0,
+        1
+      );
+      const lineStart = Number(line.audioStartSeconds ?? line.startSeconds ?? 0);
+      const lineEnd = Number(line.audioEndSeconds ?? (lineStart + Number(line.durationSeconds || 0)));
+      const startNudge = clampNumber(startNudgeSeconds, -0.5, 1);
+      const targetDelay = profile.postLineDelay + startNudge;
+      const earliestStart = roundSeconds(Math.max(0, lineEnd + Math.min(targetDelay, 0.04)));
+      const useModelStart = String(process.env.NEWTBUILDER_CUE_DIRECTOR_USE_MODEL_START || "").toLowerCase() === "true";
+      const rawStart = Number(cue?.startSeconds);
+      let startSeconds = lineEnd + targetDelay;
+      if (useModelStart && Number.isFinite(rawStart)) {
+        const latestReasonableStart = roundSeconds(lineEnd + (kind === "laugh" ? 0.75 : 1.1) + Math.max(0, startNudge));
+        startSeconds = rawStart < earliestStart || rawStart > latestReasonableStart ? startSeconds : rawStart;
+      }
+      const latestStart = Math.max(earliestStart, Number(totalDuration || 0) - 0.1);
+      startSeconds = roundSeconds(clampNumber(startSeconds, earliestStart, latestStart));
+
+      const availableSeconds = roundSeconds(Number(totalDuration || 0) - startSeconds);
+      if (availableSeconds < Math.min(profile.minCueDuration, 0.25)) return null;
+
+      const rawDuration = Number(cue?.durationSeconds ?? cue?.lengthSeconds);
+      const shapedDuration = requestedCueDuration * (kind === "laugh" ? 0.58 + intensity * 0.72 : 0.72 + intensity * 0.55);
+      const maxDuration = Math.max(
+        profile.minCueDuration,
+        Math.min(availableSeconds, requestedCueDuration * (kind === "laugh" ? 1.75 : 1.6))
+      );
+      const durationSeconds = roundSeconds(
+        clampNumber(Number.isFinite(rawDuration) ? rawDuration : shapedDuration, profile.minCueDuration, maxDuration)
+      );
+
+      return {
+        startSeconds,
+        durationSeconds,
+        lineId: line.id || "",
+        lineIndex: Number(line.index) || 0,
+        score: roundSeconds(profile.scoreThreshold + confidence * 1.25),
+        confidence,
+        intensity,
+        energy: profile.energy,
+        energyLabel: profile.label,
+        reason: compactText(String(cue?.reason || line.text || "").trim(), 160),
+        source
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.confidence - a.confidence || b.intensity - a.intensity || a.startSeconds - b.startSeconds);
+
+  const minSpacing = scriptDirectorSource
+    ? kind === "laugh"
+      ? 0.35
+      : 1.2
+    : kind === "laugh"
+      ? Math.min(profile.minSpacing, 1.15)
+      : Math.min(profile.minSpacing, 2.75);
+  const selected = [];
+  for (const candidate of candidates) {
+    if (selected.some((placement) => placement.lineIndex === candidate.lineIndex)) continue;
+    if (selected.some((placement) => Math.abs(placement.startSeconds - candidate.startSeconds) < minSpacing)) continue;
+    selected.push(candidate);
+    if (selected.length >= cap) break;
+  }
+
+  return selected.sort((a, b) => a.startSeconds - b.startSeconds);
+}
+
+async function laughTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDuration = 2.4, maxCues = 12, energy = 55, autoCueCount = true, startNudgeSeconds = 0, cueExclusions = [] }) {
   const timeline = await laughTrackTimelineLinesForEpisode(episode);
   const lines = timeline.lines;
   if (!lines.length) return [];
@@ -5264,11 +6720,15 @@ async function laughTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDu
     lines,
     baseDuration: totalDuration,
     cueDuration,
-    maxCues
+    maxCues,
+    energy,
+    autoCueCount,
+    startNudgeSeconds,
+    cueExclusions
   });
 }
 
-async function applauseTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDuration = 3.2, maxCues = 3 }) {
+async function applauseTrackPlacementsForEpisode({ episode, baseDuration = 0, cueDuration = 3.2, maxCues = 12, energy = 60, autoCueCount = true, cueExclusions = [] }) {
   const timeline = await laughTrackTimelineLinesForEpisode(episode);
   const lines = timeline.lines;
   if (!lines.length) return [];
@@ -5277,7 +6737,10 @@ async function applauseTrackPlacementsForEpisode({ episode, baseDuration = 0, cu
     lines,
     baseDuration: totalDuration,
     cueDuration,
-    maxCues
+    maxCues,
+    energy,
+    autoCueCount,
+    cueExclusions
   });
 }
 
@@ -5290,17 +6753,25 @@ async function laughTrackTimelineLinesForEpisode(episode) {
     const manifest = await readJson(outputFilePath(output), null);
     const lines = Array.isArray(manifest?.lines) ? manifest.lines : [];
     if (lines.length) {
+      const assemblyTiming = assemblyTimingForManifestLines(manifest);
       return {
         source: "final_render_manifest",
         totalSeconds: Number(manifest.totalSeconds || manifest.video?.durationSeconds || 0),
-        lines: lines.map((line, index) => ({
-          id: line.id || `line-${index + 1}`,
-          index: Number(line.index) || index + 1,
-          lineType: sanitizeLineType(line.lineType),
-          text: String(line.text || "").trim(),
-          startSeconds: Math.max(0, roundSeconds(line.startSeconds)),
-          durationSeconds: Math.max(0.35, roundSeconds(line.durationSeconds || 0.35))
-        }))
+        lines: lines.map((line, index) => {
+          const timing = assemblyTiming.get(line.id || `line-${index + 1}`) || {};
+          return {
+            id: line.id || `line-${index + 1}`,
+            index: Number(line.index) || index + 1,
+            lineType: sanitizeLineType(line.lineType),
+            speaker: String(line.speaker || "").trim(),
+            character: String(line.character || "").trim(),
+            text: String(line.text || "").trim(),
+            audienceCue: normalizeAudienceCue(line.audienceCue),
+            startSeconds: Math.max(0, roundSeconds(line.startSeconds)),
+            durationSeconds: Math.max(0.35, roundSeconds(line.durationSeconds || 0.35)),
+            ...timing
+          };
+        })
       };
     }
   }
@@ -5314,7 +6785,10 @@ async function laughTrackTimelineLinesForEpisode(episode) {
       id: line.id || `line-${index + 1}`,
       index: Number(line.index) || index + 1,
       lineType: line.lineType,
+      speaker: String(line.speaker || "").trim(),
+      character: String(line.character || "").trim(),
       text: line.text,
+      audienceCue: normalizeAudienceCue(line.audienceCue),
       startSeconds: roundSeconds(startSeconds),
       durationSeconds: roundSeconds(durationSeconds)
     };
@@ -5327,133 +6801,297 @@ async function laughTrackTimelineLinesForEpisode(episode) {
   };
 }
 
-function selectLaughTrackPlacements({ lines = [], baseDuration = 0, cueDuration = 2.4, maxCues = 4 }) {
-  const dialogueLines = (Array.isArray(lines) ? lines : [])
-    .filter((line) => line.lineType !== "insert" && String(line.text || "").trim())
-    .map((line, index) => ({ ...line, sequenceIndex: index }));
-  if (!dialogueLines.length) return [];
+function assemblyTimingForManifestLines(manifest) {
+  const lines = Array.isArray(manifest?.lines) ? manifest.lines : [];
+  const fps = Number(manifest?.format?.fps || 30);
+  const frameDuration = fps > 0 ? 1 / fps : 1 / 30;
+  const mediaLines = lines.filter((line) => line.videoTake || line.image || line.videoPath || line.imagePath || line.image?.localUrl);
+  const timing = new Map();
+  let visualCursor = 0;
 
+  mediaLines.forEach((line, index) => {
+    const durationSeconds = Math.max(0.35, Number(line.durationSeconds) || 0.35);
+    const tailHoldSeconds = index === mediaLines.length - 1 ? 0.35 : 0;
+    const visualSegmentDurationSeconds = roundSeconds(durationSeconds + tailHoldSeconds);
+    const sourceDurationSeconds = Number(line.videoTake?.durationSeconds || 0);
+    const sourceTrimStartSeconds = line.lineType === "insert" ? insertVideoInPoint(line) : 0;
+    const sourceTrimEndSeconds = sourceDurationSeconds
+      ? Math.max(sourceTrimStartSeconds, sourceTrimStartSeconds + visualSegmentDurationSeconds)
+      : 0;
+    const audioStartSeconds = Math.max(0, roundSeconds(line.startSeconds));
+    const audioEndSeconds = roundSeconds(audioStartSeconds + durationSeconds);
+    const visualStartSeconds = roundSeconds(visualCursor);
+    const visualEndSeconds = roundSeconds(visualCursor + visualSegmentDurationSeconds);
+    const startFrame = Math.max(0, Math.round(visualStartSeconds / frameDuration));
+    const endFrame = Math.max(startFrame, Math.round(visualEndSeconds / frameDuration));
+    timing.set(line.id || `line-${index + 1}`, {
+      audioStartSeconds,
+      audioEndSeconds,
+      visualStartSeconds,
+      visualEndSeconds,
+      visualSegmentDurationSeconds,
+      sourceTrimStartSeconds: roundSeconds(sourceTrimStartSeconds),
+      sourceTrimEndSeconds: roundSeconds(sourceTrimEndSeconds),
+      sourceDurationSeconds: roundSeconds(sourceDurationSeconds),
+      framesPerSecond: fps,
+      visualStartFrame: startFrame,
+      visualEndFrame: endFrame,
+      assemblyCutStartFrames: Math.max(0, Math.round(sourceTrimStartSeconds * fps)),
+      assemblyCutEndFrames: sourceDurationSeconds
+        ? Math.max(0, Math.round((sourceDurationSeconds - sourceTrimStartSeconds - visualSegmentDurationSeconds) * fps))
+        : 0
+    });
+    visualCursor += visualSegmentDurationSeconds;
+  });
+
+  return timing;
+}
+
+function timelineDialogueLines(lines = []) {
+  const sortedLines = (Array.isArray(lines) ? lines : [])
+    .filter((line) => line.lineType !== "insert" && String(line.text || "").trim())
+    .map((line, index) => ({
+      ...line,
+      sequenceIndex: index,
+      startSeconds: Math.max(0, Number(line.startSeconds || 0)),
+      durationSeconds: Math.max(0.1, Number(line.durationSeconds || 0.1))
+    }))
+    .sort((a, b) => a.startSeconds - b.startSeconds || a.sequenceIndex - b.sequenceIndex);
+
+  return sortedLines.map((line, index) => ({
+      ...line,
+      timelineIndex: index,
+      wordCount: audienceCueWordCount(line.text),
+      wordsPerSecond: roundSeconds(audienceCueWordCount(line.text) / Math.max(0.1, Number(line.durationSeconds || 0.1))),
+      nextGapSeconds: roundSeconds(
+        index < sortedLines.length - 1
+          ? Math.max(
+              0,
+              Number(sortedLines[index + 1].startSeconds || 0) -
+                (Number(line.startSeconds || 0) + Number(line.durationSeconds || 0))
+            )
+          : 0
+      ),
+      previousGapSeconds: roundSeconds(
+        index > 0
+          ? Math.max(
+              0,
+              Number(line.startSeconds || 0) -
+                (Number(sortedLines[index - 1].startSeconds || 0) + Number(sortedLines[index - 1].durationSeconds || 0))
+            )
+          : 0
+      ),
+      previousText: index > 0 ? String(sortedLines[index - 1].text || "") : "",
+      nextText: index < sortedLines.length - 1 ? String(sortedLines[index + 1].text || "") : ""
+    }));
+}
+
+function audienceCueIntensity({ score, profile }) {
+  const floor = profile.scoreThreshold - 0.55;
+  const ceiling = profile.scoreThreshold + 1.45;
+  return roundSeconds(clampNumber((Number(score) - floor) / Math.max(0.1, ceiling - floor), 0.18, 1));
+}
+
+function audienceCueDuration({ requestedCueDuration, availableSeconds, profile, score }) {
+  const intensity = audienceCueIntensity({ score, profile });
+  const requested = Math.max(profile.minCueDuration, Number(requestedCueDuration) || profile.minCueDuration);
+  const shaped = requested * (0.48 + intensity * 0.72);
+  return roundSeconds(clampNumber(shaped, profile.minCueDuration, Math.min(availableSeconds, requested * 1.25)));
+}
+
+function audienceCueVolume(baseVolume, placement, kind = "laugh") {
+  const base = clampNumber(baseVolume, 0, 2);
+  const intensity = clampNumber(placement?.intensity ?? 0.5, 0, 1);
+  const multiplier = kind === "applause" ? 0.78 + intensity * 0.38 : 0.72 + intensity * 0.5;
+  return roundSeconds(clampNumber(base * multiplier, 0, 2));
+}
+
+function audienceCueFadeInSeconds(profile, placement) {
+  const intensity = clampNumber(placement?.intensity ?? 0.5, 0, 1);
+  return roundSeconds(clampNumber(profile.fadeInSeconds * (1.2 - intensity * 0.45), 0.04, 0.25));
+}
+
+function selectAudienceReactionPlacements({
+  lines = [],
+  baseDuration = 0,
+  cueDuration = 2.4,
+  maxCues = 4,
+  energy = 55,
+  kind = "laugh",
+  scoreLine,
+  autoCueCount = false,
+  startNudgeSeconds = 0,
+  cueExclusions = []
+}) {
+  const profile = audienceReactionProfile(kind, energy);
   const totalDuration =
     Number(baseDuration) ||
-    Math.max(...dialogueLines.map((line) => Number(line.startSeconds || 0) + Number(line.durationSeconds || 0)));
+    Math.max(0, ...((Array.isArray(lines) ? lines : []).map((line) => Number(line.startSeconds || 0) + Number(line.durationSeconds || 0))));
+  const dialogueLines = timelineDialogueLines(lines);
+  if (!dialogueLines.length) return [];
+
   if (!Number.isFinite(totalDuration) || totalDuration <= 0) return [];
 
-  const requestedCueDuration = clampNumber(cueDuration, 0.5, 30);
-  const requestedMaxCues = Math.round(clampNumber(maxCues, 1, 8));
-  const minSpacing = Math.max(4.5, requestedCueDuration + 1.5);
+  const requestedCueDuration = clampNumber(cueDuration, profile.minCueDuration, 30);
+  const requestedMaxCues = Math.round(clampNumber(maxCues, 1, 100));
+  const minSpacing = profile.minSpacing;
+  const exclusionKeys = audienceCueExclusionKeySet(cueExclusions);
   const scored = dialogueLines
+    .filter((line) => !audienceCueIsExcluded({ lineId: line.id || "", lineIndex: Number(line.index) || 0 }, exclusionKeys))
     .map((line, index) => ({
       line,
-      score: laughTrackLineScore(line, index, dialogueLines.length)
+      score: scoreLine(line, index, dialogueLines.length, dialogueLines)
     }))
     .sort((a, b) => b.score - a.score || Number(a.line.startSeconds || 0) - Number(b.line.startSeconds || 0));
-  const pool = scored.filter((item) => item.score >= 1.25);
-  const candidates = pool.length ? pool : scored.slice(0, Math.min(requestedMaxCues, scored.length));
+  const scoreFloor = kind === "laugh" ? profile.scoreThreshold - 0.45 : profile.scoreThreshold;
+  const strongPool = scored.filter((item) => item.score >= profile.scoreThreshold);
+  const backupPool = scored.filter((item) => item.score < profile.scoreThreshold && item.score >= scoreFloor);
+  const targetCueCount = autoCueCount
+    ? estimateAudienceCueTarget({ kind, scored, profile, maxCues: requestedMaxCues, lineCount: dialogueLines.length })
+    : requestedMaxCues;
+  const candidates = strongPool.length
+    ? [...strongPool, ...backupPool].slice(0, Math.max(targetCueCount * 3, targetCueCount))
+    : scored.slice(0, Math.min(targetCueCount, scored.length));
   const selected = [];
 
   for (const candidate of candidates) {
-    const line = candidate.line;
-    const lineEnd = Number(line.startSeconds || 0) + Number(line.durationSeconds || 0);
-    const startSeconds = roundSeconds(lineEnd + 0.08);
-    if (startSeconds >= totalDuration - 0.35) continue;
-    if (selected.some((placement) => Math.abs(placement.startSeconds - startSeconds) < minSpacing)) continue;
-    const durationSeconds = roundSeconds(Math.min(requestedCueDuration, Math.max(0.5, totalDuration - startSeconds)));
-    selected.push({
-      startSeconds,
-      durationSeconds,
-      lineId: line.id || "",
-      lineIndex: Number(line.index) || 0,
-      score: roundSeconds(candidate.score),
-      reason: compactText(String(line.text || "").trim(), 120)
+    const cue = fittedAudienceCueForLine({
+      line: candidate.line,
+      totalDuration,
+      requestedCueDuration,
+      profile,
+      startNudgeSeconds
     });
-    if (selected.length >= requestedMaxCues) break;
+    if (!cue) continue;
+    if (selected.some((placement) => Math.abs(placement.startSeconds - cue.startSeconds) < minSpacing)) continue;
+    selected.push({
+      startSeconds: cue.startSeconds,
+      durationSeconds:
+        kind === "laugh"
+          ? audienceCueDuration({
+              requestedCueDuration,
+              availableSeconds: cue.availableSeconds,
+              profile,
+              score: candidate.score
+            })
+          : cue.durationSeconds,
+      lineId: candidate.line.id || "",
+      lineIndex: Number(candidate.line.index) || 0,
+      score: roundSeconds(candidate.score),
+      intensity: kind === "laugh" ? audienceCueIntensity({ score: candidate.score, profile }) : profile.normalized,
+      energy: profile.energy,
+      energyLabel: profile.label,
+      reason: compactText(String(candidate.line.text || "").trim(), 120)
+    });
+    if (selected.length >= targetCueCount) break;
   }
 
   return selected.sort((a, b) => a.startSeconds - b.startSeconds);
 }
 
-function selectApplauseTrackPlacements({ lines = [], baseDuration = 0, cueDuration = 3.2, maxCues = 3 }) {
-  const dialogueLines = (Array.isArray(lines) ? lines : [])
-    .filter((line) => line.lineType !== "insert" && String(line.text || "").trim())
-    .map((line, index) => ({ ...line, sequenceIndex: index }));
-  if (!dialogueLines.length) return [];
+function selectLaughTrackPlacements({ lines = [], baseDuration = 0, cueDuration = 2.4, maxCues = 12, energy = 55, autoCueCount = true, startNudgeSeconds = 0, cueExclusions = [] }) {
+  return selectAudienceReactionPlacements({
+    lines,
+    baseDuration,
+    cueDuration,
+    maxCues,
+    energy,
+    kind: "laugh",
+    scoreLine: laughTrackLineScore,
+    autoCueCount,
+    startNudgeSeconds,
+    cueExclusions
+  });
+}
 
-  const totalDuration =
-    Number(baseDuration) ||
-    Math.max(...dialogueLines.map((line) => Number(line.startSeconds || 0) + Number(line.durationSeconds || 0)));
-  if (!Number.isFinite(totalDuration) || totalDuration <= 0) return [];
+function selectApplauseTrackPlacements({ lines = [], baseDuration = 0, cueDuration = 3.2, maxCues = 12, energy = 60, autoCueCount = true, cueExclusions = [] }) {
+  return selectAudienceReactionPlacements({
+    lines,
+    baseDuration,
+    cueDuration,
+    maxCues,
+    energy,
+    kind: "applause",
+    scoreLine: applauseTrackLineScore,
+    autoCueCount,
+    cueExclusions
+  });
+}
 
-  const requestedCueDuration = clampNumber(cueDuration, 0.5, 30);
-  const requestedMaxCues = Math.round(clampNumber(maxCues, 1, 8));
-  const minSpacing = Math.max(7, requestedCueDuration + 2);
-  const scored = dialogueLines
-    .map((line, index) => ({
-      line,
-      score: applauseTrackLineScore(line, index, dialogueLines.length)
-    }))
-    .sort((a, b) => b.score - a.score || Number(a.line.startSeconds || 0) - Number(b.line.startSeconds || 0));
-  const pool = scored.filter((item) => item.score >= 1.15);
-  const candidates = pool.length ? pool : scored.slice(0, Math.min(requestedMaxCues, scored.length));
-  const selected = [];
+function estimateAudienceCueTarget({ kind = "laugh", scored = [], profile, maxCues = 12, lineCount = 0 }) {
+  const cap = Math.max(1, Math.round(Number(maxCues) || 1));
+  const strongCount = scored.filter((item) => item.score >= profile.scoreThreshold).length;
+  const goodCount = scored.filter((item) => item.score >= profile.scoreThreshold - 0.25 && item.score < profile.scoreThreshold).length;
+  const possibleCount = scored.filter((item) => item.score >= profile.scoreThreshold - 0.55).length;
+  const densityDivisor = kind === "applause" ? 7 : 3.5;
+  const densityCap = Math.max(1, Math.round((Number(lineCount) || scored.length || 1) / densityDivisor));
+  const scriptEstimate = Math.round(strongCount + goodCount * 0.6 + Math.max(0, possibleCount - strongCount - goodCount) * 0.25);
+  const fallbackDivisor = kind === "applause" ? 10 : 6;
+  const fallbackEstimate = Math.max(1, Math.round((Number(lineCount) || scored.length || 1) / fallbackDivisor));
+  return Math.min(cap, densityCap, Math.max(scriptEstimate || fallbackEstimate, Math.min(strongCount || 1, cap)));
+}
 
-  for (const candidate of candidates) {
-    const line = candidate.line;
-    const lineEnd = Number(line.startSeconds || 0) + Number(line.durationSeconds || 0);
-    const startSeconds = roundSeconds(lineEnd + 0.12);
-    if (startSeconds >= totalDuration - 0.35) continue;
-    if (selected.some((placement) => Math.abs(placement.startSeconds - startSeconds) < minSpacing)) continue;
-    const durationSeconds = roundSeconds(Math.min(requestedCueDuration, Math.max(0.5, totalDuration - startSeconds)));
-    selected.push({
-      startSeconds,
-      durationSeconds,
-      lineId: line.id || "",
-      lineIndex: Number(line.index) || 0,
-      score: roundSeconds(candidate.score),
-      reason: compactText(String(line.text || "").trim(), 120)
-    });
-    if (selected.length >= requestedMaxCues) break;
-  }
-
-  return selected.sort((a, b) => a.startSeconds - b.startSeconds);
+function audienceCueWordCount(text = "") {
+  return String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
 }
 
 function laughTrackLineScore(line, index, totalLines) {
   const text = String(line.text || "").trim();
   const normalized = text.toLowerCase();
-  let score = 0.25;
+  const previousText = String(line.previousText || "").trim().toLowerCase();
+  const nextText = String(line.nextText || "").trim().toLowerCase();
+  const wordCount = Number(line.wordCount || audienceCueWordCount(text));
+  const previousGap = Number(line.previousGapSeconds || 0);
+  let score = 0.15;
   const position = totalLines > 1 ? index / (totalLines - 1) : 0;
-  score += position * 0.35;
-  if (/[!?]["')\]]?$/.test(text)) score += 0.6;
-  if (text.length >= 35 && text.length <= 180) score += 0.35;
-  if (/^("|'|and\b|but\b|so\b|because\b|which\b|that\b|then\b)/i.test(text)) score += 0.35;
+  score += position * 0.25;
+  if (/[!?]["')\]]?$/.test(text)) score += 0.65;
+  if (/[.]["')\]]?$/.test(text) && wordCount <= 12) score += 0.45;
+  if (wordCount >= 4 && wordCount <= 16) score += 0.45;
+  if (wordCount <= 5 && previousText) score += 0.35;
+  if (text.length >= 35 && text.length <= 180) score += 0.25;
+  if (/^("|'|and\b|but\b|so\b|because\b|which\b|that\b|then\b|meanwhile\b|apparently\b|except\b)/i.test(text)) score += 0.35;
   if (/"[^"]{3,}"/.test(text)) score += 0.45;
-  if (/\b(seriously|folks|apparently|somehow|meanwhile|frankly|admittedly|honestly|trust me|for the first time|goodnight)\b/i.test(text)) score += 0.6;
-  if (/\b(dead|alive|afterlife|insane|ridiculous|absurd|normal|forever|again|anyway|shocked|license|hobby|yogurt|payroll|nuclear|comment sections|exclusive|limited-time|offer)\b/i.test(text)) score += 0.75;
-  if (/\b(no|not|never|only|just|even|still|actually|exactly|absolutely)\b/i.test(text)) score += 0.25;
-  if (index === totalLines - 1) score += 0.5;
-  if (/\b(thank you|welcome back|before we begin|moving on)\b/i.test(normalized)) score -= 0.35;
+  if (/\b(seriously|folks|apparently|somehow|meanwhile|frankly|admittedly|honestly|trust me|for the first time|yes|no|again|exactly)\b/i.test(text)) score += 0.65;
+  if (/\b(dead|alive|afterlife|insane|ridiculous|absurd|normal|forever|shocked|license|hobby|yogurt|payroll|nuclear|comment sections|exclusive|club|collapse|subscription|products|fired|temples)\b/i.test(text)) score += 0.8;
+  if (/\b(no|not|never|only|just|even|still|actually|absolutely|literally|somehow|eventually)\b/i.test(text)) score += 0.25;
+  if (/\b(but|because|except|instead|while|meanwhile|turns out|apparently)\b/i.test(normalized)) score += 0.3;
+  if (/\?$/.test(previousText) || /\b(question|asking|wondering|whether)\b/i.test(previousText)) score += 0.45;
+  if (previousText && wordCount <= 10 && !/^(and|but|so|because)\b/i.test(normalized)) score += 0.35;
+  if (previousGap >= 0.35 && wordCount <= 12) score += 0.15;
+  if (index === totalLines - 1) score += 0.25;
+  if (/\b(thank you|welcome back|before we begin|moving on|finally|tonight we'?ll|let me explain|now before)\b/i.test(normalized)) score -= 0.45;
+  if (/\b(politics|technology|celebrity|economic|updates from earth|moving on|let'?s discuss)\b/i.test(normalized)) score -= 0.25;
+  if (nextText && /^(and|but|because|which|that)\b/i.test(nextText) && wordCount > 18) score -= 0.2;
   if (text.length > 220) score -= 0.45;
-  return score;
+  return roundSeconds(score);
 }
 
 function applauseTrackLineScore(line, index, totalLines) {
   const text = String(line.text || "").trim();
   const normalized = text.toLowerCase();
+  const wordCount = Number(line.wordCount || audienceCueWordCount(text));
+  const nextGap = Number(line.nextGapSeconds || 0);
   let score = 0.1;
   const isFirst = index === 0;
   const isLast = index === totalLines - 1;
   const position = totalLines > 1 ? index / (totalLines - 1) : 0;
   score += position * 0.25;
-  if (isFirst) score += 1.1;
-  if (isLast) score += 1.25;
+  if (isFirst) score += 1.35;
+  if (isLast) score += 1.45;
   if (/[!]["')\]]?$/.test(text)) score += 0.35;
   if (/\b(good evening|welcome|welcome back|thank you|thanks|goodnight|good night|that'?s our show|joining us|first episode|tonight'?s show|moving on|finally|before we begin|and that'?s)\b/i.test(normalized)) score += 1.0;
   if (/\b(please welcome|give it up|big hand|applause|audience|show|episode|everybody|folks)\b/i.test(normalized)) score += 0.9;
   if (/\b(reveal|announcement|winner|celebrating|birthday|anniversary|final|closing)\b/i.test(normalized)) score += 0.55;
-  if (text.length >= 20 && text.length <= 160) score += 0.25;
+  if (wordCount >= 3 && wordCount <= 28) score += 0.25;
+  if (nextGap >= 0.5) score += 0.25;
   if (/\b(seriously|apparently|somehow|insane|ridiculous|dead|afterlife)\b/i.test(normalized)) score -= 0.25;
+  if (!isFirst && !isLast && /\b(no|not|never|just|actually|absurd|ridiculous|yogurt|payroll|nuclear|comment sections)\b/i.test(normalized)) score -= 0.3;
   if (text.length > 220) score -= 0.45;
-  return score;
+  return roundSeconds(score);
 }
 
 async function exportFinishedMaster({ episode, show, layers = [] }) {
@@ -5726,6 +7364,15 @@ function latestFinalVideoOutput(episode) {
   return (
     outputs.find((output) => output.type === "finished_master" && outputFilePath(output)) ||
     baseFinalVideoOutput(episode)
+  );
+}
+
+function latestFinalAudioOutput(episode) {
+  const outputs = Array.isArray(episode.outputs) ? episode.outputs : [];
+  return (
+    outputs.find((output) => output.type === "final_audio_mix" && outputFilePath(output)) ||
+    outputs.find((output) => output.type === "audio_mix" && outputFilePath(output)) ||
+    null
   );
 }
 
@@ -6912,14 +8559,9 @@ async function extractThumbnailReferenceFrame({ sourcePath, outputPath, timestam
 
 async function thumbnailReferenceAssetPaths({ episode, tempDir }) {
   const assets = Array.isArray(episode.assets) ? episode.assets.map(normalizeAsset) : [];
-  const imageAssets = assets.filter((asset) => asset.type === "image" && asset.shotRole !== "mask");
-  const ranked = [
-    ...imageAssets.filter((asset) => asset.shotRole === "character_one_shot"),
-    ...imageAssets.filter((asset) => asset.shotRole === "wide_shot"),
-    ...imageAssets.filter((asset) => asset.shotRole === "medium_two_shot"),
-    ...imageAssets.filter((asset) => asset.shotRole === "insert_shot"),
-    ...imageAssets.filter((asset) => !["character_one_shot", "wide_shot", "medium_two_shot", "insert_shot"].includes(asset.shotRole))
-  ];
+  const imageAssetsById = new Map(assets.filter((asset) => asset.type === "image" && asset.shotRole !== "mask").map((asset) => [asset.id, asset]));
+  const usedAssetIds = await thumbnailUsedImageAssetIds(episode);
+  const ranked = usedAssetIds.map((assetId) => imageAssetsById.get(assetId)).filter(Boolean);
   const seen = new Set();
   const references = [];
   for (const asset of ranked) {
@@ -6932,6 +8574,39 @@ async function thumbnailReferenceAssetPaths({ episode, tempDir }) {
     if (references.length >= 4) break;
   }
   return references;
+}
+
+async function thumbnailUsedImageAssetIds(episode) {
+  const used = [];
+  const seen = new Set();
+  const add = (assetId) => {
+    const id = cleanId(assetId);
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    used.push(id);
+    return true;
+  };
+
+  const manifestOutputs = (Array.isArray(episode.outputs) ? episode.outputs : [])
+    .filter((output) => ["final_render_manifest", "render_manifest"].includes(output.type) && outputFilePath(output))
+    .sort((a, b) => Date.parse(b.createdAt || "") - Date.parse(a.createdAt || ""));
+  for (const output of manifestOutputs.slice(0, 1)) {
+    const manifest = await readJson(outputFilePath(output), null);
+    for (const line of Array.isArray(manifest?.lines) ? manifest.lines : []) {
+      add(line?.image?.assetId);
+      add(line?.endImage?.assetId);
+      add(line?.assetId);
+      add(line?.insertEndAssetId);
+    }
+    if (used.length) return used;
+  }
+
+  for (const line of normalizeProductionMapForFormat(episode.productionMap, episode.format)) {
+    add(line.assetId);
+    add(line.insertEndAssetId);
+  }
+
+  return used;
 }
 
 async function prepareThumbnailReferenceImage({ sourcePath, outputPath }) {
@@ -6956,7 +8631,7 @@ async function prepareThumbnailReferenceImage({ sourcePath, outputPath }) {
 function aiThumbnailPrompt({ episode, show, variant, title, vertical, thumbnailBrief = {} }) {
   const planBeats = Array.isArray(episode.plan?.beats) ? episode.plan.beats : [];
   const hook = compactText(planBeats[0]?.text || episode.drafts?.youtube?.description || episode.scriptText || episode.title, 420);
-  const characterNames = uniqueStrings((show.characters || []).map((character) => character.name).filter(Boolean)).join(", ");
+  const characterNames = thumbnailEpisodeCharacterNames({ episode, show }).join(", ");
   const visualStyle = show.creative?.visualStyle || "bright expressive 2D cartoon, polished animated short";
   const thumbnailStyle = show.creative?.thumbnailStyle || "bold character moment, clean text, strong expression";
   const aspect = vertical ? "vertical 9:16 video thumbnail" : "wide 16:9 YouTube thumbnail";
@@ -6969,19 +8644,33 @@ function aiThumbnailPrompt({ episode, show, variant, title, vertical, thumbnailB
     [
       `User thumbnail prompt: ${userInstruction}`,
       `Create a premium ${aspect} for the show "${show.name}".`,
-      "Use Image 1 as the selected still frame and compositional base. Use the other provided images only as visual references for character identity and show style.",
+      "Use Image 1 as the selected still frame and compositional base. Use the other provided images only as visual references for character identity and show style for images used in the current video.",
       `Dynamic super text to include exactly, large and readable: "${titleLine}".`,
       providedInfo ? `Provided episode information: ${compactText(providedInfo, 700)}.` : "",
       `Preserve the exact character designs, color palette, and episode visual style from the references.`,
       `Visual style: ${visualStyle}. Thumbnail style: ${thumbnailStyle}.`,
-      characterNames ? `Characters to preserve when present: ${characterNames}.` : "",
+      characterNames ? `Current episode characters to preserve when present: ${characterNames}.` : "",
       `Story hook: ${hook}.`,
       `Composition: ${variant.prompt}. Make one clear emotional focal point, strong readable faces, clean negative space for the title, bright child-friendly polish, high contrast, and no clutter.`,
-      "Constraints: no logos, no watermark, no captions beyond the dynamic super text, no misspelled text, no photoreal humans, no distorted faces, no extra characters beyond the references."
+      "Constraints: no logos, no watermark, no captions beyond the dynamic super text, no misspelled text, no photoreal humans, no distorted faces, no extra characters beyond the selected still frame, current episode characters, and current video image references."
     ]
       .filter(Boolean)
       .join(" "),
     3000
+  );
+}
+
+function thumbnailEpisodeCharacterNames({ episode, show }) {
+  const charactersById = new Map((show?.characters || []).map((character) => [character.id, character.name]));
+  return uniqueStrings(
+    normalizeProductionMapForFormat(episode.productionMap, episode.format)
+      .filter((line) => line.lineType !== "insert")
+      .map((line) => charactersById.get(line.characterId) || line.character || line.speaker)
+      .map((name) => {
+        const trimmed = String(name || "").replace(/^@/, "").trim();
+        return /^[A-Z\s]+$/.test(trimmed) ? trimmed.toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase()) : trimmed;
+      })
+      .filter(Boolean)
   );
 }
 
@@ -7027,11 +8716,22 @@ function sanitizeThumbnailBrief(brief = {}) {
     ? String(brief.stillFrame).toLowerCase()
     : "middle";
   return {
-    prompt: compactText(brief.prompt, 1000),
-    superText: compactText(brief.superText, 140),
-    details: compactText(brief.details, 1600),
+    prompt: preserveInputText(brief.prompt, 1000),
+    superText: preserveInputText(brief.superText, 140),
+    details: preserveInputText(brief.details, 1600),
     stillFrame
   };
+}
+
+function preserveInputText(value, maxLength) {
+  const normalized = String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\t/g, "  ")
+    .replace(/[^\S\n]+$/gm, "")
+    .trim();
+  if (normalized.length <= maxLength) return normalized;
+  return normalized.slice(0, maxLength).replace(/[^\S\n]+$/gm, "").trimEnd();
 }
 
 async function renderThumbnailOverlayWithPillow({ framePath, outputPath, textPath, width, height, variant }) {
@@ -7509,17 +9209,22 @@ function reusableVideoTakeForLine(line, imageAsset, endImageAsset, format, maskA
     const maskPath = resolveAssetPath(maskAsset);
     const visualLipSyncModel = sanitizeOptionalLipSyncModel(imageAsset?.metadata?.lipSyncModel);
     const visualLipSyncPrompt = lineLipSyncInputPrompt(line, imageAsset);
+    const visualAnimationStrength = animationStrengthForAsset(imageAsset);
+    const resolvedAnimationStrength = animationStrengthForLine(line, imageAsset);
     const signatureLine = {
       ...line,
       visualLipSyncModel,
       visualLipSyncPrompt,
+      visualAnimationStrength,
+      animationStrength: resolvedAnimationStrength,
       image: imageAsset
         ? {
             assetId: imageAsset.id,
             fileName: imageAsset.fileName,
             localUrl: imageAsset.localUrl,
             lipSyncModel: visualLipSyncModel,
-            lipSyncPrompt: visualLipSyncPrompt
+            lipSyncPrompt: visualLipSyncPrompt,
+            animationStrength: visualAnimationStrength
           }
         : null,
       needsMask: Boolean(maskPath),
@@ -7718,6 +9423,50 @@ function defaultLipSyncModel() {
   return sanitizeLipSyncModel(process.env.NEWTBUILDER_DEFAULT_LIPSYNC_MODEL || "fabric");
 }
 
+function animationStrengthValueIsSet(value) {
+  return value !== null && value !== undefined && String(value).trim() !== "";
+}
+
+function roundAnimationStrength(value) {
+  return Math.round(Number(value) * 10) / 10;
+}
+
+function defaultAnimationStrength() {
+  const configured = [
+    process.env.NEWTBUILDER_ANIMATION_STRENGTH,
+    process.env.COMFYUI_INFINITALK_AUDIO_CFG_SCALE
+  ].find((value) => animationStrengthValueIsSet(value));
+  const number = Number(configured);
+  if (!Number.isFinite(number)) return animationStrengthDefault;
+  return roundAnimationStrength(clampNumber(number, 0, 5));
+}
+
+function normalizeAnimationStrength(value, fallback = defaultAnimationStrength()) {
+  if (!animationStrengthValueIsSet(value)) return normalizeAnimationStrength(fallback, animationStrengthDefault);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return normalizeAnimationStrength(fallback, animationStrengthDefault);
+  return roundAnimationStrength(clampNumber(number, 0, 5));
+}
+
+function normalizeOptionalAnimationStrength(value) {
+  if (!animationStrengthValueIsSet(value)) return null;
+  return normalizeAnimationStrength(value);
+}
+
+function animationStrengthForAsset(asset) {
+  const value = normalizeOptionalAnimationStrength(asset?.metadata?.animationStrength);
+  return value === null ? defaultAnimationStrength() : value;
+}
+
+function animationStrengthForLine(line, imageAsset = null) {
+  const override = normalizeOptionalAnimationStrength(line?.animationStrengthOverride);
+  if (override !== null) return override;
+  const resolvedLineValue = normalizeOptionalAnimationStrength(line?.animationStrength);
+  if (resolvedLineValue !== null) return resolvedLineValue;
+  const assetValue = normalizeOptionalAnimationStrength(imageAsset?.metadata?.animationStrength ?? line?.image?.animationStrength);
+  return assetValue === null ? defaultAnimationStrength() : assetValue;
+}
+
 function defaultInfiniteTalkBackend() {
   return sanitizeInfiniteTalkBackend(process.env.NEWTBUILDER_INFINITALK_BACKEND || "fal");
 }
@@ -7788,6 +9537,262 @@ function comfyUiInfiniteTalkModelId() {
   return process.env.COMFYUI_INFINITALK_MODEL_ID || "comfyui-infinitalk";
 }
 
+function cleanupComfyUiProgressEntries() {
+  const now = Date.now();
+  const activeTtlMs = Number(process.env.COMFYUI_PROGRESS_ACTIVE_TTL_MS || 6 * 60 * 60 * 1000);
+  const doneTtlMs = Number(process.env.COMFYUI_PROGRESS_DONE_TTL_MS || 5 * 60 * 1000);
+  for (const [key, entry] of comfyUiProgressEntries.entries()) {
+    const updatedAt = Date.parse(entry.updatedAt || entry.startedAt || "") || 0;
+    const terminal = ["complete", "error", "cancelled"].includes(String(entry.status || "").toLowerCase());
+    const ttl = terminal ? doneTtlMs : activeTtlMs;
+    if (!updatedAt || now - updatedAt > ttl) comfyUiProgressEntries.delete(key);
+  }
+}
+
+function comfyUiProgressKey(context = {}) {
+  const episodeId = String(context.episodeId || "episode").trim() || "episode";
+  const lineId = String(context.lineId || context.promptId || "render").trim() || "render";
+  return `${episodeId}:${lineId}`;
+}
+
+function comfyUiProgressContext({ manifest = {}, line = {}, filenamePrefix = "" } = {}) {
+  return {
+    episodeId: String(manifest?.episode?.id || line?.episodeId || "").trim(),
+    episodeTitle: String(manifest?.episode?.title || "").trim(),
+    renderId: String(manifest?.id || "").trim(),
+    lineId: String(line?.id || "").trim(),
+    lineIndex: Number(line?.index || 0) || 0,
+    speaker: String(line?.speaker || "").trim(),
+    provider: "infinitalk",
+    backend: "comfyui",
+    filenamePrefix
+  };
+}
+
+function setComfyUiProgress(context = {}, patch = {}) {
+  const key = comfyUiProgressKey(context);
+  const existing = comfyUiProgressEntries.get(key) || {};
+  const now = new Date().toISOString();
+  const next = {
+    key,
+    episodeId: String(context.episodeId || existing.episodeId || "").trim(),
+    episodeTitle: String(context.episodeTitle || existing.episodeTitle || "").trim(),
+    renderId: String(context.renderId || existing.renderId || "").trim(),
+    lineId: String(context.lineId || existing.lineId || "").trim(),
+    lineIndex: Number(context.lineIndex || existing.lineIndex || 0) || 0,
+    speaker: String(context.speaker || existing.speaker || "").trim(),
+    provider: String(context.provider || existing.provider || "infinitalk").trim(),
+    backend: String(context.backend || existing.backend || "comfyui").trim(),
+    filenamePrefix: String(context.filenamePrefix || existing.filenamePrefix || "").trim(),
+    startedAt: existing.startedAt || now,
+    updatedAt: now,
+    status: String(patch.status || existing.status || "starting").trim(),
+    phase: String(patch.phase || existing.phase || "").trim(),
+    message: compactText(String(patch.message || existing.message || ""), 260),
+    percent: clampPercent(patch.percent ?? existing.percent ?? 0),
+    value: Number.isFinite(Number(patch.value)) ? Number(patch.value) : Number(existing.value || 0),
+    max: Number.isFinite(Number(patch.max)) ? Number(patch.max) : Number(existing.max || 0),
+    node: String(patch.node ?? existing.node ?? "").trim(),
+    nodeType: String(patch.nodeType ?? existing.nodeType ?? "").trim(),
+    promptId: String(patch.promptId || existing.promptId || "").trim(),
+    error: compactText(String(patch.error || existing.error || ""), 500)
+  };
+  comfyUiProgressEntries.set(key, next);
+  cleanupComfyUiProgressEntries();
+  return next;
+}
+
+function completeComfyUiProgress(context = {}, patch = {}) {
+  return setComfyUiProgress(context, {
+    status: "complete",
+    phase: "complete",
+    percent: 100,
+    message: patch.message || "ComfyUI generation complete.",
+    promptId: patch.promptId || ""
+  });
+}
+
+function failComfyUiProgress(context = {}, error, patch = {}) {
+  return setComfyUiProgress(context, {
+    status: "error",
+    phase: "error",
+    message: patch.message || "ComfyUI generation failed.",
+    promptId: patch.promptId || "",
+    error: cleanErrorMessage(error)
+  });
+}
+
+function clampPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(100, Math.round(number)));
+}
+
+function comfyUiProgressPercent(value, max) {
+  const numericValue = Number(value);
+  const numericMax = Number(max);
+  if (!Number.isFinite(numericValue) || !Number.isFinite(numericMax) || numericMax <= 0) return 0;
+  return clampPercent((numericValue / numericMax) * 100);
+}
+
+function comfyUiWebSocketUrl(clientId) {
+  const url = new URL(comfyUiBaseUrl());
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/ws";
+  url.search = "";
+  url.searchParams.set("clientId", clientId);
+  return url.toString();
+}
+
+function openComfyUiProgressSocket({ clientId, context }) {
+  if (typeof WebSocket === "undefined") {
+    setComfyUiProgress(context, {
+      status: "queued",
+      phase: "polling",
+      message: "ComfyUI websocket is unavailable in this Node runtime; polling history."
+    });
+    return null;
+  }
+
+  let promptId = "";
+  let socket = null;
+  try {
+    socket = new WebSocket(comfyUiWebSocketUrl(clientId));
+  } catch (error) {
+    setComfyUiProgress(context, {
+      status: "queued",
+      phase: "polling",
+      message: `ComfyUI websocket could not open; polling history. ${cleanErrorMessage(error)}`
+    });
+    return null;
+  }
+
+  const close = () => {
+    try {
+      socket?.close?.();
+    } catch {
+      // Non-critical cleanup.
+    }
+  };
+  const setPromptId = (value) => {
+    promptId = String(value || "");
+  };
+
+  socket.addEventListener("open", () => {
+    setComfyUiProgress(context, {
+      status: "queued",
+      phase: "connected",
+      message: "Connected to ComfyUI progress stream."
+    });
+  });
+  socket.addEventListener("message", (event) => {
+    handleComfyUiProgressMessage({
+      context,
+      message: event?.data,
+      promptId
+    });
+  });
+  socket.addEventListener("error", () => {
+    setComfyUiProgress(context, {
+      status: "running",
+      phase: "polling",
+      message: "ComfyUI websocket had a progress-stream error; polling history."
+    });
+  });
+  socket.addEventListener("close", () => {
+    const current = comfyUiProgressEntries.get(comfyUiProgressKey(context));
+    if (current && !["complete", "error"].includes(current.status)) {
+      setComfyUiProgress(context, {
+        status: current.status || "running",
+        phase: current.phase || "polling",
+        message: current.message || "ComfyUI progress stream closed; polling history."
+      });
+    }
+  });
+
+  return { close, setPromptId };
+}
+
+function handleComfyUiProgressMessage({ context, message, promptId = "" }) {
+  if (typeof message !== "string") return;
+  let payload = null;
+  try {
+    payload = JSON.parse(message);
+  } catch {
+    return;
+  }
+
+  const type = String(payload?.type || "").toLowerCase();
+  const data = payload?.data || {};
+  const messagePromptId = String(data.prompt_id || data.promptId || "");
+  if (promptId && messagePromptId && messagePromptId !== promptId) return;
+  const promptPatch = messagePromptId ? { promptId: messagePromptId } : {};
+
+  if (type === "execution_start") {
+    setComfyUiProgress(context, {
+      ...promptPatch,
+      status: "running",
+      phase: "started",
+      message: "ComfyUI started executing the prompt."
+    });
+    return;
+  }
+  if (type === "executing") {
+    const node = data.node === null || data.node === undefined ? "" : String(data.node);
+    if (!node) {
+      completeComfyUiProgress(context, {
+        ...promptPatch,
+        message: "ComfyUI finished executing the prompt."
+      });
+      return;
+    }
+    setComfyUiProgress(context, {
+      ...promptPatch,
+      status: "running",
+      phase: "executing",
+      node,
+      message: `ComfyUI executing node ${node}.`
+    });
+    return;
+  }
+  if (type === "progress") {
+    const value = Number(data.value || 0);
+    const max = Number(data.max || 0);
+    setComfyUiProgress(context, {
+      ...promptPatch,
+      status: "running",
+      phase: "sampling",
+      value,
+      max,
+      percent: comfyUiProgressPercent(value, max),
+      message: max > 0 ? `ComfyUI sampling ${value}/${max}.` : "ComfyUI sampling."
+    });
+    return;
+  }
+  if (type === "execution_cached") {
+    setComfyUiProgress(context, {
+      ...promptPatch,
+      status: "running",
+      phase: "cached",
+      message: "ComfyUI reused cached nodes."
+    });
+    return;
+  }
+  if (type === "executed") {
+    setComfyUiProgress(context, {
+      ...promptPatch,
+      status: "running",
+      phase: "collecting",
+      node: data.node === undefined || data.node === null ? "" : String(data.node),
+      message: "ComfyUI node finished; collecting output."
+    });
+    return;
+  }
+  if (type === "execution_error") {
+    failComfyUiProgress(context, data.exception_message || data.exception_type || "ComfyUI execution error.", promptPatch);
+  }
+}
+
 async function comfyUiHealthStatus() {
   const baseUrl = comfyUiBaseUrl();
   const configured = comfyUiInfiniteTalkConfigured();
@@ -7807,8 +9812,214 @@ async function comfyUiHealthStatus() {
     workflow: comfyUiInfiniteTalkWorkflowPath(),
     inputDir: comfyUiInputDir(),
     outputDir: comfyUiOutputDir(),
+    autoStartEnabled: comfyUiAutoStartEnabled(),
+    startScript: comfyUiStartScriptPath(),
+    logs: comfyUiLogPaths(),
     error
   };
+}
+
+function comfyUiAutoStartEnabled() {
+  const value = String(process.env.COMFYUI_AUTO_START ?? process.env.NEWTBUILDER_COMFYUI_AUTO_START ?? "").trim().toLowerCase();
+  if (!value) return true;
+  return ["1", "true", "yes", "on"].includes(value);
+}
+
+function comfyUiStartScriptPath() {
+  const configured = String(process.env.COMFYUI_START_SCRIPT || process.env.NEWTBUILDER_COMFYUI_START_SCRIPT || "").trim();
+  if (configured) return path.resolve(configured);
+  return existsSync(defaultComfyUiStartScriptPath) ? defaultComfyUiStartScriptPath : "";
+}
+
+function comfyUiLogPaths() {
+  return {
+    log: path.join(logsDir, "comfyui.log"),
+    errorLog: path.join(logsDir, "comfyui.err.log")
+  };
+}
+
+function comfyUiConnectionTarget() {
+  try {
+    const url = new URL(comfyUiBaseUrl());
+    const portNumber = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+    return {
+      host: url.hostname || "127.0.0.1",
+      listenHost: ["localhost", "::1"].includes(url.hostname) ? "127.0.0.1" : url.hostname || "127.0.0.1",
+      port: Number.isFinite(portNumber) ? portNumber : 8188
+    };
+  } catch {
+    return { host: "127.0.0.1", listenHost: "127.0.0.1", port: 8188 };
+  }
+}
+
+function comfyUiPythonPath(root) {
+  const configured = String(process.env.COMFYUI_PYTHON || process.env.NEWTBUILDER_COMFYUI_PYTHON || "").trim();
+  if (configured) return path.resolve(configured);
+  const candidates =
+    process.platform === "win32"
+      ? [
+          path.join(root, ".venv", "Scripts", "python.exe"),
+          path.join(root, "venv", "Scripts", "python.exe"),
+          path.join(root, "..", "standalone-env", "python.exe")
+        ]
+      : [
+          path.join(root, ".venv", "bin", "python"),
+          path.join(root, "venv", "bin", "python"),
+          path.join(root, "..", "standalone-env", "bin", "python")
+        ];
+  return candidates.find((candidate) => existsSync(candidate)) || "python";
+}
+
+function comfyUiAutoStartTimeoutMs(renderTimeoutMs = 120000) {
+  const configured = Number(process.env.COMFYUI_AUTO_START_TIMEOUT_MS || process.env.NEWTBUILDER_COMFYUI_AUTO_START_TIMEOUT_MS || 120000);
+  const timeoutMs = Number.isFinite(configured) ? configured : 120000;
+  const renderCeiling = Number.isFinite(Number(renderTimeoutMs)) ? Number(renderTimeoutMs) : 120000;
+  return Math.min(Math.max(5000, timeoutMs), Math.max(5000, renderCeiling));
+}
+
+function closeFdQuietly(fd) {
+  if (!Number.isInteger(fd)) return;
+  try {
+    closeSync(fd);
+  } catch {
+    // Best effort cleanup for detached process log descriptors.
+  }
+}
+
+async function spawnDetachedProcess(command, args = [], options = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(command, args, {
+        ...options,
+        detached: true,
+        windowsHide: true
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let settled = false;
+    const settle = (error = null) => {
+      if (settled) return;
+      settled = true;
+      if (error) {
+        reject(error);
+        return;
+      }
+      child.unref();
+      resolve(child);
+    };
+
+    child.once("error", settle);
+    child.once("spawn", () => settle());
+  });
+}
+
+async function launchComfyUiBackend() {
+  await mkdir(logsDir, { recursive: true });
+  const scriptPath = comfyUiStartScriptPath();
+  if (scriptPath) {
+    if (!existsSync(scriptPath)) {
+      throw new Error(`Configured ComfyUI start script was not found: ${scriptPath}`);
+    }
+    await spawnDetachedProcess(scriptPath, [], {
+      cwd: path.dirname(scriptPath),
+      shell: process.platform === "win32",
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        PYTHONUTF8: process.env.PYTHONUTF8 || "1",
+        PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8"
+      }
+    });
+    return { mode: "script", path: scriptPath };
+  }
+
+  const root = comfyUiRootDir();
+  if (!root || !existsSync(root)) {
+    throw new Error("COMFYUI_ROOT_DIR is not set and the default ComfyUI Desktop path was not found.");
+  }
+  const mainPath = path.join(root, "main.py");
+  if (!existsSync(mainPath)) {
+    throw new Error(`ComfyUI main.py was not found under ${root}.`);
+  }
+
+  const { listenHost, port: comfyPort } = comfyUiConnectionTarget();
+  const pythonPath = comfyUiPythonPath(root);
+  const { log, errorLog } = comfyUiLogPaths();
+  const stdoutFd = openSync(log, "a");
+  const stderrFd = openSync(errorLog, "a");
+  try {
+    await spawnDetachedProcess(
+      pythonPath,
+      ["main.py", "--listen", listenHost, "--port", String(comfyPort)],
+      {
+        cwd: root,
+        stdio: ["ignore", stdoutFd, stderrFd],
+        env: {
+          ...process.env,
+          PYTHONUTF8: process.env.PYTHONUTF8 || "1",
+          PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8"
+        }
+      }
+    );
+  } finally {
+    closeFdQuietly(stdoutFd);
+    closeFdQuietly(stderrFd);
+  }
+
+  return { mode: "python", path: mainPath, pythonPath, port: comfyPort };
+}
+
+async function waitForComfyUiReachable(timeoutMs) {
+  const startedAt = Date.now();
+  let lastStatus = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    lastStatus = await comfyUiHealthStatus();
+    if (lastStatus.reachable) return lastStatus;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  return lastStatus || comfyUiHealthStatus();
+}
+
+async function startComfyUiBackendAndWait(renderTimeoutMs) {
+  const startTimeoutMs = comfyUiAutoStartTimeoutMs(renderTimeoutMs);
+  const launched = await launchComfyUiBackend();
+  const status = await waitForComfyUiReachable(startTimeoutMs);
+  if (!status.reachable) {
+    const { log, errorLog } = comfyUiLogPaths();
+    throw new Error(
+      `ComfyUI auto-start launched via ${launched.mode}, but ${status.baseUrl} did not answer within ${Math.round(startTimeoutMs / 1000)} seconds. ` +
+        `Check ${log} and ${errorLog}.${status.error ? ` Last health error: ${status.error}` : ""}`
+    );
+  }
+  if (!status.infinitalkConfigured) {
+    throw new Error("ComfyUI is running, but InfiniteTalk is not configured. Check COMFYUI_INFINITALK_WORKFLOW plus the ComfyUI input/output directories.");
+  }
+  return status;
+}
+
+async function ensureComfyUiReadyForInfiniteTalk(renderTimeoutMs = 120000) {
+  const status = await comfyUiHealthStatus();
+  if (status.reachable) {
+    if (!status.infinitalkConfigured) {
+      throw new Error("ComfyUI is running, but InfiniteTalk is not configured. Check COMFYUI_INFINITALK_WORKFLOW plus the ComfyUI input/output directories.");
+    }
+    return status;
+  }
+
+  if (!comfyUiAutoStartEnabled()) {
+    throw new Error(`ComfyUI is not reachable at ${status.baseUrl}. Start ComfyUI or set COMFYUI_AUTO_START=true to let NewtBuilder launch it for InfiniteTalk renders.`);
+  }
+
+  if (!comfyUiAutoStartPromise) {
+    comfyUiAutoStartPromise = startComfyUiBackendAndWait(renderTimeoutMs).finally(() => {
+      comfyUiAutoStartPromise = null;
+    });
+  }
+  return comfyUiAutoStartPromise;
 }
 
 function fabricModelId() {
@@ -8121,7 +10332,7 @@ function infiniteTalkSeed() {
 function lipSyncProviderSignatureOptions(provider, line, format = {}) {
   if (provider === "infinitalk") {
     const backend = infiniteTalkBackendForLine(line);
-    return {
+    const options = {
       backend,
       numFrames: infiniteTalkNumFrames(line),
       requiredAudioSeconds: infiniteTalkRequiredAudioSeconds(line),
@@ -8133,6 +10344,8 @@ function lipSyncProviderSignatureOptions(provider, line, format = {}) {
       comfyUiWorkflow: backend === "comfyui" ? comfyUiInfiniteTalkWorkflowPath() : "",
       comfyUiMapping: backend === "comfyui" ? compactText(process.env.COMFYUI_INFINITALK_MAPPING_JSON || "", 500) : ""
     };
+    if (backend === "comfyui") options.audioCfgScale = animationStrengthForLine(line);
+    return options;
   }
   return {};
 }
@@ -8215,6 +10428,40 @@ async function prepareLipSyncInputImage({ line, tempDir, signatureHash }) {
   return outputPath;
 }
 
+async function prepareLipSyncMaskImage({ line, tempDir, signatureHash }) {
+  const lineLabel = `line-${String(line.index).padStart(3, "0")}-${signatureHash}`;
+  const outputPath = path.join(tempDir, `${lineLabel}-speaker-mask.png`);
+  const maskChain = renderMaskCleanupFilter({ invert: line.invertMask });
+  const filterComplex = [
+    `[0:v]${maskChain}[mask0]`,
+    "[mask0][1:v]scale2ref=flags=neighbor[mask][ref]",
+    "[ref]nullsink",
+    "[mask]format=gray,setsar=1[out]"
+  ].join(";");
+
+  await execFileAsync(
+    process.env.FFMPEG_PATH || "ffmpeg",
+    [
+      "-y",
+      "-i",
+      line.maskPath,
+      "-i",
+      line.imagePath,
+      "-filter_complex",
+      filterComplex,
+      "-map",
+      "[out]",
+      "-frames:v",
+      "1",
+      "-update",
+      "1",
+      outputPath
+    ],
+    { timeout: 90000, maxBuffer: 12 * 1024 * 1024 }
+  );
+  return outputPath;
+}
+
 async function prepareLipSyncAudio({ line, tempDir, signatureHash, provider = "kling" }) {
   const sourcePath = line.audio?.filePath || "";
   const sourceDuration = Number(line.audio?.durationSeconds || 0) || (sourcePath ? await probeDuration(sourcePath) : 0);
@@ -8252,7 +10499,7 @@ async function runLipSyncProvider({ provider, imagePath, audioPath, prompt, line
       return runLocalInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath });
     }
     if (backend === "comfyui") {
-      return runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath });
+      return runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest });
     }
   }
   return runFalLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir });
@@ -8356,7 +10603,7 @@ async function runLocalInfiniteTalk({ imagePath, audioPath, prompt, line, tempDi
   }
 }
 
-async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, rawPath }) {
+async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest }) {
   const workflowPath = comfyUiInfiniteTalkWorkflowPath();
   if (!workflowPath || !existsSync(workflowPath)) {
     throw new Error("ComfyUI InfiniteTalk is selected, but COMFYUI_INFINITALK_WORKFLOW does not point to an API-format workflow JSON file.");
@@ -8371,56 +10618,115 @@ async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, form
   }
 
   const timeoutMs = Number(process.env.COMFYUI_INFINITALK_TIMEOUT_MS || process.env.LOCAL_INFINITALK_TIMEOUT_MS || 7200000);
+  await ensureComfyUiReadyForInfiniteTalk(timeoutMs);
   const graph = await loadComfyUiApiWorkflow(workflowPath);
   const lineLabel = `line-${String(line.index).padStart(3, "0")}-${safeFileSegment(line.speaker)}`;
   const prefix = `NewtBuilder_${lineLabel}_${Date.now()}`;
-  const imageName = await copyComfyUiInputFile(imagePath, `${prefix}-image`);
-  const audioName = await copyComfyUiInputFile(audioPath, `${prefix}-audio`);
-  const dimensions = parseResolution(format?.resolution, format?.aspectRatio);
-  const width = Number(format?.width || dimensions.width || 720);
-  const height = Number(format?.height || dimensions.height || 1280);
-  const seed = infiniteTalkSeed();
+  const progressContext = comfyUiProgressContext({ manifest, line, filenamePrefix: prefix });
+  let promptId = "";
+  let progressSocket = null;
 
-  applyComfyUiWorkflowInputs(graph, {
-    imageName,
-    audioName,
-    prompt: prompt || ".",
-    negativePrompt: process.env.COMFYUI_INFINITALK_NEGATIVE_PROMPT || defaultComfyUiInfiniteTalkNegativePrompt,
-    width,
-    height,
-    numFrames: infiniteTalkNumFrames(line),
-    seed,
-    filenamePrefix: prefix
-  });
+  try {
+    setComfyUiProgress(progressContext, {
+      status: "starting",
+      phase: "preparing",
+      message: `Preparing ComfyUI inputs for line ${line.index}.`
+    });
 
-  const queued = await queueComfyUiPrompt(graph, timeoutMs);
-  const promptId = queued.prompt_id || queued.promptId || "";
-  if (!promptId) {
-    throw new Error(`ComfyUI did not return a prompt id. ${compactText(JSON.stringify(queued), 260)}`);
-  }
+    const masked = Boolean(line.maskPath && line.imagePath);
+    const workflowMaskSupported = masked && comfyUiCanMapImageFileInput(graph, "mask", comfyUiMaskInputNames(), comfyUiMaskInputPredicate);
+    const primaryImagePath = workflowMaskSupported ? line.imagePath : imagePath;
+    const imageName = await copyComfyUiInputFile(primaryImagePath, `${prefix}-image`);
+    const audioName = await copyComfyUiInputFile(audioPath, `${prefix}-audio`);
+    const maskInputPath = workflowMaskSupported ? await prepareLipSyncMaskImage({ line, tempDir, signatureHash: prefix }) : "";
+    const maskName = maskInputPath ? await copyComfyUiInputFile(maskInputPath, `${prefix}-mask`) : "";
+    const sourceImageName = workflowMaskSupported ? imageName : "";
+    const dimensions = parseResolution(format?.resolution, format?.aspectRatio);
+    const width = Number(format?.width || dimensions.width || 720);
+    const height = Number(format?.height || dimensions.height || 1280);
+    const seed = infiniteTalkSeed();
+    const audioCfgScale = animationStrengthForLine(line);
 
-  const history = await waitForComfyUiPrompt(promptId, timeoutMs);
-  const output = findComfyUiVideoOutput(history, promptId);
-  if (!output) {
-    throw new Error(`ComfyUI completed prompt ${promptId}, but no MP4/video output was recorded in history.`);
-  }
-  const outputPath = resolveComfyUiOutputPath(output);
-  if (!outputPath || !existsSync(outputPath)) {
-    throw new Error(`ComfyUI reported an output that NewtBuilder could not find: ${compactText(JSON.stringify(output), 260)}`);
-  }
-  if (path.resolve(outputPath) !== path.resolve(rawPath)) {
-    await copyFile(outputPath, rawPath);
-  }
+    const mappedInputs = applyComfyUiWorkflowInputs(graph, {
+      imageName,
+      audioName,
+      maskName,
+      sourceImageName,
+      prompt: prompt || ".",
+      negativePrompt: process.env.COMFYUI_INFINITALK_NEGATIVE_PROMPT || defaultComfyUiInfiniteTalkNegativePrompt,
+      width,
+      height,
+      numFrames: infiniteTalkNumFrames(line),
+      audioCfgScale,
+      seed,
+      filenamePrefix: prefix
+    });
 
-  return {
-    video: { path: rawPath, url: "" },
-    backend: "comfyui",
-    model: comfyUiInfiniteTalkModelId(),
-    prompt_id: promptId,
-    workflow: workflowPath,
-    width,
-    height
-  };
+    const clientId = randomUUID();
+    progressSocket = openComfyUiProgressSocket({ clientId, context: progressContext });
+    setComfyUiProgress(progressContext, {
+      status: "queued",
+      phase: "queueing",
+      message: `Submitting line ${line.index} to ComfyUI.`
+    });
+
+    const queued = await queueComfyUiPrompt(graph, timeoutMs, clientId);
+    promptId = queued.prompt_id || queued.promptId || "";
+    if (!promptId) {
+      throw new Error(`ComfyUI did not return a prompt id. ${compactText(JSON.stringify(queued), 260)}`);
+    }
+    progressSocket?.setPromptId?.(promptId);
+    setComfyUiProgress(progressContext, {
+      status: "queued",
+      phase: "queued",
+      message: `ComfyUI queued line ${line.index}.`,
+      promptId
+    });
+
+    const history = await waitForComfyUiPrompt(promptId, timeoutMs, progressContext);
+    setComfyUiProgress(progressContext, {
+      status: "running",
+      phase: "collecting",
+      message: "ComfyUI finished; locating generated video output.",
+      promptId,
+      percent: 100
+    });
+    const output = findComfyUiVideoOutput(history, promptId);
+    if (!output) {
+      throw new Error(`ComfyUI completed prompt ${promptId}, but no MP4/video output was recorded in history.`);
+    }
+    const outputPath = resolveComfyUiOutputPath(output);
+    if (!outputPath || !existsSync(outputPath)) {
+      throw new Error(`ComfyUI reported an output that NewtBuilder could not find: ${compactText(JSON.stringify(output), 260)}`);
+    }
+    if (path.resolve(outputPath) !== path.resolve(rawPath)) {
+      await copyFile(outputPath, rawPath);
+    }
+
+    completeComfyUiProgress(progressContext, {
+      promptId,
+      message: `ComfyUI video ready for line ${line.index}.`
+    });
+
+    return {
+      video: { path: rawPath, url: "" },
+      backend: "comfyui",
+      model: comfyUiInfiniteTalkModelId(),
+      prompt_id: promptId,
+      workflow: workflowPath,
+      audio_cfg_scale: audioCfgScale,
+      masked,
+      workflow_mask_supported: workflowMaskSupported,
+      workflow_mask_input: Boolean(mappedInputs.mask),
+      width,
+      height
+    };
+  } catch (error) {
+    failComfyUiProgress(progressContext, error, { promptId });
+    throw error;
+  } finally {
+    progressSocket?.close?.();
+  }
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
@@ -8486,12 +10792,18 @@ async function copyComfyUiInputFile(sourcePath, label) {
 }
 
 function applyComfyUiWorkflowInputs(graph, values) {
-  setComfyUiWorkflowInput(graph, "image", values.imageName, {
+  const mapped = {
+    image: false,
+    audio: false,
+    mask: false,
+    sourceImage: false
+  };
+  mapped.image = setComfyUiWorkflowInput(graph, "image", values.imageName, {
     required: true,
     defaultInput: "image",
     candidates: comfyUiCandidatesByInput(graph, ["image"], (node) => comfyUiNodeText(node).includes("loadimage"))
   });
-  setComfyUiWorkflowInput(graph, "audio", values.audioName, {
+  mapped.audio = setComfyUiWorkflowInput(graph, "audio", values.audioName, {
     required: true,
     defaultInput: "audio",
     candidates: comfyUiCandidatesByInput(
@@ -8500,6 +10812,24 @@ function applyComfyUiWorkflowInputs(graph, values) {
       (node) => comfyUiNodeText(node).includes("audio")
     )
   });
+  if (values.sourceImageName) {
+    mapped.sourceImage = applyComfyUiImageFileInput(
+      graph,
+      "sourceImage",
+      values.sourceImageName,
+      comfyUiSourceImageInputNames(),
+      comfyUiSourceImageInputPredicate
+    );
+  }
+  if (values.maskName) {
+    mapped.mask = applyComfyUiImageFileInput(
+      graph,
+      "mask",
+      values.maskName,
+      comfyUiMaskInputNames(),
+      comfyUiMaskInputPredicate
+    );
+  }
   setComfyUiWorkflowInput(graph, "prompt", values.prompt, {
     defaultInput: "text",
     candidates: comfyUiCandidatesByInput(
@@ -8523,10 +10853,79 @@ function applyComfyUiWorkflowInputs(graph, values) {
   }
   applyComfyUiResolutionInputs(graph, values.width, values.height);
   applyComfyUiNumericInputs(graph, "numFrames", values.numFrames, ["num_frames", "frame_num"]);
+  applyComfyUiNumericInputs(graph, "audioCfgScale", values.audioCfgScale, ["audio_cfg_scale"]);
   if (values.seed !== null && values.seed !== undefined) {
     applyComfyUiNumericInputs(graph, "seed", values.seed, ["seed"]);
   }
   applyComfyUiStringInputs(graph, "filenamePrefix", values.filenamePrefix, ["filename_prefix"]);
+  return mapped;
+}
+
+function comfyUiMaskInputNames() {
+  return ["mask", "mask_image", "maskImage", "mask_file", "maskFile", "mask_filename", "maskFilename", "matte", "matte_image", "alpha_mask", "segmentation_mask"];
+}
+
+function comfyUiSourceImageInputNames() {
+  return ["source_image", "sourceImage", "original_image", "originalImage", "full_image", "fullImage", "reference_image", "referenceImage"];
+}
+
+function comfyUiMaskInputPredicate(node) {
+  const text = comfyUiNodeText(node);
+  return text.includes("mask") || text.includes("matte") || text.includes("alpha");
+}
+
+function comfyUiSourceImageInputPredicate(node) {
+  const text = comfyUiNodeText(node);
+  return text.includes("source") || text.includes("original") || text.includes("full image") || text.includes("reference");
+}
+
+function applyComfyUiImageFileInput(graph, field, value, inputNames, predicate) {
+  const mapping = comfyUiInputMapping(field);
+  if (mapping.node) {
+    const node = graph[String(mapping.node)];
+    if (!node) {
+      throw new Error(`COMFYUI_INFINITALK_${comfyUiFieldEnvKey(field)}_NODE=${mapping.node} does not exist in the API workflow.`);
+    }
+    const inputKey = mapping.input || "image";
+    node.inputs[inputKey] = String(value || "");
+    return true;
+  }
+
+  const literalInputNames = inputNames.filter((name) => String(name).toLowerCase() !== "image");
+  if (setComfyUiInputsByName(graph, literalInputNames, String(value || "")) > 0) return true;
+
+  const candidates = comfyUiImageFileInputCandidates(graph, inputNames, predicate);
+  if (candidates.length !== 1) return false;
+  graph[candidates[0].id].inputs[candidates[0].input] = String(value || "");
+  return true;
+}
+
+function comfyUiCanMapImageFileInput(graph, field, inputNames, predicate) {
+  const mapping = comfyUiInputMapping(field);
+  if (mapping.node) return true;
+  const literalInputNames = inputNames.filter((name) => String(name).toLowerCase() !== "image");
+  if (countComfyUiLiteralInputsByName(graph, literalInputNames) > 0) return true;
+  return comfyUiImageFileInputCandidates(graph, inputNames, predicate).length === 1;
+}
+
+function comfyUiImageFileInputCandidates(graph, inputNames, predicate) {
+  return [
+    ...comfyUiCandidatesByInput(graph, inputNames, predicate),
+    ...comfyUiCandidatesByInput(graph, ["image"], (node) => predicate(node) && comfyUiNodeText(node).includes("loadimage"))
+  ];
+}
+
+function countComfyUiLiteralInputsByName(graph, inputNames) {
+  const names = new Set(inputNames.map((item) => String(item).toLowerCase()));
+  let count = 0;
+  for (const node of Object.values(graph)) {
+    for (const [inputName, inputValue] of Object.entries(node.inputs || {})) {
+      if (!names.has(inputName.toLowerCase())) continue;
+      if (!comfyUiInputIsLiteral(inputValue)) continue;
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function setComfyUiWorkflowInput(graph, field, value, options = {}) {
@@ -8639,21 +11038,22 @@ function describeComfyUiCandidates(candidates) {
     .join(", ");
 }
 
-async function queueComfyUiPrompt(graph, timeoutMs) {
+async function queueComfyUiPrompt(graph, timeoutMs, clientId = randomUUID()) {
   return fetchJsonWithTimeout(
     `${comfyUiBaseUrl()}/prompt`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: graph, client_id: randomUUID() })
+      body: JSON.stringify({ prompt: graph, client_id: clientId })
     },
     Math.min(timeoutMs, Number(process.env.COMFYUI_REQUEST_TIMEOUT_MS || 30000))
   );
 }
 
-async function waitForComfyUiPrompt(promptId, timeoutMs) {
+async function waitForComfyUiPrompt(promptId, timeoutMs, progressContext = null) {
   const startedAt = Date.now();
   const pollMs = Math.max(1000, Number(process.env.COMFYUI_POLL_INTERVAL_MS || 3000));
+  let pollCount = 0;
   while (Date.now() - startedAt < timeoutMs) {
     const history = await fetchJsonWithTimeout(
       `${comfyUiBaseUrl()}/history/${encodeURIComponent(promptId)}`,
@@ -8666,6 +11066,19 @@ async function waitForComfyUiPrompt(promptId, timeoutMs) {
       throw new Error(`ComfyUI prompt ${promptId} failed. ${comfyUiExecutionErrorMessage(status)}`);
     }
     if (record?.outputs && status.completed !== false) return history;
+    if (progressContext) {
+      pollCount += 1;
+      const current = comfyUiProgressEntries.get(comfyUiProgressKey(progressContext));
+      if (!current || ["starting", "queued"].includes(current.status) || pollCount % 4 === 0) {
+        setComfyUiProgress(progressContext, {
+          status: "running",
+          phase: current?.phase || "polling",
+          message: current?.message || "ComfyUI is running; waiting for history output.",
+          promptId,
+          percent: current?.percent || 0
+        });
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   throw new Error(`ComfyUI prompt ${promptId} timed out after ${Math.round(timeoutMs / 60000)} minutes.`);
@@ -9113,7 +11526,7 @@ async function generateAutomaticSpeakerMaskForLine({ line, imageAsset, show }) {
       speaker: String(line.speaker || "").trim(),
       speakerRole: targetSpeakerRoleForLine(line, imageAsset),
       characterId: cleanId(line.characterId),
-      detector: region.detector || "filename-role-order",
+      detector: region.detector || "shot-asset-speaking-tags",
       confidence: Number(region.confidence || 0),
       maskRegionX: Number(region.x || 0),
       maskRegionY: Number(region.y || 0),
@@ -9273,7 +11686,7 @@ async function openAiSpeakerMaskRegion({ line, imageAsset, show, dimensions }) {
   const imageUrl = await imageDataUri(imagePath);
   const character = findCharacterForSpeaker(line.speaker, show);
   const targetRole = targetSpeakerRoleForLine(line, imageAsset);
-  const binding = shotFilenameBinding(imageAsset?.fileName);
+  const binding = assetShotBinding(imageAsset);
   const roleOrder = binding.roles.length ? binding.roles.join(", ") : "unknown";
   const characterContext = characterMaskContext({ line, character, show });
 
@@ -9299,8 +11712,8 @@ async function openAiSpeakerMaskRegion({ line, imageAsset, show, dimensions }) {
                 "Do not include other characters. If the target is unclear, return confidence below 0.65.",
                 `Target speaker: ${line.speaker || "unknown"}`,
                 `Target role: ${targetRole}`,
-                `Filename visible role order: ${roleOrder}`,
-                `Shot filename: ${imageAsset?.fileName || "unknown"}`,
+                `Shot asset speaking tags: ${roleOrder}`,
+                `Shot asset file name: ${imageAsset?.fileName || "unknown"}`,
                 `Image size: ${dimensions.width}x${dimensions.height}`,
                 characterContext
               ]
@@ -9346,7 +11759,7 @@ async function openAiSpeakerMaskRegion({ line, imageAsset, show, dimensions }) {
 }
 
 function filenameSpeakerMaskRegion({ line, imageAsset, dimensions }) {
-  const binding = shotFilenameBinding(imageAsset?.fileName);
+  const binding = assetShotBinding(imageAsset);
   const roles = binding.roles || [];
   const targetRole = targetSpeakerRoleForLine(line, imageAsset);
   const roleIndex = roles.indexOf(targetRole);
@@ -9360,7 +11773,7 @@ function filenameSpeakerMaskRegion({ line, imageAsset, dimensions }) {
     {
       ...region,
       confidence: 0.55,
-      detector: "filename-role-order"
+      detector: "shot-asset-speaking-tags"
     },
     dimensions
   );
@@ -9499,6 +11912,18 @@ function extractOpenAiResponseText(payload) {
     }
   }
   return parts.join("\n");
+}
+
+function extractOpenAiChatResponseText(payload) {
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => part?.text || part?.output_text || "")
+      .filter(Boolean)
+      .join("\n");
+  }
+  return extractOpenAiResponseText(payload);
 }
 
 function parseResponseJsonObject(text) {
@@ -10379,9 +12804,8 @@ function normalizeShortFormat(format = {}) {
 
 function normalizeAsset(asset) {
   const fileName = String(asset.fileName || "asset").trim() || "asset";
-  const binding = shotFilenameBinding(fileName);
-  const storedRole = sanitizeShotRole(asset.shotRole || asset.role || "general");
-  const shotRole = binding.shotRole && storedRole !== "mask" ? binding.shotRole : storedRole;
+  const storedRole = sanitizeShotRole(asset.shotRole || asset.role || "");
+  const shotRole = storedRole || "general";
   return {
     id: asset.id || randomUUID(),
     type: asset.type || mediaTypeForMime(asset.mimeType),
@@ -10408,6 +12832,9 @@ function normalizeAssetMetadata(metadata) {
       normalized[key] = sanitizeOptionalLipSyncModel(value);
     } else if (key === "lipSyncPromptModel") {
       normalized[key] = sanitizeOptionalLipSyncModel(value);
+    } else if (key === "animationStrength") {
+      const animationStrength = normalizeOptionalAnimationStrength(value);
+      if (animationStrength !== null) normalized[key] = animationStrength;
     } else if (typeof value === "string") {
       normalized[key] = value.slice(0, 500);
     } else {
@@ -10421,7 +12848,12 @@ function normalizeFinishingLayers(layers = []) {
   return (Array.isArray(layers) ? layers : [])
     .map(normalizeFinishingLayer)
     .filter(Boolean)
-    .slice(0, 24);
+    .slice(0, 160);
+}
+
+function finishingLayersFromRequestOrEpisode(req, episode) {
+  const submittedLayers = Array.isArray(req.body?.finishingLayers) ? req.body.finishingLayers : null;
+  return normalizeFinishingLayers(submittedLayers || episode?.drafts?.finishingLayers);
 }
 
 function normalizeFinishingLayer(layer) {
@@ -10439,6 +12871,14 @@ function normalizeFinishingLayer(layer) {
     mimeType: String(layer.mimeType || "").trim(),
     localUrl: String(layer.localUrl || "").trim(),
     duplicatedFromLayerId: cleanId(layer.duplicatedFromLayerId),
+    cueKind: compactText(String(layer.cueKind || "").trim(), 24),
+    cueLineId: cleanId(layer.cueLineId),
+    cueLineIndex: Math.max(0, Math.round(Number(layer.cueLineIndex) || 0)),
+    cueScore: roundSeconds(layer.cueScore),
+    cueIntensity: clampNumber(layer.cueIntensity ?? 0, 0, 1),
+    cueConfidence: clampNumber(layer.cueConfidence ?? 0, 0, 1),
+    cueSource: compactText(String(layer.cueSource || "").trim(), 60),
+    cueReason: compactText(String(layer.cueReason || "").trim(), 220),
     enabled: layer.enabled !== false,
     startSeconds,
     durationSeconds,

@@ -1,0 +1,52 @@
+{
+  "createdFor": "NewtBuilder puppet-style lip-sync testing",
+  "format": "ComfyUI Desktop workflow JSON",
+  "workflows": [
+    {
+      "file": "echomimic-v3-flash-workflow.json",
+      "model": "EchoMimic V3 Flash",
+      "source": "https://raw.githubusercontent.com/smthemex/ComfyUI_EchoMimic/main/example_workflows/echov3_falsh_Workflow.json",
+      "customNodes": [
+        "https://github.com/smthemex/ComfyUI_EchoMimic"
+      ],
+      "notes": "Start here for the quickest puppet-style test."
+    },
+    {
+      "file": "echomimic-v3-workflow.json",
+      "model": "EchoMimic V3",
+      "source": "https://raw.githubusercontent.com/smthemex/ComfyUI_EchoMimic/main/example_workflows/echov3_Workflow.json",
+      "customNodes": [
+        "https://github.com/smthemex/ComfyUI_EchoMimic"
+      ],
+      "notes": "Use after V3 Flash if the style looks promising."
+    },
+    {
+      "file": "fantasy-talking-i2v-workflow.json",
+      "model": "FantasyTalking",
+      "source": "https://raw.githubusercontent.com/kijai/ComfyUI-WanVideoWrapper/main/example_workflows/wanvideo_2_1_14B_I2V_FantasyTalking_example_01.json",
+      "customNodes": [
+        "https://github.com/kijai/ComfyUI-WanVideoWrapper"
+      ],
+      "notes": "Promptable audio-driven talking portrait workflow."
+    },
+    {
+      "file": "longcat-avatar-audio-image-to-video-workflow.json",
+      "model": "LongCat Video Avatar",
+      "source": "https://raw.githubusercontent.com/kijai/ComfyUI-WanVideoWrapper/main/example_workflows/LongCatAvatar_audio_image_to_video_example_01.json",
+      "customNodes": [
+        "https://github.com/kijai/ComfyUI-WanVideoWrapper"
+      ],
+      "notes": "Audio plus image to video avatar workflow."
+    }
+  ],
+  "notIncluded": [
+    {
+      "model": "MultiTalk",
+      "reason": "WanVideoWrapper currently includes multitalk implementation code, but no importable MultiTalk workflow JSON was found in its public example_workflows folder.",
+      "watch": [
+        "https://github.com/kijai/ComfyUI-WanVideoWrapper/tree/main/example_workflows",
+        "https://github.com/MeiGen-AI/MultiTalk"
+      ]
+    }
+  ]
+}

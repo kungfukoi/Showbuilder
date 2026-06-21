@@ -41,6 +41,10 @@ const AUTOSAVE_DELAY_MS = 4000;
 const MASK_PREVIEW_ALPHA = 118;
 const LIPSYNC_INPUT_PROMPT_MAX_LENGTH = 2400;
 const LIPSYNC_FULL_PROMPT_MAX_LENGTH = 3600;
+const ANIMATION_STRENGTH_DEFAULT = 1;
+const ANIMATION_STRENGTH_MIN = 0;
+const ANIMATION_STRENGTH_MAX = 5;
+const ANIMATION_STRENGTH_STEP = 0.1;
 
 const formatResolutionOptions = {
   "9:16": [
@@ -422,6 +426,24 @@ function lineVideoTakeOptions(line = {}) {
   return options;
 }
 
+function audienceLaughCueMode(line = {}) {
+  const raw = String(line?.audienceCue?.laugh ?? line?.audienceCue?.laughMode ?? line?.audienceCue?.mode ?? "auto")
+    .trim()
+    .toLowerCase();
+  if (["force", "laugh", "add", "on", "yes", "true"].includes(raw)) return "force";
+  if (["none", "off", "no", "false", "never", "skip"].includes(raw)) return "none";
+  return "auto";
+}
+
+function audienceLaughCuePatch(line = {}, mode = "auto") {
+  return {
+    audienceCue: {
+      ...(line.audienceCue || {}),
+      laugh: mode
+    }
+  };
+}
+
 function parseJsonObject(value) {
   if (!value || typeof value !== "string") return null;
   try {
@@ -746,6 +768,43 @@ function voiceStatusText({ count, source, elevenLabsConnected }) {
   return "No voices available yet.";
 }
 
+function progressUpdatedAtValue(item) {
+  return Date.parse(item?.updatedAt || item?.startedAt || "") || 0;
+}
+
+function generationProgressIsActive(item) {
+  return item && !["complete", "error", "cancelled"].includes(String(item.status || "").toLowerCase());
+}
+
+function latestGenerationProgress(items = []) {
+  const sorted = [...items].sort((a, b) => progressUpdatedAtValue(b) - progressUpdatedAtValue(a));
+  return sorted.find(generationProgressIsActive) || sorted[0] || null;
+}
+
+function generationProgressPercent(item) {
+  const percent = Number(item?.percent || 0);
+  if (!Number.isFinite(percent)) return 0;
+  return Math.max(0, Math.min(100, Math.round(percent)));
+}
+
+function generationProgressLineLabel(item) {
+  return item?.lineIndex ? `Line ${item.lineIndex}${item.speaker ? ` ${item.speaker}` : ""}` : "ComfyUI";
+}
+
+function generationProgressTitle(item) {
+  if (!item) return "";
+  const percent = generationProgressPercent(item);
+  const status = String(item.status || "running").replace(/_/g, " ");
+  const phase = String(item.phase || "").replace(/_/g, " ");
+  const base = `${generationProgressLineLabel(item)} - ${phase || status}`;
+  return percent > 0 ? `${base} ${percent}%` : base;
+}
+
+function generationProgressDetail(item) {
+  if (!item) return "";
+  return item.message || (item.promptId ? `Prompt ${item.promptId}` : "Waiting for ComfyUI progress.");
+}
+
 function lipSyncModelForLine(line) {
   const value = String(line?.lipSyncModel || "").trim().toLowerCase();
   if (value === "kling") return "kling";
@@ -773,6 +832,29 @@ function assetLipSyncPrompt(asset) {
   return compactText(String(asset?.metadata?.lipSyncPrompt || "").trim(), LIPSYNC_INPUT_PROMPT_MAX_LENGTH);
 }
 
+function animationStrengthValueIsSet(value) {
+  return value !== null && value !== undefined && String(value).trim() !== "";
+}
+
+function normalizeAnimationStrength(value, fallback = ANIMATION_STRENGTH_DEFAULT) {
+  const source = animationStrengthValueIsSet(value) ? value : fallback;
+  const number = Number(source);
+  const safeNumber = Number.isFinite(number) ? number : ANIMATION_STRENGTH_DEFAULT;
+  return Math.round(Math.min(ANIMATION_STRENGTH_MAX, Math.max(ANIMATION_STRENGTH_MIN, safeNumber)) * 10) / 10;
+}
+
+function optionalAnimationStrength(value) {
+  return animationStrengthValueIsSet(value) ? normalizeAnimationStrength(value) : null;
+}
+
+function formatAnimationStrength(value) {
+  return normalizeAnimationStrength(value).toFixed(1);
+}
+
+function assetAnimationStrength(asset) {
+  return normalizeAnimationStrength(asset?.metadata?.animationStrength);
+}
+
 function lineLipSyncInputPromptOverride(line) {
   return compactText(String(line?.lipSyncInputPromptOverride || "").trim(), LIPSYNC_INPUT_PROMPT_MAX_LENGTH);
 }
@@ -783,6 +865,15 @@ function lineLipSyncInputPrompt(line, asset) {
 
 function lineLipSyncOverrideModel(line) {
   return optionalLipSyncModel(line?.lipSyncModelOverride || line?.lipSyncModel);
+}
+
+function lineAnimationStrengthOverride(line) {
+  return optionalAnimationStrength(line?.animationStrengthOverride);
+}
+
+function resolvedAnimationStrengthForLine(line, asset) {
+  const override = lineAnimationStrengthOverride(line);
+  return override === null ? assetAnimationStrength(asset) : override;
 }
 
 function resolvedLipSyncModelForLine(line, asset, show) {
@@ -953,6 +1044,37 @@ function Pill({ children, tone = "neutral" }) {
   return <span className={`pill ${tone}`}>{children}</span>;
 }
 
+function AnimationStrengthControl({ label, value, sourceLabel = "", onChange, onReset = null }) {
+  const normalizedValue = normalizeAnimationStrength(value);
+  return (
+    <div className="animationStrengthControl">
+      <div className="animationStrengthHeader">
+        <span>{label}</span>
+        <output>{formatAnimationStrength(normalizedValue)}</output>
+      </div>
+      <input
+        type="range"
+        min={ANIMATION_STRENGTH_MIN}
+        max={ANIMATION_STRENGTH_MAX}
+        step={ANIMATION_STRENGTH_STEP}
+        value={normalizedValue}
+        aria-label={label}
+        onChange={(event) => onChange?.(normalizeAnimationStrength(event.target.value))}
+      />
+      {sourceLabel || onReset ? (
+        <div className="animationStrengthMeta">
+          {sourceLabel ? <Pill tone={sourceLabel === "shot" ? "good" : "neutral"}>{sourceLabel}</Pill> : null}
+          {onReset ? (
+            <button type="button" className="quietButton" onClick={onReset}>
+              Use Global
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function commaList(value) {
   return String(value || "")
     .split(",")
@@ -1004,6 +1126,23 @@ function newestTimestamp(items = []) {
     const value = Date.parse(item?.updatedAt || item?.createdAt || "");
     return Number.isFinite(value) ? Math.max(latest, value) : latest;
   }, 0);
+}
+
+function episodeShelfOrderValue(episode) {
+  const sortOrder = Number(episode?.sortOrder);
+  if (Number.isFinite(sortOrder)) return sortOrder;
+  const timestamp = Date.parse(episode?.createdAt || episode?.updatedAt || "");
+  return Number.isFinite(timestamp) ? -timestamp : Number.MAX_SAFE_INTEGER;
+}
+
+function sortEpisodesForShelf(episodes = []) {
+  return [...episodes].sort((a, b) => {
+    return (
+      episodeShelfOrderValue(a) - episodeShelfOrderValue(b) ||
+      newestTimestamp([b]) - newestTimestamp([a]) ||
+      String(a.title || "").localeCompare(String(b.title || ""))
+    );
+  });
 }
 
 function friendlyDate(value) {
@@ -1134,11 +1273,28 @@ function ShowDashboard({
   onOpenEpisode,
   onOpenEpisodeReview,
   onRenameEpisode,
-  onDuplicateEpisode
+  onDuplicateEpisode,
+  onReorderEpisodes
 }) {
+  const orderedEpisodes = useMemo(() => sortEpisodesForShelf(episodes), [episodes]);
+  const [draggedEpisodeId, setDraggedEpisodeId] = useState("");
+  const [dropTargetEpisodeId, setDropTargetEpisodeId] = useState("");
   const latestTime = newestTimestamp(episodes);
   const renderedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "final_video").length).length;
   const uploadedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "youtube_upload").some((output) => output.videoId)).length;
+
+  function finishEpisodeDrop(targetEpisodeId, insertAfter = false) {
+    const draggedId = draggedEpisodeId;
+    setDraggedEpisodeId("");
+    setDropTargetEpisodeId("");
+    if (!draggedId || draggedId === targetEpisodeId) return;
+    const currentIds = orderedEpisodes.map((episode) => episode.id);
+    const nextIds = currentIds.filter((id) => id !== draggedId);
+    const targetIndex = targetEpisodeId ? nextIds.indexOf(targetEpisodeId) : nextIds.length - 1;
+    const insertIndex = targetEpisodeId && targetIndex >= 0 ? targetIndex + (insertAfter ? 1 : 0) : nextIds.length;
+    nextIds.splice(insertIndex, 0, draggedId);
+    onReorderEpisodes?.(nextIds);
+  }
 
   if (!show) {
     return (
@@ -1173,13 +1329,55 @@ function ShowDashboard({
         <span>{latestTime ? `Last edited ${friendlyDate(latestTime)}` : "Fresh show"}</span>
       </div>
 
-      {episodes.length ? (
-        <div className="episodeCardGrid">
-          {episodes.map((episode) => {
+      {orderedEpisodes.length ? (
+        <div
+          className="episodeCardGrid"
+          onDragOver={(event) => {
+            if (!draggedEpisodeId) return;
+            event.preventDefault();
+          }}
+          onDrop={(event) => {
+            if (!draggedEpisodeId) return;
+            event.preventDefault();
+            finishEpisodeDrop("");
+          }}
+        >
+          {orderedEpisodes.map((episode) => {
             const status = episodeStatusSummary(episode);
             const previewImage = episodePreviewImage(episode);
+            const isDragging = draggedEpisodeId === episode.id;
+            const isDropTarget = dropTargetEpisodeId === episode.id && draggedEpisodeId !== episode.id;
             return (
-              <article className="episodeCard" key={episode.id}>
+              <article
+                className={`episodeCard ${isDragging ? "dragging" : ""} ${isDropTarget ? "dropTarget" : ""}`}
+                key={episode.id}
+                draggable={!busy}
+                onDragStart={(event) => {
+                  setDraggedEpisodeId(episode.id);
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData("text/plain", episode.id);
+                }}
+                onDragEnter={() => {
+                  if (draggedEpisodeId && draggedEpisodeId !== episode.id) setDropTargetEpisodeId(episode.id);
+                }}
+                onDragOver={(event) => {
+                  if (!draggedEpisodeId || draggedEpisodeId === episode.id) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                  setDropTargetEpisodeId(episode.id);
+                }}
+                onDrop={(event) => {
+                  if (!draggedEpisodeId) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  finishEpisodeDrop(episode.id, event.clientX > rect.left + rect.width / 2);
+                }}
+                onDragEnd={() => {
+                  setDraggedEpisodeId("");
+                  setDropTargetEpisodeId("");
+                }}
+              >
                 <button className="episodeCardPreview" type="button" onClick={() => onOpenEpisode(episode.id)} disabled={busy}>
                   {previewImage ? <img src={previewImage} alt="" /> : <Film size={30} />}
                 </button>
@@ -1246,6 +1444,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [busyAction, setBusyAction] = useState("");
   const [status, setStatus] = useState("");
+  const [generationProgressItems, setGenerationProgressItems] = useState([]);
   const [showDraft, setShowDraft] = useState(null);
   const [episodeDraft, setEpisodeDraft] = useState(null);
   const [voices, setVoices] = useState([]);
@@ -1265,6 +1464,10 @@ export default function App() {
     () => episodes.find((episode) => episode.id === activeEpisodeId) || episodes[0] || null,
     [episodes, activeEpisodeId]
   );
+  const activeGenerationProgress = useMemo(
+    () => latestGenerationProgress(generationProgressItems),
+    [generationProgressItems]
+  );
 
   useEffect(() => {
     loadAll();
@@ -1278,6 +1481,38 @@ export default function App() {
     setEpisodeDraft(activeEpisode ? structuredClone(activeEpisode) : null);
     setLaunchReadiness(null);
   }, [activeEpisode?.id]);
+
+  useEffect(() => {
+    const episodeId = activeEpisode?.id;
+    if (!episodeId) {
+      setGenerationProgressItems([]);
+      return undefined;
+    }
+
+    const lastUpdated = progressUpdatedAtValue(activeGenerationProgress);
+    const progressIsRecent = lastUpdated && Date.now() - lastUpdated < 10 * 60 * 1000;
+    const shouldPoll = busy || (generationProgressIsActive(activeGenerationProgress) && progressIsRecent);
+    if (!shouldPoll) return undefined;
+
+    let cancelled = false;
+    async function pollProgress() {
+      try {
+        const response = await fetch(`${API}/api/episodes/${encodeURIComponent(episodeId)}/comfyui-progress`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled) setGenerationProgressItems(Array.isArray(data.items) ? data.items : []);
+      } catch {
+        // Progress is supplemental; the main render request owns error reporting.
+      }
+    }
+
+    pollProgress();
+    const timer = window.setInterval(pollProgress, 1250);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeEpisode?.id, busy, busyAction, activeGenerationProgress?.key, activeGenerationProgress?.status, activeGenerationProgress?.updatedAt]);
 
   useEffect(() => {
     if (!activeShowId) return;
@@ -1349,11 +1584,13 @@ export default function App() {
     autosaveTimerRef.current = window.setTimeout(async () => {
       autosaveInFlightRef.current = true;
       try {
+        let savedShow = null;
         if (showSnapshot) {
           const show = await request(`/api/shows/${showSnapshot.id}`, {
             method: "PATCH",
             body: JSON.stringify(showSnapshot)
           });
+          savedShow = show;
           setShows((prev) => [show, ...prev.filter((item) => item.id !== show.id)]);
           setShowDraft((prev) =>
             prev?.id === show.id && JSON.stringify(prev) === showSignature ? structuredClone(show) : prev
@@ -1366,7 +1603,7 @@ export default function App() {
             body: JSON.stringify({
               title: episodeSnapshot.title,
               scriptText: episodeSnapshot.scriptText,
-              format: episodeSnapshot.format,
+              format: savedShow && episodeSnapshot.showId === savedShow.id ? savedShow.shortFormat : episodeSnapshot.format,
               productionMap: episodeSnapshot.productionMap,
               productionMapEditedAt: episodeSnapshot.productionMapEditedAt,
               drafts: episodeSnapshot.drafts,
@@ -1377,6 +1614,9 @@ export default function App() {
           setEpisodeDraft((prev) =>
             prev?.id === episode.id && JSON.stringify(prev) === episodeSignature ? structuredClone(episode) : prev
           );
+        }
+        if (savedShow) {
+          await refreshEpisodesAfterShowSave(savedShow.id);
         }
       } catch (error) {
         setStatus(`Autosave failed: ${error.message}`);
@@ -1465,6 +1705,23 @@ export default function App() {
     }
   }
 
+  async function refreshEpisodesAfterShowSave(showId) {
+    const [allEpisodeData, showEpisodeData] = await Promise.all([
+      request("/api/episodes"),
+      request(`/api/episodes${showId ? `?showId=${showId}` : ""}`)
+    ]);
+    setAllEpisodes(allEpisodeData);
+    setEpisodes(showEpisodeData);
+    if (!showEpisodeData.find((episode) => episode.id === activeEpisodeId)) {
+      setActiveEpisodeId(showEpisodeData[0]?.id || "");
+    }
+    setEpisodeDraft((prev) => {
+      if (!prev?.id) return prev;
+      const refreshed = allEpisodeData.find((episode) => episode.id === prev.id);
+      return refreshed ? structuredClone(refreshed) : prev;
+    });
+  }
+
   async function createShow() {
     setBusy(true);
     try {
@@ -1506,6 +1763,8 @@ export default function App() {
         body: JSON.stringify(showDraft)
       });
       setShows((prev) => [show, ...prev.filter((item) => item.id !== show.id)]);
+      setShowDraft(structuredClone(show));
+      await refreshEpisodesAfterShowSave(show.id);
       setStatus("Show profile saved.");
     } catch (error) {
       setStatus(error.message);
@@ -1640,6 +1899,41 @@ export default function App() {
     }
   }
 
+  async function reorderEpisodes(episodeIds = []) {
+    if (!activeShowId || !episodeIds.length) return;
+    const previousEpisodes = episodes;
+    const previousAllEpisodes = allEpisodes;
+    const optimisticOrder = new Map(episodeIds.map((id, index) => [id, index]));
+    const optimisticEpisodes = sortEpisodesForShelf(
+      episodes.map((episode) =>
+        optimisticOrder.has(episode.id) ? { ...episode, sortOrder: optimisticOrder.get(episode.id) } : episode
+      )
+    );
+
+    setEpisodes(optimisticEpisodes);
+    setAllEpisodes((prev) =>
+      prev.map((episode) =>
+        episode.showId === activeShowId && optimisticOrder.has(episode.id)
+          ? { ...episode, sortOrder: optimisticOrder.get(episode.id) }
+          : episode
+      )
+    );
+
+    try {
+      const { episodes: orderedEpisodes, allEpisodes: orderedAllEpisodes } = await request("/api/episodes/reorder", {
+        method: "PATCH",
+        body: JSON.stringify({ showId: activeShowId, episodeIds })
+      });
+      setEpisodes(orderedEpisodes);
+      if (orderedAllEpisodes) setAllEpisodes(orderedAllEpisodes);
+      setStatus("Episode order saved.");
+    } catch (error) {
+      setEpisodes(previousEpisodes);
+      setAllEpisodes(previousAllEpisodes);
+      setStatus(error.message);
+    }
+  }
+
   async function ensureEpisodeForUpload() {
     if (episodeDraft) return episodeDraft;
     if (activeEpisode) return activeEpisode;
@@ -1651,21 +1945,29 @@ export default function App() {
     if (!draft) return;
     setBusy(true);
     try {
+      let savedShow = null;
       if (showDraft) {
         const show = await request(`/api/shows/${showDraft.id}`, {
           method: "PATCH",
           body: JSON.stringify(showDraft)
         });
+        savedShow = show;
         setShows((prev) => [show, ...prev.filter((item) => item.id !== show.id)]);
         setShowDraft(structuredClone(show));
       }
       const episode = await request(`/api/episodes/${draft.id}`, {
         method: "PATCH",
-        body: JSON.stringify(draft)
+        body: JSON.stringify({
+          ...draft,
+          format: savedShow && draft.showId === savedShow.id ? savedShow.shortFormat : draft.format
+        })
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setActiveEpisodeId(episode.id);
       setEpisodeDraft(structuredClone(episode));
+      if (savedShow) {
+        await refreshEpisodesAfterShowSave(savedShow.id);
+      }
       setStatus("Episode saved.");
     } catch (error) {
       setStatus(error.message);
@@ -1876,17 +2178,20 @@ export default function App() {
     setBusyAction("finishing-laugh-track");
     setBusy(true);
     try {
-      const { episode, layer, layers } = await request(`/api/episodes/${activeEpisode.id}/finishing/laugh-track`, {
+      const { episode, layer, layers, output } = await request(`/api/episodes/${activeEpisode.id}/finishing/laugh-track`, {
         method: "POST",
         body: JSON.stringify(laughTrackBrief || {})
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setEpisodeDraft(structuredClone(episode));
       const cueCount = Array.isArray(layers) ? layers.length : layer ? 1 : 0;
+      const placementNote = output?.placementWarning ? ` ${output.placementWarning}` : "";
       setStatus(
-        cueCount > 1
-          ? `Generated laugh track and placed ${cueCount} cues: ${layer?.fileName || "ElevenLabs laugh track"}.`
-          : `Generated laugh track layer: ${layer?.fileName || "ElevenLabs laugh track"}.`
+        cueCount === 0
+          ? `Generated laugh track audio, but no new cue placements were added.${placementNote}`
+          : cueCount > 1
+            ? `Generated laugh track and placed ${cueCount} new cues: ${layer?.fileName || "ElevenLabs laugh track"}.${placementNote}`
+            : `Generated laugh track layer: ${layer?.fileName || "ElevenLabs laugh track"}.${placementNote}`
       );
     } catch (error) {
       if (error.payload?.episode) {
@@ -1906,17 +2211,20 @@ export default function App() {
     setBusyAction("finishing-applause-track");
     setBusy(true);
     try {
-      const { episode, layer, layers } = await request(`/api/episodes/${activeEpisode.id}/finishing/applause-track`, {
+      const { episode, layer, layers, output } = await request(`/api/episodes/${activeEpisode.id}/finishing/applause-track`, {
         method: "POST",
         body: JSON.stringify(applauseTrackBrief || {})
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setEpisodeDraft(structuredClone(episode));
       const cueCount = Array.isArray(layers) ? layers.length : layer ? 1 : 0;
+      const placementNote = output?.placementWarning ? ` ${output.placementWarning}` : "";
       setStatus(
-        cueCount > 1
-          ? `Generated applause track and placed ${cueCount} cues: ${layer?.fileName || "ElevenLabs applause track"}.`
-          : `Generated applause track layer: ${layer?.fileName || "ElevenLabs applause track"}.`
+        cueCount === 0
+          ? `Generated applause track audio, but no new cue placements were added.${placementNote}`
+          : cueCount > 1
+            ? `Generated applause track and placed ${cueCount} new cues: ${layer?.fileName || "ElevenLabs applause track"}.${placementNote}`
+            : `Generated applause track layer: ${layer?.fileName || "ElevenLabs applause track"}.${placementNote}`
       );
     } catch (error) {
       if (error.payload?.episode) {
@@ -2190,6 +2498,31 @@ export default function App() {
       const { episode, job, report } = await request(`/api/episodes/${activeEpisode.id}/audio/rebuild-mix`, {
         method: "POST",
         body: JSON.stringify({})
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus(report?.localUrl ? `${job.summary} Report saved locally.` : job.summary);
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function regenerateAllAudio() {
+    if (!activeEpisode) return;
+    setBusyAction("regenerate-audio");
+    setBusy(true);
+    try {
+      setStatus("Regenerating all dialogue audio...");
+      const workingEpisode = episodeDraft?.id === activeEpisode.id ? episodeDraft : activeEpisode;
+      const { episode, job, report } = await request(`/api/episodes/${activeEpisode.id}/audio/regenerate-all`, {
+        method: "POST",
+        body: JSON.stringify({
+          productionMap: workingEpisode.productionMap || [],
+          productionMapEditedAt: workingEpisode.productionMapEditedAt || ""
+        })
       });
       setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
       setEpisodeDraft(structuredClone(episode));
@@ -2754,6 +3087,10 @@ export default function App() {
     cta: showDraft?.creative?.defaultCta || activeShow?.creative?.defaultCta || ""
   };
   const productionMap = episodeDraft?.productionMap || activeEpisode?.productionMap || [];
+  const workingAssets =
+    episodeDraft?.id === activeEpisode?.id
+      ? episodeDraft?.assets || activeEpisode?.assets || []
+      : activeEpisode?.assets || [];
   const previewOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "preview_video");
   const previewOutput = previewOutputs[0] || null;
   const finalOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "final_video");
@@ -2778,7 +3115,7 @@ export default function App() {
   const renderReviewApproved = !renderReviewGate || renderReviewGate.status === "approved" || renderReviewGate.status === "auto";
   const renderReadiness = buildRenderReadiness({
     productionMap,
-    assets: episodeDraft?.assets || activeEpisode?.assets || [],
+    assets: workingAssets,
     approvals,
     audioOutput,
     previewOutput,
@@ -2792,31 +3129,31 @@ export default function App() {
 
   const assetCounts = useMemo(() => {
     const counts = {};
-    for (const asset of activeEpisode?.assets || []) {
+    for (const asset of workingAssets) {
       const role = asset.shotRole || "general";
       counts[role] = (counts[role] || 0) + 1;
     }
     return counts;
-  }, [activeEpisode]);
+  }, [workingAssets]);
   const assetsByRole = useMemo(() => {
     const groups = {};
     for (const type of shotAssetTypes) {
       groups[type.role] = [];
     }
-    for (const asset of activeEpisode?.assets || []) {
+    for (const asset of workingAssets) {
       const role = asset.shotRole || "general";
       if (!groups[role]) groups[role] = [];
       groups[role].push(asset);
     }
     return groups;
-  }, [activeEpisode]);
+  }, [workingAssets]);
   const visualAssets = useMemo(
-    () => (activeEpisode?.assets || []).filter((asset) => asset.type === "image" && asset.shotRole !== "mask"),
-    [activeEpisode]
+    () => workingAssets.filter((asset) => asset.type === "image" && asset.shotRole !== "mask"),
+    [workingAssets]
   );
   const maskAssets = useMemo(
-    () => (activeEpisode?.assets || []).filter((asset) => asset.type === "image" && asset.shotRole === "mask"),
-    [activeEpisode]
+    () => workingAssets.filter((asset) => asset.type === "image" && asset.shotRole === "mask"),
+    [workingAssets]
   );
   const productionShotTypes = shotAssetTypes.filter((type) => type.role !== "mask");
   const uploadShotTypes = shotAssetTypes.filter((type) => type.role !== "mask");
@@ -2979,6 +3316,7 @@ export default function App() {
             onOpenEpisodeReview={openEpisodeReview}
             onRenameEpisode={renameEpisode}
             onDuplicateEpisode={duplicateEpisode}
+            onReorderEpisodes={reorderEpisodes}
           />
         )}
 
@@ -3091,13 +3429,13 @@ export default function App() {
                   ))}
                 </div>
                 <CastVisualLibrary
+                  episodeId={activeEpisode?.id || ""}
                   uploadShotTypes={uploadShotTypes}
-                  assetCounts={assetCounts}
-                  assetsByRole={assetsByRole}
+                  assets={visualAssets}
                   onUpload={uploadAssets}
                   onDelete={deleteAsset}
                   onUpdateTags={updateAssetTags}
-                  onUpdateLipSyncDefaults={updateAssetLipSyncDefaults}
+                  onUpdateAsset={updateAssetLipSyncDefaults}
                   onGenerateLipSyncPrompt={generateAssetLipSyncPrompt}
                   showDefaultLipSyncModel={showDraft.production?.defaultLipSyncModel || "fabric"}
                   busyAction={busyAction}
@@ -3491,6 +3829,7 @@ export default function App() {
             </div>
             <AutomationRunbookPanel automation={activeAutomation} safety={safety} />
             <FinalReviewPanel
+              episodeId={activeEpisode?.id || ""}
               audioOutput={audioOutput}
               previewOutput={previewOutput}
               finalOutput={finalOutput}
@@ -3513,6 +3852,7 @@ export default function App() {
               youtubeAuth={youtubeAuth}
               safety={safety}
               launchReadiness={launchReadiness}
+              generationProgress={activeGenerationProgress}
               hasProductionMap={productionMap.length > 0}
               readiness={renderReadiness}
               canBuildPreview={previewBuildReady}
@@ -3520,6 +3860,7 @@ export default function App() {
               busy={busy}
               busyAction={busyAction}
               onRebuildAudio={rebuildAudioMix}
+              onRegenerateAudio={regenerateAllAudio}
               onBuildPreview={runPipeline}
               onRebuildFinal={() => renderFinalEpisode({ regenerateVideos: false })}
               onRenderFinal={renderFinalEpisode}
@@ -3553,6 +3894,14 @@ export default function App() {
       </main>
 
       <footer className="statusbar">
+        {activeGenerationProgress ? (
+          <div className={`footerGenerationProgress ${activeGenerationProgress.status || ""}`}>
+            <span>{generationProgressTitle(activeGenerationProgress)}</span>
+            <div className="footerProgressBar">
+              <i style={{ width: `${Math.max(generationProgressPercent(activeGenerationProgress) || 4, generationProgressIsActive(activeGenerationProgress) ? 8 : 100)}%` }} />
+            </div>
+          </div>
+        ) : null}
         <div className="statusText">
           {busy ? <RefreshCw className="spin" size={16} /> : <BadgeCheck size={16} />}
           <span>{status || "Ready."}</span>
@@ -3584,7 +3933,29 @@ function Metric({ icon: Icon, label, value }) {
 }
 
 function CollapsiblePanel({ className = "", eyebrow, title, action = null, children, defaultOpen = false }) {
-  const [isOpen, setIsOpen] = useState(defaultOpen);
+  const storageKey = `newtbuilder:panel:${className || title}`;
+  const [isOpen, setIsOpen] = useState(() => {
+    try {
+      const stored = globalThis.localStorage?.getItem(storageKey);
+      if (stored === "open") return true;
+      if (stored === "closed") return false;
+    } catch {
+      // Local storage can be unavailable in hardened browser contexts.
+    }
+    return defaultOpen;
+  });
+
+  function toggleOpen() {
+    setIsOpen((value) => {
+      const next = !value;
+      try {
+        globalThis.localStorage?.setItem(storageKey, next ? "open" : "closed");
+      } catch {
+        // Non-critical preference persistence.
+      }
+      return next;
+    });
+  }
 
   return (
     <section className={`workPanel collapsiblePanel ${isOpen ? "open" : "closed"} ${className}`}>
@@ -3592,7 +3963,7 @@ function CollapsiblePanel({ className = "", eyebrow, title, action = null, child
         <button
           type="button"
           className="collapseTitle"
-          onClick={() => setIsOpen((value) => !value)}
+          onClick={toggleOpen}
           aria-expanded={isOpen}
         >
           <ChevronRight size={18} className={isOpen ? "open" : ""} />
@@ -3662,11 +4033,15 @@ function defaultThumbnailBrief({ drafts = {}, selectedFormat = {} }) {
     .filter(Boolean)
     .join("\n\n")
     .trim();
-  return {
+  const defaults = {
     superText,
     prompt: `Create a ${aspect} YouTube thumbnail that includes the selected still frame, a dynamic super, and the provided episode information.`,
-    details
+    details,
+    stillFrame: "middle"
   };
+  const saved = drafts.thumbnailBrief && typeof drafts.thumbnailBrief === "object" ? drafts.thumbnailBrief : {};
+  const hasSavedText = ["superText", "prompt", "details"].some((key) => String(saved[key] || "").trim());
+  return hasSavedText ? { ...defaults, ...saved } : defaults;
 }
 
 function visibleThumbnailCandidates(outputs = []) {
@@ -3841,6 +4216,7 @@ function FinalOutputLink({ video, index, finalOutputs, finalManifestOutputs, man
 }
 
 function FinalReviewPanel({
+  episodeId,
   audioOutput,
   previewOutput,
   finalOutput,
@@ -3864,6 +4240,7 @@ function FinalReviewPanel({
   youtubeAuth,
   safety,
   launchReadiness,
+  generationProgress,
   hasProductionMap,
   readiness,
   canBuildPreview,
@@ -3871,6 +4248,7 @@ function FinalReviewPanel({
   busy,
   busyAction,
   onRebuildAudio,
+  onRegenerateAudio,
   onBuildPreview,
   onRebuildFinal,
   onRenderFinal,
@@ -3916,18 +4294,32 @@ function FinalReviewPanel({
     reportOutputs.length;
   const renderBusy =
     busyAction === "rebuild-audio" ||
+    busyAction === "regenerate-audio" ||
     busyAction === "build-preview" ||
     busyAction === "rebuild-final" ||
     busyAction === "render-final";
   const thumbnailBusy = busyAction === "thumbnails";
+  const progressPercent = generationProgressPercent(generationProgress);
+  const showGenerationProgress = Boolean(generationProgress && (renderBusy || busyAction?.startsWith("dialogue-video:") || generationProgressIsActive(generationProgress)));
   const selectedThumbnailId = drafts.selectedThumbnailOutputId || thumbnailOutputs.find((thumb) => thumb.isSelected)?.id || "";
   const selectedThumbnail = thumbnailOutputs.find((thumb) => thumb.id === selectedThumbnailId) || null;
   const latestPackage = packageOutputs[0] || null;
   const latestYoutubeUpload = youtubeUploadOutputs[0] || null;
   const packageReady = Boolean(finalOutput && selectedThumbnail);
+  const savedThumbnailBrief = drafts.thumbnailBrief && typeof drafts.thumbnailBrief === "object" ? drafts.thumbnailBrief : {};
+  const youtubeTagsKey = Array.isArray(drafts.youtube?.tags) ? drafts.youtube.tags.join("|") : "";
   const thumbnailBriefDefaults = useMemo(
     () => defaultThumbnailBrief({ drafts, selectedFormat }),
-    [drafts, selectedFormat.aspectRatio]
+    [
+      selectedFormat.aspectRatio,
+      drafts.youtube?.title,
+      drafts.youtube?.description,
+      youtubeTagsKey,
+      savedThumbnailBrief.superText,
+      savedThumbnailBrief.prompt,
+      savedThumbnailBrief.details,
+      savedThumbnailBrief.stillFrame
+    ]
   );
   const [thumbnailBrief, setThumbnailBrief] = useState(thumbnailBriefDefaults);
   const [reviewVideoMode, setReviewVideoMode] = useState("auto");
@@ -4012,7 +4404,7 @@ function FinalReviewPanel({
 
   useEffect(() => {
     setThumbnailBrief(thumbnailBriefDefaults);
-  }, [thumbnailBriefDefaults]);
+  }, [episodeId, thumbnailBriefDefaults]);
 
   useEffect(() => {
     const urls = finalManifestOutputs.map((output) => output.localUrl).filter(Boolean);
@@ -4067,6 +4459,10 @@ function FinalReviewPanel({
   const updateThumbnailBrief = (key, value) => {
     setThumbnailBrief((prev) => ({ ...prev, [key]: value }));
   };
+
+  async function handleSaveThumbnailBrief() {
+    await onSavePublishingDraft?.({ thumbnailBrief });
+  }
 
   async function handleBuildPreview() {
     setReviewVideoMode("preview");
@@ -4128,6 +4524,15 @@ function FinalReviewPanel({
           </button>
           <button
             className="secondaryButton"
+            onClick={onRegenerateAudio}
+            disabled={!hasProductionMap || busy}
+            title="Regenerate every dialogue audio line and rebuild the audio review mix"
+          >
+            <RefreshCw size={16} />
+            Regenerate Audio
+          </button>
+          <button
+            className="secondaryButton"
             onClick={handleBuildPreview}
             disabled={!canBuildPreview || busy}
             title={canBuildPreview ? "Create or refresh the local preview" : readiness.setupReady ? "Select an episode first" : "Clear the Render Readiness setup checks first"}
@@ -4155,6 +4560,22 @@ function FinalReviewPanel({
           </button>
         </div>
       </div>
+
+      {showGenerationProgress ? (
+        <div className={`generationProgress ${generationProgress?.status || ""}`}>
+          <div className="generationProgressHeader">
+            <div>
+              <span className="eyebrow">ComfyUI Progress</span>
+              <strong>{generationProgressTitle(generationProgress)}</strong>
+            </div>
+            <span>{progressPercent > 0 ? `${progressPercent}%` : generationProgress?.status || "running"}</span>
+          </div>
+          <div className="generationProgressBar" aria-label={generationProgressTitle(generationProgress)}>
+            <span style={{ width: `${Math.max(progressPercent || 4, generationProgressIsActive(generationProgress) ? 8 : 100)}%` }} />
+          </div>
+          <p>{generationProgressDetail(generationProgress)}</p>
+        </div>
+      ) : null}
 
       <div className={`finalReviewGrid ${reviewVideo ? "" : "audioOnly"}`}>
         <div className="finalAudioCard">
@@ -4289,6 +4710,10 @@ function FinalReviewPanel({
         </summary>
         <div className="thumbnailReviewBody">
           <div className="thumbnailReviewHeader">
+            <button className="secondaryButton" onClick={handleSaveThumbnailBrief} disabled={busy}>
+              <Save size={16} />
+              Save Inputs
+            </button>
             <button className="secondaryButton" onClick={() => onGenerateThumbnails(thumbnailBrief)} disabled={!reviewVideo || busy}>
               <Image size={16} />
               Generate AI Thumbnails
@@ -4486,18 +4911,23 @@ function FinishingLayersPanel({
     description: "Warm studio audience laugh track for a late-night comedy monologue: natural laughs, small chuckles, no words, no applause.",
     durationSeconds: 8,
     promptInfluence: 0.35,
+    energy: 55,
     volume: 0.22,
     autoPlace: true,
-    maxCues: 4,
-    cueDurationSeconds: 2.4
+    autoCueCount: true,
+    maxCues: 100,
+    cueDurationSeconds: 2.4,
+    startNudgeSeconds: -0.1
   });
   const [applauseTrackBrief, setApplauseTrackBrief] = useState({
     description: "Warm studio audience applause for a late-night show: clean clapping, light cheering, no laughter, no words, no music.",
     durationSeconds: 10,
     promptInfluence: 0.35,
+    energy: 60,
     volume: 0.24,
     autoPlace: true,
-    maxCues: 3,
+    autoCueCount: true,
+    maxCues: 12,
     cueDurationSeconds: 3.2
   });
 
@@ -4551,9 +4981,11 @@ function FinishingLayersPanel({
       const numericRanges = {
         durationSeconds: [0.5, 30],
         promptInfluence: [0, 1],
+        energy: [0, 100],
         volume: [0, 2],
-        maxCues: [1, 8],
-        cueDurationSeconds: [0.5, 30]
+        maxCues: [1, 100],
+        cueDurationSeconds: [0.5, 30],
+        startNudgeSeconds: [-0.5, 1]
       };
       const range = numericRanges[key];
       return {
@@ -4568,8 +5000,9 @@ function FinishingLayersPanel({
       const numericRanges = {
         durationSeconds: [0.5, 30],
         promptInfluence: [0, 1],
+        energy: [0, 100],
         volume: [0, 2],
-        maxCues: [1, 8],
+        maxCues: [1, 100],
         cueDurationSeconds: [0.5, 30]
       };
       const range = numericRanges[key];
@@ -4722,12 +5155,14 @@ function FinishingLayersPanel({
 
   function duplicateLayer(layer) {
     pushUndoSnapshot("Duplicate layer");
+    const duplicateRootId = layer.duplicatedFromLayerId || layer.id;
+    const nextStartSeconds = nextDuplicateLayerStart(layer, draftLayers, timelineSeconds);
     const copy = normalizeFinishingLayerForUi({
       ...layer,
       id: createLocalId("finishing-layer"),
       name: `${layer.name || finishingLayerTypeLabel(layer.type)} copy`,
-      duplicatedFromLayerId: layer.id,
-      startSeconds: clampTimelineValue((Number(layer.startSeconds) || 0) + 0.5, 0, Math.max(0, timelineSeconds - (Number(layer.durationSeconds) || 0.1))),
+      duplicatedFromLayerId: duplicateRootId,
+      startSeconds: nextStartSeconds,
       createdAt: new Date().toISOString()
     });
     setDraftLayers((prev) => {
@@ -5190,7 +5625,7 @@ function FinishingLayersPanel({
             <button
               type="button"
               className="secondaryButton"
-              onClick={() => onGenerateLaughTrack?.(laughTrackBrief)}
+              onClick={() => onGenerateLaughTrack?.({ ...laughTrackBrief, finishingLayers: draftLayers })}
               disabled={!baseFinalOutput || !elevenMusicReady || busy}
               title={
                 !baseFinalOutput
@@ -5233,6 +5668,16 @@ function FinishingLayersPanel({
                 onChange={(event) => updateLaughTrackBrief("promptInfluence", event.target.value)}
               />
             </Field>
+            <Field label={`Energy ${Math.round(Number(laughTrackBrief.energy) || 0)}`}>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={laughTrackBrief.energy}
+                onChange={(event) => updateLaughTrackBrief("energy", event.target.value)}
+              />
+            </Field>
             <Field label="Volume">
               <input
                 type="number"
@@ -5251,18 +5696,24 @@ function FinishingLayersPanel({
               label="Auto-place cues"
               icon={Check}
             />
+            <Toggle
+              checked={laughTrackBrief.autoCueCount}
+              onChange={(checked) => updateLaughTrackBrief("autoCueCount", checked)}
+              label="Auto cue count"
+              icon={Check}
+            />
             <Field label="Max cues">
               <input
                 type="number"
                 min="1"
-                max="8"
+                max="100"
                 step="1"
                 value={laughTrackBrief.maxCues}
                 onChange={(event) => updateLaughTrackBrief("maxCues", event.target.value)}
                 disabled={!laughTrackBrief.autoPlace}
               />
             </Field>
-            <Field label="Cue length">
+            <Field label="Laugh length">
               <input
                 type="number"
                 min="0.5"
@@ -5271,6 +5722,18 @@ function FinishingLayersPanel({
                 value={laughTrackBrief.cueDurationSeconds}
                 onChange={(event) => updateLaughTrackBrief("cueDurationSeconds", event.target.value)}
                 disabled={!laughTrackBrief.autoPlace}
+              />
+            </Field>
+            <Field label="Start nudge">
+              <input
+                type="number"
+                min="-0.5"
+                max="1"
+                step="0.01"
+                value={laughTrackBrief.startNudgeSeconds}
+                onChange={(event) => updateLaughTrackBrief("startNudgeSeconds", event.target.value)}
+                disabled={!laughTrackBrief.autoPlace}
+                title="Negative values start laughter earlier; -0.10 is about 3 frames at 30fps."
               />
             </Field>
           </div>
@@ -5290,7 +5753,7 @@ function FinishingLayersPanel({
             <button
               type="button"
               className="secondaryButton"
-              onClick={() => onGenerateApplauseTrack?.(applauseTrackBrief)}
+              onClick={() => onGenerateApplauseTrack?.({ ...applauseTrackBrief, finishingLayers: draftLayers })}
               disabled={!baseFinalOutput || !elevenMusicReady || busy}
               title={
                 !baseFinalOutput
@@ -5333,6 +5796,16 @@ function FinishingLayersPanel({
                 onChange={(event) => updateApplauseTrackBrief("promptInfluence", event.target.value)}
               />
             </Field>
+            <Field label={`Energy ${Math.round(Number(applauseTrackBrief.energy) || 0)}`}>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={applauseTrackBrief.energy}
+                onChange={(event) => updateApplauseTrackBrief("energy", event.target.value)}
+              />
+            </Field>
             <Field label="Volume">
               <input
                 type="number"
@@ -5351,18 +5824,24 @@ function FinishingLayersPanel({
               label="Auto-place cues"
               icon={Check}
             />
+            <Toggle
+              checked={applauseTrackBrief.autoCueCount}
+              onChange={(checked) => updateApplauseTrackBrief("autoCueCount", checked)}
+              label="Auto cue count"
+              icon={Check}
+            />
             <Field label="Max cues">
               <input
                 type="number"
                 min="1"
-                max="8"
+                max="100"
                 step="1"
                 value={applauseTrackBrief.maxCues}
                 onChange={(event) => updateApplauseTrackBrief("maxCues", event.target.value)}
                 disabled={!applauseTrackBrief.autoPlace}
               />
             </Field>
-            <Field label="Cue length">
+            <Field label="Applause length">
               <input
                 type="number"
                 min="0.5"
@@ -5616,6 +6095,14 @@ function normalizeFinishingLayerForUi(layer) {
     ...layer,
     type,
     duplicatedFromLayerId: String(layer.duplicatedFromLayerId || "").trim(),
+    cueKind: compactText(String(layer.cueKind || "").trim(), 24),
+    cueLineId: String(layer.cueLineId || "").trim(),
+    cueLineIndex: Math.max(0, Math.round(Number(layer.cueLineIndex) || 0)),
+    cueScore: uiNumber(layer.cueScore, 0, 0, 99),
+    cueIntensity: uiNumber(layer.cueIntensity, 0, 0, 1),
+    cueConfidence: uiNumber(layer.cueConfidence, 0, 0, 1),
+    cueSource: compactText(String(layer.cueSource || "").trim(), 60),
+    cueReason: compactText(String(layer.cueReason || "").trim(), 220),
     enabled: layer.enabled !== false,
     startSeconds: uiNumber(layer.startSeconds, 0, 0, 9999),
     durationSeconds: uiNumber(layer.durationSeconds, 3, 0.1, 9999),
@@ -5666,6 +6153,23 @@ function finishingLayerUiDedupeKey(layer) {
     layer.fadeInSeconds,
     layer.fadeOutSeconds
   ].join("|");
+}
+
+function nextDuplicateLayerStart(layer, layers = [], timelineSeconds = 1) {
+  const duration = Math.max(0.1, Number(layer.durationSeconds) || 0.1);
+  const maxStart = Math.max(0, Number(timelineSeconds || 0) - duration);
+  let start = clampTimelineValue((Number(layer.startSeconds) || 0) + 0.5, 0, maxStart);
+  const existingStarts = new Set(
+    (Array.isArray(layers) ? layers : [])
+      .filter((item) => item?.id !== layer.id && item?.type === layer.type && item?.fileName === layer.fileName)
+      .map((item) => roundTimelineValue(Number(item.startSeconds) || 0).toFixed(3))
+  );
+  let guard = 0;
+  while (existingStarts.has(roundTimelineValue(start).toFixed(3)) && guard < 30) {
+    start = clampTimelineValue(start + 0.5, 0, maxStart);
+    guard += 1;
+  }
+  return roundTimelineValue(start);
 }
 
 function createLocalId(prefix = "id") {
@@ -7043,6 +7547,8 @@ function ProductionLineRow({
   const lineInputPromptOverride = lineLipSyncInputPromptOverride(line);
   const displayedLipSyncPrompt = lineLipSyncInputPrompt(line, selectedAsset);
   const promptLocked = line.lipSyncInputPromptLocked !== false;
+  const animationStrengthOverride = lineAnimationStrengthOverride(line);
+  const effectiveAnimationStrength = resolvedAnimationStrengthForLine(line, selectedAsset);
   const defaultRendererLabel = selectedAsset
     ? `Use visual default (${lipSyncModelLabel(inheritedLipSyncModel)})`
     : `Use show default (${lipSyncModelLabel(inheritedLipSyncModel)})`;
@@ -7155,6 +7661,7 @@ function ProductionLineRow({
               busy={busy}
               onRegenerateAudio={onRegenerateAudio}
             onSetAudioStatus={onSetAudioStatus}
+            onSetAudienceCue={(mode) => onUpdate(line.id, audienceLaughCuePatch(line, mode))}
           />
           <LineDialogueVideoReview
             line={line}
@@ -7230,6 +7737,7 @@ function ProductionLineRow({
                     lipSyncPromptOverride: "",
                     lipSyncInputPromptOverride: "",
                     lipSyncInputPromptLocked: true,
+                    animationStrengthOverride: null,
                     videoStatus: "pending",
                     videoTake: null
                   })
@@ -7373,6 +7881,32 @@ function ProductionLineRow({
                 icon={Activity}
               />
             ) : null}
+            <AnimationStrengthControl
+              label="Animation strength"
+              value={effectiveAnimationStrength}
+              sourceLabel={animationStrengthOverride === null ? "global" : "shot"}
+              onChange={(value) =>
+                onUpdate(line.id, {
+                  animationStrengthOverride: value,
+                  videoStatus: "pending",
+                  videoTake: null,
+                  videoError: "",
+                  videoWarning: ""
+                })
+              }
+              onReset={
+                animationStrengthOverride === null
+                  ? null
+                  : () =>
+                      onUpdate(line.id, {
+                        animationStrengthOverride: null,
+                        videoStatus: "pending",
+                        videoTake: null,
+                        videoError: "",
+                        videoWarning: ""
+                      })
+              }
+            />
           </div>
         </>
       )}
@@ -7573,7 +8107,7 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
             className="quietButton"
             onClick={suggestMask}
             disabled={busy || !canvasReady || !canSuggestMask}
-            title={canSuggestMask ? "Suggest a speaker matte from the filename role order" : "Suggested masks need a grouped MS/WS filename with two or more cast roles"}
+            title={canSuggestMask ? "Suggest a speaker matte from the shot asset tags" : "Suggested masks need a grouped MS/WS shot asset with two or more speaking tags"}
           >
             <WandSparkles size={15} />
             Suggest
@@ -7727,11 +8261,11 @@ function speakerMaskSuggestionHint(line, imageAsset) {
   if (!["medium_two_shot", "wide_shot"].includes(shotRole)) return "";
   const roles = binding.roles || [];
   if (roles.length < 2) {
-    return "Auto-suggest needs an MS/WS filename with two or more visible roles, like WS_MAX-PIP_01.png.";
+    return "Auto-suggest needs an MS/WS shot asset with two or more speaking tags.";
   }
   const speakerRole = targetSpeakerMaskRole(line, imageAsset);
   if (!roles.includes(speakerRole)) {
-    return `Auto-suggest could not find ${speakerRole} in this filename's role order.`;
+    return `Auto-suggest could not find ${speakerRole} in this shot asset's speaking tags.`;
   }
   return "";
 }
@@ -7747,7 +8281,7 @@ function speakerMaskRole(speaker) {
     .replace(/[^A-Z0-9]+/g, "");
   if (key === "MAX") return "MAX";
   if (key === "PIP" || key === "POP") return "PIP";
-  return "GUEST";
+  return key || "";
 }
 
 function normalizeMaskPreviewRegion(canvas, from, to, brushSize) {
@@ -8345,15 +8879,42 @@ function InsertFilmstripFrame({ src, fallbackSrc, time = 0, clipDuration = 0 }) 
   );
 }
 
-function LineAudioReview({ line, status, busy, onRegenerateAudio, onSetAudioStatus }) {
+function LineAudioReview({ line, status, busy, onRegenerateAudio, onSetAudioStatus, onSetAudienceCue }) {
   const take = line.audioTake || null;
   const hasAudio = Boolean(take?.localUrl);
+  const laughCueMode = audienceLaughCueMode(line);
+  const cueOptions = [
+    { mode: "auto", label: "Auto", icon: Activity, title: "Let NewtBuilder decide whether this line is a punchline." },
+    { mode: "force", label: "Add Laugh", icon: Plus, title: "Force a laugh cue immediately after this line's audio." },
+    { mode: "none", label: "No Laugh", icon: X, title: "Prevent auto laugh placement on this line." }
+  ];
 
   return (
     <div className="lineAudioReview">
       <div className="lineAudioMeta">
         <span>{take?.mode || "No clip yet"}</span>
         {take?.durationSeconds ? <span>{formatSeconds(take.durationSeconds)}</span> : null}
+      </div>
+      <div className={`lineAudienceCueControls ${laughCueMode !== "auto" ? `cue-${laughCueMode}` : ""}`}>
+        <span>Laugh cue</span>
+        <div className="segmentedMini cueSegmented" role="group" aria-label="Laugh cue placement">
+          {cueOptions.map((option) => {
+            const Icon = option.icon;
+            return (
+              <button
+                key={option.mode}
+                type="button"
+                className={laughCueMode === option.mode ? "active" : ""}
+                onClick={() => onSetAudienceCue?.(option.mode)}
+                disabled={busy}
+                title={option.title}
+              >
+                <Icon size={14} />
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
       </div>
       {hasAudio ? (
         <audio controls preload="metadata" src={take.localUrl} />
@@ -8432,10 +8993,19 @@ function roundTenths(value) {
   return Math.round((Number(value) || 0) * 10) / 10;
 }
 
+function shotTypeForRole(role) {
+  return shotAssetTypes.find((type) => type.role === role) || null;
+}
+
+function shotTypeLabelForRole(role) {
+  return shotTypeForRole(role)?.label || "";
+}
+
 function assetLabel(asset) {
   const binding = assetShotBinding(asset);
   const bindingLabel = shotBindingLabel(binding);
-  return `${asset.fileName}${bindingLabel || asset.roleLabel ? ` (${bindingLabel || asset.roleLabel})` : ""}`;
+  const typeLabel = shotTypeLabelForRole(asset.shotRole) || asset.roleLabel || bindingLabel;
+  return `${asset.fileName}${typeLabel ? ` (${typeLabel})` : ""}`;
 }
 
 function applyStoredSpeakerMasksToLines(lines = [], assets = []) {
@@ -8473,7 +9043,7 @@ function applyStoredSpeakerMasksToLines(lines = [], assets = []) {
 function lineCanUseSpeakerMask(line, asset) {
   if (!line || line.lineType === "insert" || !asset) return false;
   const shotRole = String(line.shotRole || asset.shotRole || "");
-  const assetShotRole = shotFilenameBinding(asset.fileName).shotRole || String(asset.shotRole || "");
+  const assetShotRole = String(asset.shotRole || "");
   return ["medium_two_shot", "wide_shot"].includes(shotRole) || ["medium_two_shot", "wide_shot"].includes(assetShotRole);
 }
 
@@ -8501,7 +9071,7 @@ function speakerTypeForMask(speaker) {
   const key = keyForMaskMatch(speaker);
   if (key === "max") return "max";
   if (key === "pip" || key === "pop") return "pip";
-  return "guest";
+  return key || "guest";
 }
 
 function keyForMaskMatch(value) {
@@ -8509,11 +9079,16 @@ function keyForMaskMatch(value) {
 }
 
 function assetShotBinding(asset) {
-  return shotFilenameBinding(asset?.fileName);
+  const shotRole = asset?.shotRole || "";
+  return {
+    prefix: shotRolePrefixForRole(shotRole),
+    shotRole,
+    roles: assetSpeakerRoles(asset)
+  };
 }
 
 function assetSpeakerRoles(asset) {
-  return shotFilenameBinding(asset?.fileName).roles;
+  return parseCharacterTagRoles(asset?.metadata?.speakingTag || asset?.metadata?.characterTags);
 }
 
 function assetSpeakingRole(asset) {
@@ -8542,6 +9117,16 @@ function normalizeSpeakingTag(value) {
         .filter(Boolean);
   const first = fallback[0] || "";
   return first ? `@${first.slice(0, 48)}` : "";
+}
+
+function shotRolePrefixForRole(role) {
+  return {
+    character_one_shot: "CU",
+    medium_two_shot: "MS",
+    wide_shot: "WS",
+    insert_shot: "INS",
+    mask: "MASK"
+  }[role] || "";
 }
 
 function shotFilenameBinding(fileName) {
@@ -8607,142 +9192,306 @@ function shotBindingLabel(binding) {
 }
 
 function CastVisualLibrary({
+  episodeId = "",
   uploadShotTypes,
-  assetCounts,
-  assetsByRole,
+  assets = [],
   onUpload,
   onDelete,
   onUpdateTags,
-  onUpdateLipSyncDefaults,
+  onUpdateAsset,
   onGenerateLipSyncPrompt,
   showDefaultLipSyncModel,
   busyAction
 }) {
-  const characterShotTypes = uploadShotTypes.filter((type) => type.role !== "insert_shot");
-  const insertShotType = uploadShotTypes.find((type) => type.role === "insert_shot");
+  const [selectedAssetId, setSelectedAssetId] = useState("");
+  const shotTypes = uploadShotTypes.filter((type) => type.role !== "mask");
+  const defaultShotRole = shotTypes[0]?.role || "character_one_shot";
+  const storyboardAssets = (assets || [])
+    .filter((asset) => asset.type === "image")
+    .sort((a, b) => Date.parse(a.createdAt || "") - Date.parse(b.createdAt || ""));
+  const selectedAsset = storyboardAssets.find((asset) => asset.id === selectedAssetId) || null;
+
+  useEffect(() => {
+    setSelectedAssetId("");
+  }, [episodeId]);
+
+  useEffect(() => {
+    if (selectedAssetId && !storyboardAssets.some((asset) => asset.id === selectedAssetId)) {
+      setSelectedAssetId("");
+    }
+  }, [selectedAssetId, storyboardAssets]);
+
+  function openAsset(assetId) {
+    setSelectedAssetId(assetId);
+  }
+
+  function saveShotRole(asset, role) {
+    const shotType = shotTypeForRole(role);
+    onUpdateAsset?.(asset.id, {
+      shotRole: shotType?.role || role,
+      roleLabel: shotType?.label || labelForShotRoleFallback(role)
+    });
+  }
 
   return (
     <div className="castVisualLibrary">
       <div className="castSubheader">
         <span className="eyebrow">Cast Visuals</span>
-        <strong>Shot Images</strong>
+        <strong>Shot Assets</strong>
       </div>
-      <div className="shotUploadGrid castShotUploadGrid">
-        {characterShotTypes.map((type) => (
-          <ShotUploadCard
-            key={type.role}
-            type={type}
-            count={assetCounts[type.role] || 0}
-            assets={assetsByRole[type.role] || []}
-            onUpload={(files) => onUpload(files, type.role)}
-            onDelete={onDelete}
-            onUpdateTags={onUpdateTags}
-            onUpdateLipSyncDefaults={onUpdateLipSyncDefaults}
-            onGenerateLipSyncPrompt={onGenerateLipSyncPrompt}
-            showDefaultLipSyncModel={showDefaultLipSyncModel}
-            busyAction={busyAction}
+
+      <div className="shotAssetToolbar">
+        <label className="shotDrop addShotAssetButton">
+          <Upload size={17} />
+          <span>Add new Shot Asset</span>
+          <input
+            type="file"
+            multiple
+            accept="image/*"
+            onChange={(event) => onUpload(event.target.files, defaultShotRole)}
           />
-        ))}
+        </label>
+        <span>Double-click a storyboard tile to edit details.</span>
       </div>
-      {insertShotType ? (
-        <>
-          <div className="castSubheader compact">
-            <span className="eyebrow">Episode Inserts</span>
-            <strong>Insert Shots</strong>
-          </div>
-          <div className="shotUploadGrid insertShotUploadGrid">
-            <ShotUploadCard
-              type={insertShotType}
-              count={assetCounts[insertShotType.role] || 0}
-              assets={assetsByRole[insertShotType.role] || []}
-              onUpload={(files) => onUpload(files, insertShotType.role)}
-              onDelete={onDelete}
-              onUpdateTags={onUpdateTags}
-              onUpdateLipSyncDefaults={onUpdateLipSyncDefaults}
-              onGenerateLipSyncPrompt={onGenerateLipSyncPrompt}
-              showDefaultLipSyncModel={showDefaultLipSyncModel}
-              busyAction={busyAction}
+
+      {storyboardAssets.length ? (
+        <div className="storyboardAssetGrid">
+          {storyboardAssets.map((asset) => (
+            <StoryboardAssetTile
+              key={asset.id}
+              asset={asset}
+              shotTypes={shotTypes}
+              onOpen={() => openAsset(asset.id)}
+              onDelete={() => onDelete?.(asset.id)}
+              onChangeShotRole={(role) => saveShotRole(asset, role)}
             />
-          </div>
-        </>
+          ))}
+        </div>
+      ) : null}
+
+      {!storyboardAssets.length ? <div className="assetEmpty">No shot assets yet.</div> : null}
+
+      {selectedAsset ? (
+        <AssetDetailModal
+          asset={selectedAsset}
+          shotTypes={shotTypes}
+          showDefaultLipSyncModel={showDefaultLipSyncModel}
+          busy={busyAction === `asset-prompt:${selectedAsset.id}`}
+          onClose={() => setSelectedAssetId("")}
+          onDelete={() => {
+            onDelete?.(selectedAsset.id);
+            setSelectedAssetId("");
+          }}
+          onSave={(patch) => onUpdateAsset?.(selectedAsset.id, patch)}
+          onGenerateLipSyncPrompt={(provider) => onGenerateLipSyncPrompt?.(selectedAsset.id, provider)}
+        />
       ) : null}
     </div>
   );
 }
 
-function ShotUploadCard({
-  type,
-  count,
-  assets,
-  onUpload,
-  onDelete,
-  onUpdateTags,
-  onUpdateLipSyncDefaults,
-  onGenerateLipSyncPrompt,
-  showDefaultLipSyncModel,
-  busyAction
-}) {
-  const Icon = type.icon;
-  const previewAssets = (assets || []).filter((asset) => asset.type === "image");
+function StoryboardAssetTile({ asset, shotTypes, onOpen, onDelete, onChangeShotRole }) {
+  const bindingLabel = shotBindingLabel(assetShotBinding(asset));
+  const shotRole = asset.shotRole || "character_one_shot";
 
   return (
-    <article className="shotUploadCard">
-      <div className="shotUploadHeader">
-        <div className="shotIcon">
-          <Icon size={18} />
-        </div>
-        <div>
-          <strong>{type.label}</strong>
-          <p>{type.hint}</p>
-        </div>
-        <Pill tone={count ? "good" : "neutral"}>{count}</Pill>
+    <article
+      className={`storyboardAssetTile ${shotRole}`}
+      role="button"
+      tabIndex={0}
+      title="Double-click to edit shot asset details"
+      onDoubleClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") onOpen?.();
+      }}
+    >
+      <div className="storyboardAssetImage">
+        {bindingLabel ? <strong className="assetBindingChip">{bindingLabel}</strong> : null}
+        <img src={asset.localUrl} alt={asset.fileName} />
+        <button
+          type="button"
+          className="assetDelete"
+          onClick={(event) => {
+            event.stopPropagation();
+            onDelete?.();
+          }}
+          title="Delete image"
+        >
+          <Trash2 size={14} />
+        </button>
       </div>
-
-      <label className="shotDrop">
-        <Upload size={18} />
-        <span>Upload images</span>
-        <input
-          type="file"
-          multiple
-          accept="image/*"
-          onChange={(event) => onUpload(event.target.files)}
-        />
-      </label>
-
-      {previewAssets.length ? (
-        <div className="assetPreviewGrid">
-          {previewAssets.map((asset) => (
-            <div key={asset.id} className="assetThumb">
-              <div className="assetThumbImage">
-                {shotBindingLabel(assetShotBinding(asset)) ? (
-                  <strong className="assetBindingChip">{shotBindingLabel(assetShotBinding(asset))}</strong>
-                ) : null}
-                <img src={asset.localUrl} alt={asset.fileName} />
-                <button type="button" className="assetDelete" onClick={() => onDelete(asset.id)} title="Delete image">
-                  <Trash2 size={14} />
-                </button>
-                <span>{asset.fileName}</span>
-              </div>
-              {asset.shotRole !== "insert_shot" ? (
-                <>
-                  <AssetTagsField asset={asset} onSave={(tags) => onUpdateTags?.(asset.id, tags)} />
-                  <AssetLipSyncDefaults
-                    asset={asset}
-                    showDefaultLipSyncModel={showDefaultLipSyncModel}
-                    busy={busyAction === `asset-prompt:${asset.id}`}
-                    onSave={(patch) => onUpdateLipSyncDefaults?.(asset.id, patch)}
-                    onGenerate={(provider) => onGenerateLipSyncPrompt?.(asset.id, provider)}
-                  />
-                </>
-              ) : null}
-            </div>
+      <div className="storyboardAssetMeta">
+        <strong>{asset.fileName}</strong>
+        <select
+          value={shotRole}
+          onClick={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          onChange={(event) => onChangeShotRole?.(event.target.value)}
+        >
+          {shotTypes.map((type) => (
+            <option key={type.role} value={type.role}>
+              {type.label}
+            </option>
           ))}
-        </div>
-      ) : (
-        <div className="assetEmpty">No images yet.</div>
-      )}
+        </select>
+      </div>
     </article>
   );
+}
+
+function AssetDetailModal({
+  asset,
+  shotTypes,
+  showDefaultLipSyncModel,
+  busy,
+  onClose,
+  onDelete,
+  onSave,
+  onGenerateLipSyncPrompt
+}) {
+  const savedShotRole = asset.shotRole || "character_one_shot";
+  const savedTags = normalizeSpeakingTag(asset?.metadata?.speakingTag || asset?.metadata?.characterTags || "");
+  const savedModel = assetLipSyncModel(asset);
+  const savedPrompt = assetLipSyncPrompt(asset);
+  const savedAnimationStrength = assetAnimationStrength(asset);
+  const [shotRoleDraft, setShotRoleDraft] = useState(savedShotRole);
+  const [tagsDraft, setTagsDraft] = useState(savedTags);
+  const [modelDraft, setModelDraft] = useState(savedModel);
+  const [promptDraft, setPromptDraft] = useState(savedPrompt);
+  const [animationStrengthDraft, setAnimationStrengthDraft] = useState(savedAnimationStrength);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const isInsert = shotRoleDraft === "insert_shot";
+  const effectiveModel = modelDraft || optionalLipSyncModel(showDefaultLipSyncModel) || "fabric";
+
+  useEffect(() => {
+    setShotRoleDraft(savedShotRole);
+    setTagsDraft(savedTags);
+    setModelDraft(savedModel);
+    setPromptDraft(savedPrompt);
+    setAnimationStrengthDraft(savedAnimationStrength);
+    setSaveError("");
+    setSaveBusy(false);
+  }, [asset?.id, savedShotRole, savedTags, savedModel, savedPrompt, savedAnimationStrength]);
+
+  async function saveDetails() {
+    if (saveBusy) return;
+    const shotType = shotTypeForRole(shotRoleDraft);
+    setSaveBusy(true);
+    setSaveError("");
+    try {
+      await onSave?.({
+        shotRole: shotType?.role || shotRoleDraft,
+        roleLabel: shotType?.label || labelForShotRoleFallback(shotRoleDraft),
+        speakingTag: normalizeSpeakingTag(tagsDraft),
+        lipSyncModel: optionalLipSyncModel(modelDraft),
+        lipSyncPrompt: compactText(promptDraft.trim(), LIPSYNC_INPUT_PROMPT_MAX_LENGTH),
+        animationStrength: normalizeAnimationStrength(animationStrengthDraft)
+      });
+      onClose?.();
+    } catch (error) {
+      setSaveError(error?.message || "Could not save shot asset.");
+      setSaveBusy(false);
+    }
+  }
+
+  return (
+    <div className="maskEditorBackdrop" role="dialog" aria-modal="true">
+      <div className="maskEditorPanel assetDetailPanel">
+        <div className="maskEditorHeader">
+          <div>
+            <span className="eyebrow">Shot Asset</span>
+            <strong>{asset.fileName}</strong>
+          </div>
+          <button type="button" className="quietButton iconOnly" onClick={onClose} title="Close">
+            <X size={17} />
+          </button>
+        </div>
+
+        <div className="assetDetailGrid">
+          <div className="assetDetailPreview">
+            <img src={asset.localUrl} alt={asset.fileName} />
+          </div>
+          <div className="assetDetailControls">
+            <Field label="Shot type">
+              <select value={shotRoleDraft} onChange={(event) => setShotRoleDraft(event.target.value)}>
+                {shotTypes.map((type) => (
+                  <option key={type.role} value={type.role}>
+                    {type.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+
+            {isInsert ? (
+              <div className="assetDetailNotice">
+                Insert shots are used as cutaways or action references. They use the insert-video controls in the Production Map instead of dialogue lip-sync defaults.
+              </div>
+            ) : (
+              <>
+                <Field label="Speaking tag">
+                  <input
+                    value={tagsDraft}
+                    onChange={(event) => setTagsDraft(event.target.value)}
+                    placeholder="@name"
+                  />
+                </Field>
+                <Field label="Global model">
+                  <select value={modelDraft} onChange={(event) => setModelDraft(event.target.value)}>
+                    <option value="">Show default ({lipSyncModelLabel(showDefaultLipSyncModel)})</option>
+                    {lipSyncModelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <AnimationStrengthControl
+                  label="Global animation strength"
+                  value={animationStrengthDraft}
+                  onChange={setAnimationStrengthDraft}
+                />
+                <label className="field">
+                  <span>Global prompt</span>
+                  <textarea
+                    value={promptDraft}
+                    rows={8}
+                    onChange={(event) => setPromptDraft(event.target.value)}
+                    placeholder="Generate from image or write a reusable visual reference prompt"
+                  />
+                </label>
+              </>
+            )}
+          </div>
+        </div>
+
+        {saveError ? <div className="assetDetailError">{saveError}</div> : null}
+
+        <div className="maskEditorToolbar">
+          <button type="button" className="quietButton" onClick={onDelete} disabled={saveBusy}>
+            <Trash2 size={15} />
+            Delete
+          </button>
+          <div className="buttonRow">
+            {!isInsert ? (
+              <button type="button" className="secondaryButton" onClick={() => onGenerateLipSyncPrompt?.(effectiveModel)} disabled={busy || saveBusy}>
+                <WandSparkles size={15} />
+                {busy ? "Generating" : `Generate for ${lipSyncModelLabel(effectiveModel)}`}
+              </button>
+            ) : null}
+            <button type="button" className="primaryButton" onClick={saveDetails} disabled={saveBusy}>
+              {saveBusy ? <RefreshCw className="spin" size={16} /> : <Save size={16} />}
+              {saveBusy ? "Saving" : "Save"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function labelForShotRoleFallback(role) {
+  return shotTypeLabelForRole(role) || "Shot Asset";
 }
 
 function AssetTagsField({ asset, onSave }) {

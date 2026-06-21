@@ -83,6 +83,15 @@ input[type="file"] {
   display: none;
 }
 
+input[type="range"] {
+  height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  accent-color: var(--jade);
+}
+
 .appShell {
   min-height: 100vh;
   display: grid;
@@ -300,7 +309,25 @@ main {
 }
 
 .episodeCardPreview {
-  aspect-ratio: 16 / 9;
+  width: clamp(120px, 37.5%, 150px);
+  aspect-ratio: 9 / 16;
+  margin: 14px auto 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.episodeCard[draggable="true"] {
+  cursor: grab;
+}
+
+.episodeCard.dragging {
+  opacity: 0.58;
+  border-color: rgba(109, 208, 165, 0.48);
+}
+
+.episodeCard.dropTarget {
+  border-color: rgba(244, 189, 80, 0.62);
+  box-shadow: 0 0 0 2px rgba(244, 189, 80, 0.14);
 }
 
 .showCardPreview img,
@@ -620,6 +647,46 @@ label:has(textarea:disabled) {
 .field span {
   font-size: 12px;
   font-weight: 800;
+}
+
+.animationStrengthControl {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(243, 240, 232, 0.08);
+  border-radius: 8px;
+  background: #191914;
+}
+
+.animationStrengthHeader,
+.animationStrengthMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.animationStrengthHeader span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.animationStrengthHeader output {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.animationStrengthMeta {
+  justify-content: flex-end;
+}
+
+.animationStrengthMeta .quietButton {
+  min-height: 28px;
+  padding-inline: 9px;
+  font-size: 12px;
 }
 
 .scriptArea {
@@ -1401,6 +1468,75 @@ label:has(textarea:disabled) {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #1d1d19;
+}
+
+.generationProgress {
+  display: grid;
+  gap: 8px;
+  margin: -2px 0 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(109, 208, 165, 0.32);
+  border-radius: 8px;
+  background: rgba(109, 208, 165, 0.07);
+}
+
+.generationProgress.error {
+  border-color: rgba(238, 113, 113, 0.38);
+  background: rgba(238, 113, 113, 0.08);
+}
+
+.generationProgress.complete {
+  border-color: rgba(109, 208, 165, 0.42);
+}
+
+.generationProgressHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.generationProgressHeader strong,
+.generationProgressHeader span {
+  display: block;
+  min-width: 0;
+}
+
+.generationProgressHeader > span {
+  color: var(--soft);
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.generationProgressBar,
+.footerProgressBar {
+  overflow: hidden;
+  height: 7px;
+  border-radius: 999px;
+  background: #11110f;
+}
+
+.generationProgressBar span,
+.footerProgressBar i {
+  display: block;
+  height: 100%;
+  min-width: 7px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--jade), var(--amber));
+  transition: width 0.25s ease;
+}
+
+.generationProgress.error .generationProgressBar span,
+.footerGenerationProgress.error .footerProgressBar i {
+  background: var(--danger);
+}
+
+.generationProgress p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .finalReviewGrid {
@@ -2596,6 +2732,30 @@ label:has(textarea:disabled) {
   height: 34px;
 }
 
+.lineAudienceCueControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.lineAudienceCueControls > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.cueSegmented {
+  flex-wrap: wrap;
+}
+
+.cueSegmented button {
+  min-height: 30px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
 .lineVideoTakeStepper {
   display: inline-flex;
   align-items: center;
@@ -3154,6 +3314,16 @@ label:has(textarea:disabled) {
   background: #243d31;
 }
 
+.lineAudienceCueControls.cue-force .cueSegmented button.active {
+  background: #1f5b47;
+  color: var(--text);
+}
+
+.lineAudienceCueControls.cue-none .cueSegmented button.active {
+  background: rgba(255, 107, 125, 0.18);
+  color: #ffd0d6;
+}
+
 .brushSlider {
   display: flex;
   align-items: center;
@@ -3232,6 +3402,152 @@ label:has(textarea:disabled) {
   color: var(--text);
   background: #181814;
   cursor: pointer;
+}
+
+.shotDrop input {
+  display: none;
+}
+
+.shotAssetToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.shotAssetToolbar > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.addShotAssetButton {
+  width: min(280px, 100%);
+  min-height: 42px;
+  padding: 0 13px;
+  border-style: solid;
+  justify-content: flex-start;
+  background: #1b231d;
+}
+
+.storyboardAssetGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.storyboardAssetTile {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #151511;
+  cursor: default;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.storyboardAssetTile:hover,
+.storyboardAssetTile:focus-visible {
+  outline: none;
+  border-color: rgba(133, 221, 172, 0.55);
+  box-shadow: 0 0 0 2px rgba(133, 221, 172, 0.12);
+}
+
+.storyboardAssetTile:active {
+  transform: translateY(1px);
+}
+
+.storyboardAssetImage {
+  position: relative;
+  overflow: hidden;
+  background: #0f0f0c;
+}
+
+.storyboardAssetImage img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.storyboardAssetMeta {
+  display: grid;
+  gap: 6px;
+  padding: 7px;
+}
+
+.storyboardAssetMeta strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storyboardAssetMeta select {
+  min-height: 30px;
+  padding: 0 7px;
+  border-radius: 6px;
+  font-size: 11px;
+}
+
+.assetDetailPanel {
+  width: min(980px, 100%);
+}
+
+.assetDetailGrid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.assetDetailPreview {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f0f0c;
+}
+
+.assetDetailPreview img {
+  width: 100%;
+  max-height: min(58vh, 560px);
+  object-fit: contain;
+  display: block;
+}
+
+.assetDetailControls {
+  display: grid;
+  gap: 10px;
+}
+
+.assetDetailControls textarea {
+  min-height: 170px;
+  resize: vertical;
+}
+
+.assetDetailNotice {
+  padding: 12px;
+  border: 1px solid rgba(235, 190, 105, 0.28);
+  border-radius: 8px;
+  color: #f0d7a4;
+  background: rgba(235, 190, 105, 0.08);
+  line-height: 1.4;
+  font-size: 13px;
+}
+
+.assetDetailError {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 111, 111, 0.35);
+  border-radius: 8px;
+  color: #ffb4ad;
+  background: rgba(255, 111, 111, 0.08);
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 .assetPreviewGrid {
@@ -3435,6 +3751,33 @@ label:has(textarea:disabled) {
   background: #181814;
 }
 
+.footerGenerationProgress {
+  flex: 1 1 360px;
+  max-width: 620px;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(110px, 0.45fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.footerGenerationProgress span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.footerGenerationProgress.complete span {
+  color: var(--green);
+}
+
+.footerGenerationProgress.error span {
+  color: var(--danger);
+}
+
 .statusText {
   gap: 8px;
   color: var(--muted);
@@ -3527,7 +3870,7 @@ label:has(textarea:disabled) {
 }
 
 .laughTrackBriefGrid {
-  grid-template-columns: minmax(280px, 1fr) minmax(104px, 0.22fr) minmax(136px, 0.28fr) minmax(96px, 0.2fr);
+  grid-template-columns: minmax(280px, 1fr) minmax(104px, 0.2fr) minmax(136px, 0.24fr) minmax(150px, 0.28fr) minmax(96px, 0.18fr);
 }
 
 .laughTrackPlacementControls {
@@ -4020,6 +4363,11 @@ label:has(textarea:disabled) {
     flex-direction: column;
   }
 
+  .shotAssetToolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .metrics {
     justify-content: flex-start;
   }
@@ -4061,6 +4409,7 @@ label:has(textarea:disabled) {
   .shotUploadGrid,
   .castShotUploadGrid,
   .insertShotUploadGrid,
+  .assetDetailGrid,
   .thumbnailBriefGrid,
   .thumbnailOutputGrid,
   .episodeReviewGrid,
@@ -4093,6 +4442,12 @@ label:has(textarea:disabled) {
 
   .launchReadinessActions {
     justify-content: space-between;
+  }
+
+  .footerGenerationProgress {
+    width: 100%;
+    max-width: none;
+    grid-template-columns: 1fr;
   }
 
   .approvalGate,
