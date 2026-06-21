@@ -374,6 +374,21 @@ main {
   padding-top: 2px;
 }
 
+.episodeYoutubeLink {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid rgba(255, 138, 101, 0.32);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 138, 101, 0.08);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .dashboardMetricGrid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -392,6 +407,10 @@ main {
   justify-content: space-between;
   gap: 22px;
   padding: 18px 0 22px;
+}
+
+.studioActionBand {
+  justify-content: flex-end;
 }
 
 .saveAllButton {
@@ -980,6 +999,17 @@ label:has(textarea:disabled) {
   white-space: normal;
 }
 
+.runtimeStatusPanel {
+  grid-column: 1 / -1;
+}
+
+.runtimeStatusGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
 .segmentedControl {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1112,6 +1142,10 @@ label:has(textarea:disabled) {
 
 .approvalStack.topGates {
   margin-bottom: 14px;
+}
+
+.automationApprovalGates {
+  margin-bottom: 2px;
 }
 
 .approvalStack.compact {
@@ -1914,6 +1948,7 @@ label:has(textarea:disabled) {
 .reviewDetails .thumbnailList,
 .reviewDetails .reportList,
 .reviewDetails .thumbnailReviewBody,
+.reviewDetails .renderControlBody,
 .reviewDetails .readinessColumns,
 .reviewDetails .finishingBody,
 .reviewDetails .finalPackageBody {
@@ -3830,6 +3865,72 @@ label:has(textarea:disabled) {
   display: none;
 }
 
+.finishingAudioLayerSection {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #151511;
+}
+
+.finishingAudioLayerSection > summary {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+  font-weight: 900;
+}
+
+.finishingAudioLayerSection > summary::-webkit-details-marker {
+  display: none;
+}
+
+.finishingAudioLayerSection > summary::before {
+  content: ">";
+  color: var(--muted);
+  line-height: 1;
+  transition: transform 160ms ease;
+}
+
+.finishingAudioLayerSection[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.reviewDetails[open] .finishingAudioLayerSection > summary {
+  margin-bottom: 0;
+  border-bottom: 0;
+}
+
+.reviewDetails[open] .finishingAudioLayerSection > summary::before {
+  transform: none;
+}
+
+.reviewDetails[open] .finishingAudioLayerSection[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.reviewDetails[open] .finishingAudioLayerSection[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.finishingAudioLayerSection[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.finishingAudioLayerSection > summary > span {
+  flex: 1 1 auto;
+}
+
+.finishingAudioLayerBody {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
 .finishingMusicPanel {
   display: grid;
   gap: 12px;
@@ -4427,6 +4528,7 @@ label:has(textarea:disabled) {
   .showCardGrid,
   .episodeCardGrid,
   .connectionStatus,
+  .runtimeStatusGrid,
   .automationRunbookGrid,
   .launchReadinessGrid,
   .readinessColumns,

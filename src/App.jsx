@@ -12,6 +12,7 @@ import {
   Eraser,
   Film,
   FileText,
+  FolderOpen,
   Gauge,
   Image,
   ListChecks,
@@ -22,8 +23,10 @@ import {
   Pencil,
   Play,
   Plus,
+  Power,
   RefreshCw,
   Save,
+  Server,
   Settings2,
   Sparkles,
   Trash2,
@@ -108,9 +111,9 @@ const automationControls = [
   },
   {
     key: "uploadYoutube",
-    label: "Private draft upload",
+    label: "YouTube upload",
     phase: "Publishing",
-    description: "Send private YouTube drafts only. Public release remains manual.",
+    description: "Send private YouTube uploads only. Public release remains manual.",
     icon: MonitorUp
   },
   {
@@ -1155,6 +1158,25 @@ function episodeOutputsOfType(episode, type) {
   return (episode?.outputs || []).filter((output) => output.type === type);
 }
 
+function latestYoutubeUploadForEpisode(episode) {
+  return episodeOutputsOfType(episode, "youtube_upload")
+    .filter((output) => output.videoId || output.watchUrl || output.localUrl)
+    .sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a))[0] || null;
+}
+
+function youtubeUploadHref(output) {
+  if (!output) return "";
+  if (output.watchUrl) return output.watchUrl;
+  if (output.localUrl) return output.localUrl;
+  return output.videoId ? `https://www.youtube.com/watch?v=${encodeURIComponent(output.videoId)}` : "";
+}
+
+function savedPanelOpen(panelState = {}, key = "", fallback = false) {
+  if (!key) return Boolean(fallback);
+  const value = panelState?.[key];
+  return typeof value === "boolean" ? value : Boolean(fallback);
+}
+
 function episodePreviewImage(episode) {
   const thumbnails = episodeOutputsOfType(episode, "thumbnail_image");
   const selectedId = episode?.drafts?.selectedThumbnailOutputId || "";
@@ -1345,6 +1367,8 @@ function ShowDashboard({
           {orderedEpisodes.map((episode) => {
             const status = episodeStatusSummary(episode);
             const previewImage = episodePreviewImage(episode);
+            const youtubeUpload = latestYoutubeUploadForEpisode(episode);
+            const youtubeHref = youtubeUploadHref(youtubeUpload);
             const isDragging = draggedEpisodeId === episode.id;
             const isDropTarget = dropTargetEpisodeId === episode.id && draggedEpisodeId !== episode.id;
             return (
@@ -1394,6 +1418,12 @@ function ShowDashboard({
                     <span>{formatSeconds(episode.plan?.estimatedSeconds || 0)}</span>
                     <span>{(episode.productionMap || []).length} shots</span>
                   </div>
+                  {youtubeHref ? (
+                    <a className="episodeYoutubeLink" href={youtubeHref} target="_blank" rel="noreferrer">
+                      <Youtube size={15} />
+                      YouTube
+                    </a>
+                  ) : null}
                   <div className="buttonRow">
                     <button className="primaryButton" type="button" onClick={() => onOpenEpisode(episode.id)} disabled={busy}>
                       Open Studio
@@ -1553,7 +1583,7 @@ export default function App() {
       lower.includes("token refresh failed") ||
       lower.includes("youtube oauth is not configured")
     ) {
-      return "YouTube needs to be reconnected before uploading. Click Connect YouTube, approve consent, return to NewtBuilder, then try Upload Private Draft again.";
+      return "YouTube needs to be reconnected before uploading. Click Connect YouTube, approve consent, return to NewtBuilder, then try Upload to YouTube again.";
     }
     if (lower.includes("insufficient authentication scopes")) {
       return "YouTube needs one more reconnect so NewtBuilder has the latest upload and status permissions. Click Reconnect YouTube, approve the updated permissions, then try again.";
@@ -1658,11 +1688,29 @@ export default function App() {
       if (!activeEpisodeId && episodeData[0]) {
         setActiveEpisodeId(episodeData[0].id);
       }
+      return true;
     } catch (error) {
       setStatus(error.message);
+      return false;
     } finally {
       setBusy(false);
     }
+  }
+
+  function reloadAllAfterRestart(attempt = 1) {
+    const maxAttempts = 10;
+    window.setTimeout(async () => {
+      const ok = await loadAll();
+      if (ok) {
+        setStatus("NewtBuilder backend reconnected and shows reloaded.");
+        return;
+      }
+      if (attempt < maxAttempts) {
+        reloadAllAfterRestart(attempt + 1);
+      } else {
+        setStatus("NewtBuilder backend is still restarting. Try Refresh Status in a moment.");
+      }
+    }, attempt === 1 ? 1800 : 1500);
   }
 
   async function openShow(showId) {
@@ -1899,6 +1947,13 @@ export default function App() {
     }
   }
 
+  async function refreshHealthStatus(message = "Server status refreshed.") {
+    const healthData = await request("/api/health");
+    setHealth(healthData);
+    if (message) setStatus(message);
+    return healthData;
+  }
+
   async function reorderEpisodes(episodeIds = []) {
     if (!activeShowId || !episodeIds.length) return;
     const previousEpisodes = episodes;
@@ -1969,9 +2024,107 @@ export default function App() {
         await refreshEpisodesAfterShowSave(savedShow.id);
       }
       setStatus("Episode saved.");
+      return episode;
+    } catch (error) {
+      setStatus(error.message);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updateEpisodePanelOpen(panelKey, isOpen) {
+    if (!panelKey) return;
+    setEpisodeDraft((prev) => {
+      if (!prev) return prev;
+      const currentPanelState = prev.drafts?.ui?.panelState || {};
+      if (currentPanelState[panelKey] === Boolean(isOpen)) return prev;
+      return {
+        ...prev,
+        drafts: {
+          ...(prev.drafts || {}),
+          ui: {
+            ...(prev.drafts?.ui || {}),
+            panelState: {
+              ...currentPanelState,
+              [panelKey]: Boolean(isOpen)
+            }
+          }
+        }
+      };
+    });
+  }
+
+  async function saveEpisodeAsPackage() {
+    const savedEpisode = await saveStudioAndReview();
+    const episodeId = savedEpisode?.id || activeEpisode?.id || episodeDraft?.id;
+    if (!episodeId) return;
+    setBusy(true);
+    setBusyAction("save-as-package");
+    try {
+      setStatus("Choose a parent folder for the episode package...");
+      const selection = await request("/api/system/choose-folder", {
+        method: "POST",
+        body: JSON.stringify({
+          title: "Choose parent folder for this NewtBuilder episode package"
+        })
+      });
+      if (!selection.path) {
+        setStatus("Save As canceled.");
+        return;
+      }
+      setStatus("Saving episode package...");
+      const result = await request(`/api/episodes/${episodeId}/package/save-as`, {
+        method: "POST",
+        body: JSON.stringify({ parentPath: selection.path })
+      });
+      if (result.episode) {
+        setEpisodes((prev) => [result.episode, ...prev.filter((item) => item.id !== result.episode.id)]);
+        setAllEpisodes((prev) => [result.episode, ...prev.filter((item) => item.id !== result.episode.id)]);
+        setEpisodeDraft(structuredClone(result.episode));
+      }
+      setStatus(`Episode package saved to ${result.package?.packagePath || selection.path}.`);
     } catch (error) {
       setStatus(error.message);
     } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function restartNewtBuilderServer() {
+    const ok = globalThis.confirm?.("Restart the NewtBuilder backend now? The page may need a few seconds to reconnect.");
+    if (!ok) return;
+    setBusy(true);
+    setBusyAction("restart-newtbuilder");
+    try {
+      await request("/api/system/newtbuilder/restart", { method: "POST" });
+      setStatus("NewtBuilder backend is restarting...");
+      reloadAllAfterRestart();
+    } catch (error) {
+      setStatus(`NewtBuilder restart requested. ${error.message || "Reconnect in a few seconds."}`);
+      reloadAllAfterRestart();
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
+  async function restartComfyUiServer() {
+    const ok = globalThis.confirm?.("Restart the configured ComfyUI backend now?");
+    if (!ok) return;
+    setBusy(true);
+    setBusyAction("restart-comfyui");
+    try {
+      const result = await request("/api/system/comfyui/restart", { method: "POST" });
+      if (result.health) setHealth(result.health);
+      else await refreshHealthStatus("");
+      setStatus(result.message || "ComfyUI restarted.");
+    } catch (error) {
+      setStatus(error.message);
+      refreshHealthStatus("").catch(() => {});
+    } finally {
+      setBusyAction("");
       setBusy(false);
     }
   }
@@ -2368,8 +2521,8 @@ export default function App() {
     const existingUpload = (activeEpisode.outputs || []).find((output) => output.type === "youtube_upload" && output.videoId);
     const ok = globalThis.confirm?.(
       existingUpload?.videoId
-        ? `Republish as a new private YouTube draft? YouTube does not allow replacing the video file on an existing upload, so ${existingUpload.videoId} will stay on YouTube until you remove it in Studio.`
-        : "Upload this episode to YouTube as a private draft? This sends the final video and thumbnail to YouTube, but it will not publish publicly."
+        ? `Republish as a new private YouTube upload? YouTube does not allow replacing the video file on an existing upload, so ${existingUpload.videoId} will stay on YouTube until you remove it in Studio.`
+        : "Upload this episode to YouTube privately? This sends the final video and thumbnail to YouTube, but it will not publish publicly."
     );
     if (!ok) return;
     setBusyAction("youtube-upload");
@@ -2401,7 +2554,7 @@ export default function App() {
   async function retryYoutubeThumbnail() {
     if (!activeEpisode) return;
     const ok = globalThis.confirm?.(
-      "Retry setting the selected thumbnail on the existing private YouTube draft? This sends only the thumbnail to YouTube and will not upload a duplicate video."
+      "Retry setting the selected thumbnail on the existing private YouTube upload? This sends only the thumbnail to YouTube and will not upload a duplicate video."
     );
     if (!ok) return;
     setBusyAction("youtube-thumbnail");
@@ -3076,9 +3229,17 @@ export default function App() {
     preRenderGates.length === preRenderApprovalIds.size &&
     preRenderGates.every((gate) => gate.status === "approved" || gate.status === "auto");
   const drafts = episodeDraft?.id === activeEpisode?.id ? episodeDraft?.drafts || {} : activeEpisode?.drafts || {};
+  const uiPanelState = drafts.ui?.panelState || {};
   const activeAutomation = showDraft?.automation || {};
   const socialConfig = showDraft?.platforms?.social || activeShow?.platforms?.social || {};
   const promotionTemplates = normalizePromotionTemplates(socialConfig.templates);
+  const episodePublishDescription =
+    activeEpisode?.description ||
+    drafts.youtube?.description ||
+    activeEpisode?.plan?.summary ||
+    showDraft?.description ||
+    activeShow?.description ||
+    "";
   const campaignConfig = {
     ...socialConfig,
     templates: promotionTemplates,
@@ -3160,6 +3321,7 @@ export default function App() {
   const maskEditorLine = productionMap.find((line) => line.id === maskEditorLineId) || null;
   const maskEditorImage = maskEditorLine ? visualAssets.find((asset) => asset.id === maskEditorLine.assetId) || null : null;
   const maskEditorMask = maskEditorLine ? maskAssets.find((asset) => asset.id === maskEditorLine.maskAssetId) || null : null;
+  const workspacePanelResetKey = `${activeShow?.id || ""}:${activeEpisode?.id || ""}:${activeTab}`;
   const productionMapPanelProps = {
     productionMap,
     show: activeShow,
@@ -3183,6 +3345,10 @@ export default function App() {
     onGenerateMissingDialogueVideos: generateMissingDialogueVideos,
     onGenerateInsertVideo: generateInsertVideo,
     onUploadInsertVideo: uploadInsertVideo,
+    onSave: saveStudioAndReview,
+    resetKey: workspacePanelResetKey,
+    defaultOpen: savedPanelOpen(uiPanelState, "studio.productionMap"),
+    onOpenChange: (isOpen) => updateEpisodePanelOpen("studio.productionMap", isOpen),
     busy,
     busyAction
   };
@@ -3240,6 +3406,18 @@ export default function App() {
               <Film size={16} />
               Episodes
             </button>
+          ) : null}
+          {workspaceView ? (
+            <>
+              <button className="secondaryButton" type="button" onClick={saveStudioAndReview} disabled={!activeEpisode || busy}>
+                <Save size={16} />
+                Save
+              </button>
+              <button className="secondaryButton" type="button" onClick={saveEpisodeAsPackage} disabled={!activeEpisode || busy}>
+                <FolderOpen size={16} />
+                Save As
+              </button>
+            </>
           ) : null}
           {libraryView ? (
             <button className="primaryButton" onClick={createShow} disabled={busy}>
@@ -3322,10 +3500,6 @@ export default function App() {
 
         {workspaceView && activeTab === "studio" && (
           <section className="overviewBand studioActionBand">
-            <button className="primaryButton saveAllButton" onClick={saveStudioAndReview} disabled={!episodeDraft || busy}>
-              <Save size={18} />
-              Save Episode
-            </button>
             <div className="metrics">
               <Metric icon={Gauge} label="Format" value={selectedFormat.resolution || selectedFormat.aspectRatio || "Not set"} />
               <Metric icon={FileText} label="Script" value={`${plan.wordCount || 0} words`} />
@@ -3341,7 +3515,9 @@ export default function App() {
                 className="showIdentityPanel"
                 eyebrow="Show"
                 title="Identity"
-                defaultOpen={false}
+                defaultOpen={savedPanelOpen(uiPanelState, "studio.identity")}
+                resetKey={workspacePanelResetKey}
+                onOpenChange={(isOpen) => updateEpisodePanelOpen("studio.identity", isOpen)}
                 action={
                   <button className="secondaryButton" onClick={saveShow} disabled={busy}>
                     <Save size={17} />
@@ -3369,7 +3545,9 @@ export default function App() {
                 className="characterPanel"
                 eyebrow="Cast"
                 title="Characters & Visuals"
-                defaultOpen={false}
+                defaultOpen={savedPanelOpen(uiPanelState, "studio.characters")}
+                resetKey={workspacePanelResetKey}
+                onOpenChange={(isOpen) => updateEpisodePanelOpen("studio.characters", isOpen)}
                 action={
                   <div className="buttonRow">
                     <Pill tone={voicesSource === "elevenlabs" ? "good" : "warn"}>
@@ -3381,6 +3559,10 @@ export default function App() {
                     <button className="secondaryButton" onClick={addCharacter}>
                       <Plus size={16} />
                       Character
+                    </button>
+                    <button className="secondaryButton" type="button" onClick={saveShow} disabled={busy}>
+                      <Save size={16} />
+                      Save
                     </button>
                   </div>
                 }
@@ -3447,17 +3629,25 @@ export default function App() {
               className="scriptPanel"
               eyebrow="Episode"
               title="Script Package"
-              defaultOpen={false}
+              defaultOpen={savedPanelOpen(uiPanelState, "studio.script")}
+              resetKey={workspacePanelResetKey}
+              onOpenChange={(isOpen) => updateEpisodePanelOpen("studio.script", isOpen)}
               action={
-                <label className="secondaryButton">
-                  <Upload size={17} />
-                  Upload Script
-                  <input
-                    type="file"
-                    accept=".pdf,.txt,.md,.rtf,application/pdf,text/plain,text/markdown"
-                    onChange={(event) => handleScriptFile(event.target.files?.[0])}
-                  />
-                </label>
+                <div className="buttonRow">
+                  <label className="secondaryButton">
+                    <Upload size={17} />
+                    Upload Script
+                    <input
+                      type="file"
+                      accept=".pdf,.txt,.md,.rtf,application/pdf,text/plain,text/markdown"
+                      onChange={(event) => handleScriptFile(event.target.files?.[0])}
+                    />
+                  </label>
+                  <button className="secondaryButton" type="button" onClick={saveStudioAndReview} disabled={!episodeDraft || busy}>
+                    <Save size={16} />
+                    Save
+                  </button>
+                </div>
               }
             >
               {!episodeDraft && (
@@ -3479,6 +3669,10 @@ export default function App() {
                 <button className="primaryButton" onClick={buildPlan} disabled={!episodeDraft || busy}>
                   <Sparkles size={18} />
                   Build Plan
+                </button>
+                <button className="secondaryButton" type="button" onClick={saveStudioAndReview} disabled={!episodeDraft || busy}>
+                  <Save size={16} />
+                  Save Script
                 </button>
               </div>
             </CollapsiblePanel>
@@ -3668,7 +3862,7 @@ export default function App() {
                     })}
                   </div>
                   <div className="manualPublishNotice">
-                    Auto upload creates private YouTube drafts only. Public release and non-YouTube promotion stay manual.
+                    Auto upload creates private YouTube uploads only. Public release and non-YouTube promotion stay manual.
                   </div>
                 </div>
               </section>
@@ -3687,7 +3881,7 @@ export default function App() {
                       </div>
                     </div>
                     <div className="twoColumn">
-                      <Field label="Draft privacy">
+                      <Field label="YouTube privacy">
                         <input value="Private draft" readOnly />
                       </Field>
                       <Field label="Category">
@@ -3808,6 +4002,15 @@ export default function App() {
                       })}
                     </div>
                   </div>
+
+                  <RuntimeStatusPanel
+                    health={health}
+                    busy={busy}
+                    busyAction={busyAction}
+                    onRefresh={() => refreshHealthStatus()}
+                    onRestartNewtBuilder={restartNewtBuilderServer}
+                    onRestartComfyUi={restartComfyUiServer}
+                  />
                 </div>
               </section>
             </div>
@@ -3822,14 +4025,16 @@ export default function App() {
                 <h3>{activeEpisode?.title || "No episode selected"}</h3>
               </div>
             </div>
-            <div className="approvalStack topGates">
-              {approvals.map((gate) => (
-                <ApprovalGate key={gate.id} gate={gate} onApprove={setApproval} />
-              ))}
-            </div>
-            <AutomationRunbookPanel automation={activeAutomation} safety={safety} />
+            <AutomationRunbookPanel
+              automation={activeAutomation}
+              safety={safety}
+              approvals={approvals}
+              onApprove={setApproval}
+            />
             <FinalReviewPanel
               episodeId={activeEpisode?.id || ""}
+              episodeTitle={activeEpisode?.title || episodeDraft?.title || ""}
+              episodeDescription={episodePublishDescription}
               audioOutput={audioOutput}
               previewOutput={previewOutput}
               finalOutput={finalOutput}
@@ -3846,6 +4051,8 @@ export default function App() {
               packageOutputs={packageOutputs}
               thumbnailOutputs={thumbnailOutputs}
               drafts={drafts}
+              panelState={uiPanelState}
+              onPanelOpenChange={updateEpisodePanelOpen}
               selectedFormat={selectedFormat}
               socialConfig={campaignConfig}
               integrations={integrations}
@@ -3932,27 +4139,90 @@ function Metric({ icon: Icon, label, value }) {
   );
 }
 
-function CollapsiblePanel({ className = "", eyebrow, title, action = null, children, defaultOpen = false }) {
-  const storageKey = `newtbuilder:panel:${className || title}`;
-  const [isOpen, setIsOpen] = useState(() => {
-    try {
-      const stored = globalThis.localStorage?.getItem(storageKey);
-      if (stored === "open") return true;
-      if (stored === "closed") return false;
-    } catch {
-      // Local storage can be unavailable in hardened browser contexts.
-    }
-    return defaultOpen;
-  });
+function RuntimeStatusPanel({
+  health,
+  busy,
+  busyAction,
+  onRefresh,
+  onRestartNewtBuilder,
+  onRestartComfyUi
+}) {
+  const comfyUi = health?.comfyUi || {};
+  const apiReady = Boolean(health?.ok);
+  const comfyReady = Boolean(comfyUi.reachable);
+  const apiLabel = apiReady ? "running" : "unknown";
+  const comfyLabel = comfyReady ? "running" : comfyUi.autoStartEnabled ? "auto-start ready" : "offline";
+  const newtBusy = busyAction === "restart-newtbuilder";
+  const comfyBusy = busyAction === "restart-comfyui";
+
+  return (
+    <div className="workPanel runtimeStatusPanel">
+      <div className="panelHeader">
+        <div>
+          <span className="eyebrow">Runtime</span>
+          <h3>Server Status</h3>
+        </div>
+        <button className="secondaryButton" type="button" onClick={onRefresh} disabled={busy}>
+          <RefreshCw size={16} />
+          Refresh Status
+        </button>
+      </div>
+      <div className="runtimeStatusGrid">
+        <article className={`connectionStatus ${apiReady ? "ready" : ""}`}>
+          <div>
+            <span>NewtBuilder backend</span>
+            <p>{health?.server?.baseUrl || "API health endpoint"}</p>
+          </div>
+          <div>
+            <strong>{apiLabel}</strong>
+            <code>{health?.dataDirectory || "data path unavailable"}</code>
+          </div>
+        </article>
+        <article className={`connectionStatus ${comfyReady ? "ready" : ""}`}>
+          <div>
+            <span>ComfyUI backend</span>
+            <p>{comfyUi.baseUrl || "COMFYUI_BASE_URL not resolved"}</p>
+          </div>
+          <div>
+            <strong>{comfyLabel}</strong>
+            <code>{comfyUi.workflow || comfyUi.error || "workflow not configured"}</code>
+          </div>
+        </article>
+      </div>
+      <div className="buttonRow">
+        <button className="secondaryButton" type="button" onClick={onRestartNewtBuilder} disabled={busy}>
+          {newtBusy ? <RefreshCw className="spin" size={16} /> : <Power size={16} />}
+          Reboot NewtBuilder
+        </button>
+        <button className="secondaryButton" type="button" onClick={onRestartComfyUi} disabled={busy}>
+          {comfyBusy ? <RefreshCw className="spin" size={16} /> : <Server size={16} />}
+          Reboot ComfyUI
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CollapsiblePanel({
+  className = "",
+  eyebrow,
+  title,
+  action = null,
+  children,
+  defaultOpen = false,
+  resetKey = "",
+  onOpenChange
+}) {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+
+  useEffect(() => {
+    setIsOpen(defaultOpen);
+  }, [defaultOpen, resetKey]);
 
   function toggleOpen() {
     setIsOpen((value) => {
       const next = !value;
-      try {
-        globalThis.localStorage?.setItem(storageKey, next ? "open" : "closed");
-      } catch {
-        // Non-critical preference persistence.
-      }
+      onOpenChange?.(next);
       return next;
     });
   }
@@ -3979,12 +4249,12 @@ function CollapsiblePanel({ className = "", eyebrow, title, action = null, child
   );
 }
 
-function RenderReadinessPanel({ readiness }) {
+function RenderReadinessPanel({ readiness, open = false, onOpenChange }) {
   const setupChecks = readiness.checks.filter((check) => check.group === "setup");
   const reviewChecks = readiness.checks.filter((check) => check.group === "review");
 
   return (
-    <details className="reviewDetails readinessPanel">
+    <details className="reviewDetails readinessPanel" open={open} onToggle={(event) => onOpenChange?.(event.currentTarget.open)}>
       <summary>
         <span>Preflight Checklist</span>
         <Pill tone={readiness.tone}>{readiness.label}</Pill>
@@ -4051,9 +4321,12 @@ function visibleThumbnailCandidates(outputs = []) {
   return (aiOutputs.length ? aiOutputs : outputs).slice(0, 3);
 }
 
-function AutomationRunbookPanel({ automation = {}, safety = {} }) {
+function AutomationRunbookPanel({ automation = {}, safety = {}, approvals = [], onApprove }) {
   const autoStages = automationControls.filter((stage) => automation[stage.key]);
   const privateUploadActive = Boolean(automation.uploadYoutube);
+  const approvalGates = (Array.isArray(approvals) ? approvals : []).filter((gate) =>
+    ["script_plan", "voice_audio", "render_preview"].includes(gate.id)
+  );
 
   return (
     <details className="reviewDetails automationRunbookPanel">
@@ -4062,6 +4335,13 @@ function AutomationRunbookPanel({ automation = {}, safety = {} }) {
         <Pill tone={autoStages.length ? "good" : "neutral"}>{autoStages.length} auto</Pill>
       </summary>
       <div className="automationRunbookBody">
+        {approvalGates.length ? (
+          <div className="approvalStack automationApprovalGates">
+            {approvalGates.map((gate) => (
+              <ApprovalGate key={gate.id} gate={gate} onApprove={onApprove} />
+            ))}
+          </div>
+        ) : null}
         <div className="automationRunbookGrid">
           {automationControls.map(({ key, label, phase, icon: Icon }) => {
             const enabled = Boolean(automation[key]);
@@ -4079,12 +4359,12 @@ function AutomationRunbookPanel({ automation = {}, safety = {} }) {
         </div>
         <div className="manualPublishNotice">
           {privateUploadActive
-            ? "YouTube automation can upload private drafts only. Public publishing still requires the manual handoff checklist."
-            : "YouTube upload is manual. Use YouTube Prep after final render and thumbnail selection."}
+            ? "YouTube automation can upload privately only. Public publishing still requires the manual handoff checklist."
+            : "YouTube upload is manual. Use YouTube Publish after final render and thumbnail selection."}
         </div>
         {safety.publishingEnabled ? (
           <div className="manualPublishNotice warning">
-            Publishing mode is enabled. Current safety boundary: private YouTube draft uploads only.
+            Publishing mode is enabled. Current safety boundary: private YouTube uploads only.
           </div>
         ) : null}
       </div>
@@ -4217,6 +4497,8 @@ function FinalOutputLink({ video, index, finalOutputs, finalManifestOutputs, man
 
 function FinalReviewPanel({
   episodeId,
+  episodeTitle,
+  episodeDescription,
   audioOutput,
   previewOutput,
   finalOutput,
@@ -4234,6 +4516,8 @@ function FinalReviewPanel({
   youtubeUploadOutputs = [],
   thumbnailOutputs,
   drafts,
+  panelState = {},
+  onPanelOpenChange,
   selectedFormat,
   socialConfig,
   integrations,
@@ -4501,18 +4785,27 @@ function FinalReviewPanel({
     }
   }
 
-  return (
-    <section className="workPanel finalReviewPanel">
-      <div className="panelHeader">
-        <div>
-          <span className="eyebrow">Render Control</span>
-          <div className="renderTitleRow">
-            <h3>Preview & Final Render</h3>
-            {renderBusy ? <RefreshCw className="spin renderRunningIcon" size={17} aria-label="Render running" /> : null}
-          </div>
-        </div>
-      </div>
+  function handleSavedPanelToggle(panelKey, event) {
+    onPanelOpenChange?.(panelKey, event.currentTarget.open);
+  }
 
+  return (
+    <div className="finalReviewPanel">
+      <details
+        className="reviewDetails renderControlPanel"
+        open={savedPanelOpen(panelState, "approvals.renderControl")}
+        onToggle={(event) => handleSavedPanelToggle("approvals.renderControl", event)}
+      >
+        <summary>
+          <span className="summaryTitleWithIcon">
+            Render Control
+            {renderBusy ? <RefreshCw className="spin renderRunningIcon" size={16} aria-label="Render running" /> : null}
+          </span>
+          <Pill tone={finalOutput ? "good" : integrations.youtube ? "good" : "neutral"}>
+            {finalOutput ? "final ready" : integrations.youtube ? "YouTube linked" : "Local draft"}
+          </Pill>
+        </summary>
+        <div className="renderControlBody">
       <div className="renderCommandBar">
         <Pill tone={finalOutput ? "good" : integrations.youtube ? "good" : "neutral"}>
           {finalOutput ? "final ready" : integrations.youtube ? "YouTube linked" : "Local draft"}
@@ -4680,13 +4973,21 @@ function FinalReviewPanel({
           </div>
         )}
       </div>
+        </div>
+      </details>
 
-      <RenderReadinessPanel readiness={readiness} />
+      <RenderReadinessPanel
+        readiness={readiness}
+        open={savedPanelOpen(panelState, "approvals.preflight")}
+        onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.preflight", isOpen)}
+      />
 
       <FinishingLayersPanel
         baseFinalOutput={baseFinalOutput}
         finishedMasterOutput={finishedMasterOutput}
         layers={drafts.finishingLayers || []}
+        open={savedPanelOpen(panelState, "approvals.finishingLayers")}
+        onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.finishingLayers", isOpen)}
         busy={busy}
         busyAction={busyAction}
         integrations={integrations}
@@ -4698,7 +4999,11 @@ function FinalReviewPanel({
         onGenerateApplauseTrack={onGenerateFinishingApplauseTrack}
       />
 
-      <details className="reviewDetails thumbnailReviewPanel">
+      <details
+        className="reviewDetails thumbnailReviewPanel"
+        open={savedPanelOpen(panelState, "approvals.thumbnail")}
+        onToggle={(event) => handleSavedPanelToggle("approvals.thumbnail", event)}
+      >
         <summary>
           <span className="summaryTitleWithIcon">
             Thumbnail
@@ -4770,6 +5075,10 @@ function FinalReviewPanel({
         selectedThumbnail={selectedThumbnail}
         latestPackage={latestPackage}
         youtubeDraft={drafts.youtube || {}}
+        episodeTitle={episodeTitle}
+        episodeDescription={episodeDescription}
+        open={savedPanelOpen(panelState, "approvals.youtubePublish")}
+        onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.youtubePublish", isOpen)}
         socialConfig={socialConfig}
         ready={packageReady}
         busy={busy}
@@ -4789,7 +5098,11 @@ function FinalReviewPanel({
       />
 
       {hasOutputs ? (
-        <details className="reviewDetails">
+        <details
+          className="reviewDetails"
+          open={savedPanelOpen(panelState, "approvals.localOutputs")}
+          onToggle={(event) => handleSavedPanelToggle("approvals.localOutputs", event)}
+        >
           <summary>
             <span>Local Outputs</span>
             <Pill tone="neutral">{outputCount} files</Pill>
@@ -4850,7 +5163,7 @@ function FinalReviewPanel({
             {youtubeUploadOutputs.slice(0, 2).map((upload) => (
               <a key={upload.id} href={upload.watchUrl || upload.localUrl} target="_blank" rel="noreferrer">
                 <Youtube size={16} />
-                <span>{upload.name || "YouTube private draft"}</span>
+                <span>{upload.name || "YouTube upload"}</span>
               </a>
             ))}
             {thumbnailOutputs.slice(0, 6).map((thumb) => (
@@ -4868,7 +5181,7 @@ function FinalReviewPanel({
           </div>
         </details>
       ) : null}
-    </section>
+    </div>
   );
 }
 
@@ -4876,6 +5189,8 @@ function FinishingLayersPanel({
   baseFinalOutput,
   finishedMasterOutput,
   layers = [],
+  open = false,
+  onOpenChange,
   busy,
   busyAction,
   integrations = {},
@@ -4960,6 +5275,9 @@ function FinishingLayersPanel({
   const audioPreviewLayers = finishedMasterOutput
     ? []
     : draftLayers.filter((layer) => layer.type === "audio" && layer.enabled !== false && layer.localUrl);
+  const audioLayers = draftLayers.filter((layer) => layer.type === "audio");
+  const visualLayers = draftLayers.filter((layer) => layer.type !== "audio");
+  const audioLayerCount = audioLayers.length;
   const hasLayers = draftLayers.length > 0;
   const uploadBusy = busyAction === "finishing-upload";
   const exportBusy = busyAction === "finishing-export";
@@ -5342,8 +5660,143 @@ function FinishingLayersPanel({
     window.addEventListener("pointercancel", stopTimelineEdit, { once: true });
   }
 
+  function renderLayerCard(layer) {
+    return (
+      <article
+        key={layer.id}
+        className={`finishingLayerCard ${layer.type} ${selectedLayerId === layer.id ? "selected" : ""}`}
+        onClick={() => setSelectedLayerId(layer.id)}
+      >
+        <div className="finishingLayerHeader">
+          <div>
+            <strong>{layer.name}</strong>
+            <span>{finishingLayerTypeLabel(layer.type)}</span>
+          </div>
+          <div className="buttonRow" onClick={(event) => event.stopPropagation()}>
+            <Toggle
+              checked={layer.enabled}
+              onChange={(checked) => updateLayer(layer.id, { enabled: checked })}
+              label={layer.enabled ? "On" : "Off"}
+              icon={Check}
+            />
+            <button type="button" className="quietButton" onClick={() => duplicateLayer(layer)} disabled={busy}>
+              <Copy size={15} />
+              Duplicate
+            </button>
+            <button type="button" className="quietButton" onClick={() => removeLayer(layer.id)} disabled={busy}>
+              <Trash2 size={15} />
+              Delete
+            </button>
+          </div>
+        </div>
+        <div className="finishingLayerControls">
+          <Field label="Start">
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              value={layer.startSeconds}
+              onChange={(event) => updateLayer(layer.id, { startSeconds: event.target.value })}
+            />
+          </Field>
+          <Field label="Duration">
+            <input
+              type="number"
+              min="0.1"
+              step="0.1"
+              value={layer.durationSeconds}
+              onChange={(event) => updateLayer(layer.id, { durationSeconds: event.target.value })}
+            />
+          </Field>
+          {layer.type !== "audio" ? (
+            <>
+              <Field label="X %">
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={layer.xPercent}
+                  onChange={(event) => updateLayer(layer.id, { xPercent: event.target.value })}
+                />
+              </Field>
+              <Field label="Y %">
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={layer.yPercent}
+                  onChange={(event) => updateLayer(layer.id, { yPercent: event.target.value })}
+                />
+              </Field>
+              <Field label="Width %">
+                <input
+                  type="number"
+                  min="1"
+                  max="220"
+                  step="1"
+                  value={layer.widthPercent}
+                  onChange={(event) => updateLayer(layer.id, { widthPercent: event.target.value })}
+                />
+              </Field>
+              <Field label="Opacity">
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={layer.opacity}
+                  onChange={(event) => updateLayer(layer.id, { opacity: event.target.value })}
+                />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field label="Volume">
+                <input
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.05"
+                  value={layer.volume}
+                  onChange={(event) => updateLayer(layer.id, { volume: event.target.value })}
+                />
+              </Field>
+              <Field label="Fade in">
+                <input
+                  type="number"
+                  min="0"
+                  max="10"
+                  step="0.1"
+                  value={layer.fadeInSeconds}
+                  onChange={(event) => updateLayer(layer.id, { fadeInSeconds: event.target.value })}
+                />
+              </Field>
+              <Field label="Fade out">
+                <input
+                  type="number"
+                  min="0"
+                  max="10"
+                  step="0.1"
+                  value={layer.fadeOutSeconds}
+                  onChange={(event) => updateLayer(layer.id, { fadeOutSeconds: event.target.value })}
+                />
+              </Field>
+            </>
+          )}
+        </div>
+      </article>
+    );
+  }
+
   return (
-    <details className="reviewDetails finishingLayersPanel" ref={finishingPanelRef}>
+    <details
+      className="reviewDetails finishingLayersPanel"
+      ref={finishingPanelRef}
+      open={open}
+      onToggle={(event) => onOpenChange?.(event.currentTarget.open)}
+    >
       <summary>
         <span>Finishing Layers</span>
         <Pill tone={finishedMasterOutput ? "good" : hasLayers ? "neutral" : "warn"}>
@@ -5356,7 +5809,7 @@ function FinishingLayersPanel({
             <strong>{finishedMasterOutput ? "Finished master exported" : baseFinalOutput ? "Add final graphics or sound" : "Render final video first"}</strong>
             <span>
               {finishedMasterOutput
-                ? "YouTube Prep will use the finished master."
+                ? "YouTube Publish will use the finished master."
                 : "Add image/video overlays or extra audio after the episode render, without changing the original final render."}
             </span>
           </div>
@@ -5557,7 +6010,15 @@ function FinishingLayersPanel({
           <div className="emptyState compact">Render Final before adding finishing layers.</div>
         )}
 
-        <div className="finishingMusicPanel">
+        <details className="finishingAudioLayerSection">
+          <summary>
+            <span>Audio Layers</span>
+            <Pill tone={audioLayerCount ? "neutral" : "warn"}>
+              {audioLayerCount ? `${audioLayerCount} audio` : "optional"}
+            </Pill>
+          </summary>
+          <div className="finishingAudioLayerBody">
+            <div className="finishingMusicPanel">
           <div className="finishingMusicHeader">
             <div>
               <strong>AI Music</strong>
@@ -5856,11 +6317,18 @@ function FinishingLayersPanel({
           <span className={`musicIntegrationStatus ${elevenMusicReady ? "ready" : ""}`}>
             {elevenMusicReady ? "ElevenLabs sound effects ready" : "ElevenLabs not connected"}
           </span>
-        </div>
+            </div>
+            {audioLayers.length ? (
+              <div className="finishingLayerList audioLayerList">
+                {audioLayers.map(renderLayerCard)}
+              </div>
+            ) : null}
+          </div>
+        </details>
 
-        {draftLayers.length ? (
+        {visualLayers.length ? (
           <div className="finishingLayerList">
-            {draftLayers.map((layer) => (
+            {visualLayers.map((layer) => (
               <article
                 key={layer.id}
                 className={`finishingLayerCard ${layer.type} ${selectedLayerId === layer.id ? "selected" : ""}`}
@@ -6254,6 +6722,10 @@ function FinalPackagePanel({
   latestPackage,
   latestYoutubeUpload,
   youtubeDraft,
+  episodeTitle = "",
+  episodeDescription = "",
+  open = false,
+  onOpenChange,
   socialConfig = {},
   ready,
   busy,
@@ -6271,56 +6743,39 @@ function FinalPackagePanel({
   onConnectYoutube
 }) {
   const youtubeDraftKey = JSON.stringify(youtubeDraft || {});
-  const [youtubeForm, setYoutubeForm] = useState(() => ({
-    title: youtubeDraft.title || "",
-    description: youtubeDraft.description || "",
-    tagsText: (youtubeDraft.tags || []).join(", "),
+  const defaultYoutubeTitle = String(episodeTitle || "").trim();
+  const defaultYoutubeDescription = String(episodeDescription || "").trim();
+  const youtubeFormDefaults = (draft = {}) => ({
+    title: draft.title || defaultYoutubeTitle,
+    description: draft.description || defaultYoutubeDescription,
+    tagsText: (draft.tags || []).join(", "),
     privacyStatus: "private",
-    categoryId: youtubeDraft.categoryId || "24",
-    madeForKids: Boolean(youtubeDraft.madeForKids),
-    notifySubscribers: Boolean(youtubeDraft.notifySubscribers),
-    containsSyntheticMedia: youtubeDraft.containsSyntheticMedia !== false,
-    shortsThumbnail: Boolean(youtubeDraft.shortsThumbnail),
-    plannedPublishAt: youtubeDraft.plannedPublishAt || "",
-    publishNotes: youtubeDraft.publishNotes || "",
-    readyToPublish: Boolean(youtubeDraft.readyToPublish),
-    readyToPublishAt: youtubeDraft.readyToPublishAt || "",
+    categoryId: draft.categoryId || "24",
+    madeForKids: Boolean(draft.madeForKids),
+    notifySubscribers: Boolean(draft.notifySubscribers),
+    containsSyntheticMedia: draft.containsSyntheticMedia !== false,
+    shortsThumbnail: Boolean(draft.shortsThumbnail),
+    plannedPublishAt: draft.plannedPublishAt || "",
+    publishNotes: draft.publishNotes || "",
+    readyToPublish: Boolean(draft.readyToPublish),
+    readyToPublishAt: draft.readyToPublishAt || "",
     handoffChecklist: {
       ...youtubeHandoffDefaults,
-      ...(youtubeDraft.handoffChecklist || {})
+      ...(draft.handoffChecklist || {})
     },
     promotion: {
       ...youtubePromotionDefaults,
-      ...(youtubeDraft.promotion || {})
+      ...(draft.promotion || {})
     }
+  });
+  const [youtubeForm, setYoutubeForm] = useState(() => ({
+    ...youtubeFormDefaults(youtubeDraft)
   }));
 
   useEffect(() => {
     const next = JSON.parse(youtubeDraftKey || "{}");
-    setYoutubeForm({
-      title: next.title || "",
-      description: next.description || "",
-      tagsText: (next.tags || []).join(", "),
-      privacyStatus: "private",
-      categoryId: next.categoryId || "24",
-      madeForKids: Boolean(next.madeForKids),
-      notifySubscribers: Boolean(next.notifySubscribers),
-      containsSyntheticMedia: next.containsSyntheticMedia !== false,
-      shortsThumbnail: Boolean(next.shortsThumbnail),
-      plannedPublishAt: next.plannedPublishAt || "",
-      publishNotes: next.publishNotes || "",
-      readyToPublish: Boolean(next.readyToPublish),
-      readyToPublishAt: next.readyToPublishAt || "",
-      handoffChecklist: {
-        ...youtubeHandoffDefaults,
-        ...(next.handoffChecklist || {})
-      },
-      promotion: {
-        ...youtubePromotionDefaults,
-        ...(next.promotion || {})
-      }
-    });
-  }, [youtubeDraftKey]);
+    setYoutubeForm(youtubeFormDefaults(next));
+  }, [youtubeDraftKey, defaultYoutubeTitle, defaultYoutubeDescription]);
 
   function updateYoutubeForm(key, value) {
     setYoutubeForm((prev) => ({
@@ -6529,8 +6984,8 @@ function FinalPackagePanel({
     },
     {
       id: "draft",
-      label: "Private draft",
-      detail: latestYoutubeUpload?.videoId || "Upload private YouTube draft",
+      label: "YouTube",
+      detail: latestYoutubeUpload?.videoId || "Upload to YouTube",
       status: latestYoutubeUpload?.videoId ? "pass" : "warning"
     },
     {
@@ -6549,18 +7004,22 @@ function FinalPackagePanel({
   const completedFinalQaChecks = finalQaChecks.filter((check) => check.status === "pass").length;
 
   return (
-    <details className="reviewDetails finalPackagePanel" open>
+    <details
+      className="reviewDetails finalPackagePanel"
+      open={open}
+      onToggle={(event) => onOpenChange?.(event.currentTarget.open)}
+    >
       <summary>
-        <span>{latestYoutubeUpload?.videoId ? "Episode Complete" : "YouTube Prep"}</span>
+        <span>YouTube Publish</span>
         <Pill tone={youtubeSummaryTone}>{youtubeSummaryLabel}</Pill>
       </summary>
       <div className="finalPackageBody">
         <div className={`episodeCompletePanel ${latestYoutubeUpload?.videoId ? "uploaded" : ""}`}>
           <div className="episodeCompleteHeader">
             <div>
-              <span className="eyebrow">Episode Complete</span>
+              <span className="eyebrow">YouTube Publish</span>
               <strong>{completionState}</strong>
-              <p>Review the finished render, selected thumbnail, YouTube draft, and manual schedule status from one place.</p>
+              <p>Review the finished render, selected thumbnail, YouTube upload, and manual schedule status from one place.</p>
             </div>
             <Pill tone={latestYoutubeUpload?.videoId ? (readyToPublish ? "good" : "neutral") : ready ? "good" : "warn"}>
               {latestYoutubeUpload?.videoId ? (readyToPublish ? "ready" : "draft") : ready ? "package ready" : "needs work"}
@@ -6580,10 +7039,10 @@ function FinalPackagePanel({
             <article>
               <Youtube size={17} />
               <div>
-                <span>YouTube draft</span>
+                <span>YouTube</span>
                 <strong>{latestYoutubeUpload?.videoId || "Not uploaded yet"}</strong>
                 {youtubeWatchUrl ? (
-                  <a href={youtubeWatchUrl} target="_blank" rel="noreferrer">Open draft</a>
+                  <a href={youtubeWatchUrl} target="_blank" rel="noreferrer">Open YouTube</a>
                 ) : null}
               </div>
             </article>
@@ -6651,7 +7110,7 @@ function FinalPackagePanel({
           <article>
             <Youtube size={17} />
             <div>
-              <strong>YouTube draft</strong>
+              <strong>YouTube</strong>
               <span>
                 {latestYoutubeUpload?.videoId
                   ? `Private draft ${latestYoutubeUpload.videoId}`
@@ -6706,7 +7165,7 @@ function FinalPackagePanel({
           <div className="youtubeDraftManager">
             <div className="draftManagerHeader">
               <div>
-                <strong>YouTube Draft Manager</strong>
+                <strong>YouTube Manager</strong>
                 <span>Checks YouTube state and keeps scheduling decisions inside NewtBuilder.</span>
               </div>
               <Pill tone="neutral">manual publish only</Pill>
@@ -6779,7 +7238,7 @@ function FinalPackagePanel({
           <Field label="YouTube title">
             <input value={youtubeForm.title} maxLength={100} onChange={(event) => updateYoutubeForm("title", event.target.value)} />
           </Field>
-          <Field label="Draft privacy">
+          <Field label="YouTube privacy">
             <input value="Private draft" readOnly />
           </Field>
           <Field label="Description">
@@ -6874,7 +7333,7 @@ function FinalPackagePanel({
               </Field>
             </div>
             <div className="manualPublishNotice">
-              These drafts are saved with YouTube Prep and included in the export package. Posting remains manual.
+              These drafts are saved with YouTube Publish and included in the export package. Posting remains manual.
             </div>
           </div>
         </details>
@@ -6882,7 +7341,7 @@ function FinalPackagePanel({
         <div className="packageActions primaryYoutubeActions">
           <button className="secondaryButton" onClick={saveDraft} disabled={busy}>
             <Save size={16} />
-            Save YouTube Prep
+            Save YouTube Publish
           </button>
           <button className="secondaryButton" onClick={onConnectYoutube} disabled={busy}>
             <Youtube size={16} />
@@ -6910,7 +7369,7 @@ function FinalPackagePanel({
               disabled={!canUploadDraft}
               title={
                 canUploadDraft
-                  ? "Upload this final video and thumbnail as a private YouTube draft"
+                  ? "Upload this final video and thumbnail privately to YouTube"
                   : !ready
                     ? "Render final video and select a thumbnail first"
                     : !youtubeReady
@@ -6923,7 +7382,7 @@ function FinalPackagePanel({
               }
             >
               {uploadBusy ? <RefreshCw className="spin" size={17} /> : <MonitorUp size={17} />}
-              Upload Private Draft
+              Upload to YouTube
             </button>
           ) : null}
           {latestYoutubeUpload?.videoId ? (
@@ -6933,7 +7392,7 @@ function FinalPackagePanel({
               disabled={!canUploadDraft}
               title={
                 canUploadDraft
-                  ? "Upload the current final video and thumbnail as a new private YouTube draft"
+                  ? "Upload the current final video and thumbnail privately to YouTube"
                   : !ready
                     ? "Render final video and select a thumbnail first"
                     : !youtubeReady
@@ -6946,7 +7405,7 @@ function FinalPackagePanel({
               }
             >
               {uploadBusy ? <RefreshCw className="spin" size={17} /> : <Upload size={17} />}
-              Republish New Draft
+              Republish to YouTube
             </button>
           ) : null}
           {latestYoutubeUpload?.videoId && !readyToPublish ? (
@@ -6973,7 +7432,7 @@ function FinalPackagePanel({
               disabled={!canRetryThumbnail}
               title={
                 canRetryThumbnail
-                  ? "Retry setting the selected thumbnail on the existing YouTube draft"
+                  ? "Retry setting the selected thumbnail on the existing YouTube upload"
                   : "Connect YouTube, unlock publishing, and select a thumbnail first"
               }
             >
@@ -7170,12 +7629,15 @@ function ProductionMapPanel({
   onGenerateMissingDialogueVideos,
   onGenerateInsertVideo,
   onUploadInsertVideo,
+  onSave,
+  resetKey,
+  defaultOpen = false,
+  onOpenChange,
   busyAction,
   busy
 }) {
   const hasLines = productionMap.length > 0;
-  const previousLineCountRef = useRef(productionMap.length);
-  const [isOpen, setIsOpen] = useState(() => productionMap.length > 0);
+  const [isOpen, setIsOpen] = useState(defaultOpen);
   const [selectedLineIds, setSelectedLineIds] = useState(() => new Set());
   const [dragLineId, setDragLineId] = useState("");
   const [dropTarget, setDropTarget] = useState(null);
@@ -7192,12 +7654,8 @@ function ProductionMapPanel({
   ).length;
 
   useEffect(() => {
-    const previousLineCount = previousLineCountRef.current;
-    if (!previousLineCount && productionMap.length) {
-      setIsOpen(true);
-    }
-    previousLineCountRef.current = productionMap.length;
-  }, [productionMap.length]);
+    setIsOpen(defaultOpen);
+  }, [defaultOpen, resetKey]);
 
   useEffect(() => {
     setSelectedLineIds((current) => {
@@ -7322,13 +7780,21 @@ function ProductionMapPanel({
     });
   }
 
+  function toggleOpen() {
+    setIsOpen((value) => {
+      const next = !value;
+      onOpenChange?.(next);
+      return next;
+    });
+  }
+
   return (
     <section className={`workPanel productionMapPanel collapsiblePanel ${isOpen ? "open" : "closed"}`}>
       <div className="panelHeader collapsibleHeader">
         <button
           type="button"
           className="collapseTitle"
-          onClick={() => setIsOpen((value) => !value)}
+          onClick={toggleOpen}
           aria-expanded={isOpen}
         >
           <ChevronRight size={18} className={isOpen ? "open" : ""} />
@@ -7338,6 +7804,10 @@ function ProductionMapPanel({
           </div>
         </button>
         <div className="buttonRow">
+          <button className="secondaryButton" type="button" onClick={onSave} disabled={busy}>
+            <Save size={15} />
+            Save Map
+          </button>
           {selectedLineIds.size >= 2 ? (
             <button className="secondaryButton" type="button" onClick={() => onGroupLines(selectedIds)}>
               <Plus size={15} />

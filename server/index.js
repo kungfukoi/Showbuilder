@@ -8,7 +8,7 @@ import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { copyFile, mkdir, readFile, rm, writeFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
@@ -210,6 +210,10 @@ app.get("/api/health", async (_req, res) => {
   res.json({
     ok: true,
     app: "NewtBuilder",
+    server: {
+      baseUrl: `http://127.0.0.1:${port}`,
+      port
+    },
     dataDirectory: dataDir,
     outputDirectory: outputsDir,
     features: {
@@ -242,6 +246,67 @@ app.get("/api/episodes/:id/comfyui-progress", (req, res) => {
     .filter((entry) => entry.episodeId === episodeId)
     .sort((a, b) => Date.parse(b.updatedAt || b.startedAt || "") - Date.parse(a.updatedAt || a.startedAt || ""));
   res.json({ items });
+});
+
+app.post("/api/system/choose-folder", async (req, res) => {
+  try {
+    const selectedPath = await selectFolderWithDialog({
+      title: String(req.body?.title || "Choose folder"),
+      defaultPath: String(req.body?.defaultPath || "")
+    });
+    res.json({ path: selectedPath });
+  } catch (error) {
+    if (error.code === "DIALOG_CANCELED") {
+      return res.json({ path: "", canceled: true });
+    }
+    res.status(400).json({ error: cleanErrorMessage(error) });
+  }
+});
+
+app.post("/api/system/newtbuilder/restart", async (_req, res) => {
+  res.json({ ok: true, message: "NewtBuilder backend restart requested." });
+  scheduleNewtBuilderRestart();
+});
+
+app.post("/api/system/comfyui/restart", async (_req, res) => {
+  try {
+    const comfyUi = await restartComfyUiBackend();
+    const youtube = await youtubeOAuthStatus();
+    const health = {
+      ok: true,
+      app: "NewtBuilder",
+      server: {
+        baseUrl: `http://127.0.0.1:${port}`,
+        port
+      },
+      dataDirectory: dataDir,
+      outputDirectory: outputsDir,
+      features: {
+        shortsThumbnailUploadFrame: true,
+        shortsThumbnailFrameSeconds
+      },
+      integrations: {
+        youtube: youtube.connected,
+        openai: Boolean(process.env.OPENAI_API_KEY),
+        elevenlabs: Boolean(elevenLabsApiKey),
+        fal: Boolean(falApiKey),
+        infinitalkLocal: localInfiniteTalkConfigured(),
+        comfyui: comfyUi.reachable,
+        infinitalkComfyUi: comfyUi.reachable && comfyUiInfiniteTalkConfigured()
+      },
+      comfyUi,
+      safety: {
+        publishingEnabled,
+        mode: publishingEnabled ? "publishing-capable" : "local-test-only",
+        youtubeDraftOnly: true
+      },
+      youtube
+    };
+    res.json({ ok: true, message: "ComfyUI restarted.", health });
+  } catch (error) {
+    const comfyUi = await comfyUiHealthStatus().catch(() => null);
+    res.status(400).json({ error: cleanErrorMessage(error), comfyUi });
+  }
 });
 
 app.get("/api/youtube/connect-url", async (_req, res) => {
@@ -1989,6 +2054,43 @@ app.post("/api/episodes/:id/package/export", async (req, res) => {
   }
 });
 
+app.post("/api/episodes/:id/package/save-as", async (req, res) => {
+  const shows = await readShows();
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+  const show = shows.find((item) => item.id === current.showId) || shows[0] || defaultShow();
+
+  try {
+    const parentPath = normalizePackageParentPath(req.body?.parentPath || req.body?.folderPath);
+    if (!parentPath) {
+      throw new Error("Choose a folder before saving an episode package.");
+    }
+    const savedPackage = await writeNewtBuilderEpisodePackage({ episode: current, show, parentPath });
+    const output = {
+      id: `${randomUUID()}-episode-package`,
+      type: "episode_package",
+      name: "NewtBuilder episode package",
+      fileName: savedPackage.packageName,
+      packagePath: savedPackage.packagePath,
+      manifestPath: savedPackage.manifestPath,
+      createdAt: savedPackage.exportedAt
+    };
+    const updated = normalizeEpisode({
+      ...current,
+      outputs: [output, ...(current.outputs || [])],
+      jobLog: appendLog(current.jobLog, `Episode package saved to ${savedPackage.packagePath}.`),
+      updatedAt: savedPackage.exportedAt
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.json({ episode: updated, package: savedPackage });
+  } catch (error) {
+    res.status(400).json({ error: cleanErrorMessage(error) });
+  }
+});
+
 app.get("/api/episodes/:id/launch-readiness", async (req, res) => {
   const shows = await readShows();
   const episodes = await readEpisodes();
@@ -2387,6 +2489,204 @@ app.post("/api/episodes/:id/audio/regenerate-all", async (req, res) => {
 app.get("/api/jobs", async (_req, res) => {
   res.json(await readJobs());
 });
+
+function scheduleNewtBuilderRestart() {
+  const timer = setTimeout(() => {
+    let launched = false;
+    const launchReplacement = () => {
+      if (launched) return;
+      launched = true;
+      try {
+        const child = spawnNewtBuilderBackendProcess();
+        console.log(`NewtBuilder replacement backend launched as PID ${child.pid}.`);
+        const exitTimer = setTimeout(() => process.exit(0), 150);
+      } catch (error) {
+        launched = false;
+        console.error("NewtBuilder restart failed before replacement launch:", error);
+      }
+    };
+
+    const server = globalThis.newtBuilderApiServer;
+    if (server && typeof server.close === "function") {
+      server.close(() => {
+        const launchTimer = setTimeout(launchReplacement, 250);
+      });
+      const fallbackTimer = setTimeout(launchReplacement, 1500);
+      return;
+    }
+
+    launchReplacement();
+  }, 350);
+}
+
+function spawnNewtBuilderBackendProcess() {
+  mkdirSync(logsDir, { recursive: true });
+  const outFd = openSync(path.join(logsDir, "newtbuilder-restart.out.log"), "a");
+  const errFd = openSync(path.join(logsDir, "newtbuilder-restart.err.log"), "a");
+  try {
+    const child = spawn(process.execPath, [__filename], {
+      cwd: rootDir,
+      detached: true,
+      stdio: ["ignore", outFd, errFd],
+      windowsHide: true,
+      env: sanitizedRestartEnv()
+    });
+    child.unref();
+    return child;
+  } catch (error) {
+    closeFdQuietly(outFd);
+    closeFdQuietly(errFd);
+    throw error;
+  } finally {
+    closeFdQuietly(outFd);
+    closeFdQuietly(errFd);
+  }
+}
+
+function sanitizedRestartEnv() {
+  const env = {};
+  const seen = new Set();
+  let pathValue = "";
+  for (const [key, value] of Object.entries(process.env)) {
+    const lowerKey = key.toLowerCase();
+    if (lowerKey === "path") {
+      pathValue = pathValue || value;
+      continue;
+    }
+    if (seen.has(lowerKey)) continue;
+    seen.add(lowerKey);
+    env[key] = value;
+  }
+  if (pathValue) {
+    env[process.platform === "win32" ? "Path" : "PATH"] = pathValue;
+  }
+  env.PYTHONUTF8 = env.PYTHONUTF8 || "1";
+  env.PYTHONIOENCODING = env.PYTHONIOENCODING || "utf-8";
+  env.NEWTBUILDER_RESTARTED_AT = new Date().toISOString();
+  return env;
+}
+
+async function restartComfyUiBackend() {
+  const target = comfyUiConnectionTarget();
+  if (target.port === port) {
+    throw new Error("COMFYUI_BASE_URL is using the NewtBuilder API port. Set ComfyUI to a different port before rebooting it.");
+  }
+  await stopProcessListeningOnPort(target.port);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const launched = await launchComfyUiBackend();
+  const status = await waitForComfyUiReachable(comfyUiAutoStartTimeoutMs(120000));
+  if (!status.reachable) {
+    throw new Error(`ComfyUI launched via ${launched.mode}, but ${status.baseUrl} did not answer. ${status.error || ""}`.trim());
+  }
+  return {
+    ...status,
+    launched,
+    restartedAt: new Date().toISOString()
+  };
+}
+
+async function stopProcessListeningOnPort(portNumber) {
+  const portValue = Number(portNumber);
+  if (!Number.isFinite(portValue) || portValue <= 0) return;
+  if (process.platform === "win32") {
+    const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$ids = Get-NetTCPConnection -LocalPort ${Math.round(portValue)} -State Listen | Select-Object -ExpandProperty OwningProcess -Unique
+foreach ($id in $ids) {
+  if ($id -and $id -ne $PID) {
+    Stop-Process -Id $id -Force
+  }
+}
+`;
+    await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+      windowsHide: true,
+      timeout: 30000
+    });
+    return;
+  }
+
+  const shell = process.env.SHELL || "/bin/sh";
+  const command = `pids=$(lsof -ti tcp:${Math.round(portValue)} -sTCP:LISTEN 2>/dev/null || true); if [ -n "$pids" ]; then kill $pids; fi`;
+  await execFileAsync(shell, ["-lc", command], { timeout: 30000 }).catch(() => {});
+}
+
+async function selectFolderWithDialog({ title = "Choose folder", defaultPath = "" } = {}) {
+  if (process.platform === "win32") return selectFolderWithWindowsDialog({ title, defaultPath });
+  if (process.platform === "darwin") return selectFolderWithMacDialog({ title, defaultPath });
+  return selectFolderWithLinuxDialog({ title, defaultPath });
+}
+
+async function selectFolderWithWindowsDialog({ title, defaultPath }) {
+  const selectedPath = existingDirectoryPath(defaultPath);
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = ${powershellStringLiteral(title)}
+$dialog.ShowNewFolderButton = $true
+$selectedPath = ${powershellStringLiteral(selectedPath)}
+if ($selectedPath -and (Test-Path -LiteralPath $selectedPath)) {
+  $dialog.SelectedPath = $selectedPath
+}
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+  Write-Output $dialog.SelectedPath
+  exit 0
+}
+exit 2
+`;
+  return runFolderDialogCommand("powershell.exe", ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script]);
+}
+
+async function selectFolderWithMacDialog({ title, defaultPath }) {
+  const selectedPath = existingDirectoryPath(defaultPath);
+  const script = selectedPath
+    ? `POSIX path of (choose folder with prompt ${JSON.stringify(title)} default location POSIX file ${JSON.stringify(selectedPath)})`
+    : `POSIX path of (choose folder with prompt ${JSON.stringify(title)})`;
+  return runFolderDialogCommand("osascript", ["-e", script]);
+}
+
+async function selectFolderWithLinuxDialog({ title, defaultPath }) {
+  const selectedPath = existingDirectoryPath(defaultPath) || rootDir;
+  try {
+    return await runFolderDialogCommand("zenity", ["--file-selection", "--directory", "--title", title, "--filename", selectedPath]);
+  } catch (error) {
+    if (error.code === "DIALOG_CANCELED") throw error;
+    return runFolderDialogCommand("kdialog", ["--getexistingdirectory", selectedPath]);
+  }
+}
+
+async function runFolderDialogCommand(command, args) {
+  try {
+    const { stdout } = await execFileAsync(command, args, { windowsHide: false, timeout: 120000 });
+    const selectedPath = String(stdout || "").trim();
+    if (!selectedPath) {
+      const canceled = new Error("Folder selection canceled.");
+      canceled.code = "DIALOG_CANCELED";
+      throw canceled;
+    }
+    return selectedPath;
+  } catch (error) {
+    if (error.code === "DIALOG_CANCELED" || error.code === 2) {
+      const canceled = new Error("Folder selection canceled.");
+      canceled.code = "DIALOG_CANCELED";
+      throw canceled;
+    }
+    throw error;
+  }
+}
+
+function existingDirectoryPath(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return "";
+  const resolved = path.resolve(candidate);
+  return existsSync(resolved) ? resolved : "";
+}
+
+function powershellStringLiteral(value) {
+  return `'${String(value || "").replace(/'/g, "''")}'`;
+}
 
 globalThis.newtBuilderApiServer = http.createServer(app).listen(port, "127.0.0.1", () => {
   console.log(`NewtBuilder API listening on http://127.0.0.1:${port}`);
@@ -3006,6 +3306,9 @@ function emptyDrafts(show) {
     thumbnails: [],
     thumbnailBrief: sanitizeThumbnailBrief({}),
     finishingLayers: [],
+    ui: {
+      panelState: {}
+    },
     social: []
   };
 }
@@ -7357,6 +7660,142 @@ async function exportUploadPackage({ episode, show }) {
   };
 
   return { output, metadata };
+}
+
+async function writeNewtBuilderEpisodePackage({ episode, show, parentPath }) {
+  const exportedAt = new Date().toISOString();
+  const parent = normalizePackageParentPath(parentPath);
+  if (!parent) throw new Error("Choose a valid parent folder for the episode package.");
+  await mkdir(parent, { recursive: true });
+
+  const packageName = uniqueEpisodePackageName(parent, `${safeFileSegment(episode.title)}-newtbuilder-package`);
+  const packagePath = path.join(parent, packageName);
+  const metadataDir = path.join(packagePath, ".newtbuilder");
+  await Promise.all([
+    mkdir(packagePath, { recursive: true }),
+    mkdir(metadataDir, { recursive: true })
+  ]);
+
+  const urlMap = new Map();
+  const files = [];
+  const localUrls = [...collectLocalProjectUrls(show), ...collectLocalProjectUrls(episode)];
+  for (const localUrl of [...new Set(localUrls)]) {
+    const sourcePath = localProjectFilePath(localUrl);
+    const relativePath = packageRelativePathForLocalUrl(localUrl);
+    if (!sourcePath || !relativePath) continue;
+    const targetPath = path.join(packagePath, relativePath);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await copyFile(sourcePath, targetPath);
+    const normalizedRelativePath = relativePath.replace(/\\/g, "/");
+    urlMap.set(localUrl, `./${normalizedRelativePath}`);
+    files.push({
+      originalUrl: localUrl,
+      relativePath: normalizedRelativePath,
+      fileName: path.basename(targetPath)
+    });
+  }
+
+  const packagedShow = rewritePackageLocalUrls(show, urlMap);
+  const packagedEpisode = rewritePackageLocalUrls(episode, urlMap);
+  const manifestPath = path.join(packagePath, "episode.newtbuilder.json");
+  const manifest = {
+    app: "NewtBuilder",
+    version: 1,
+    exportedAt,
+    packageName,
+    packagePath,
+    show: packagedShow,
+    episode: packagedEpisode,
+    files
+  };
+  const summary = {
+    app: "NewtBuilder",
+    version: 1,
+    exportedAt,
+    packageName,
+    manifest: "episode.newtbuilder.json",
+    showId: show.id,
+    episodeId: episode.id,
+    fileCount: files.length
+  };
+
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+  await writeFile(path.join(metadataDir, "manifest.json"), JSON.stringify(summary, null, 2));
+
+  return {
+    packageName,
+    packagePath,
+    manifestPath,
+    exportedAt,
+    fileCount: files.length
+  };
+}
+
+function normalizePackageParentPath(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return path.resolve(raw);
+}
+
+function uniqueEpisodePackageName(parentPath, baseName) {
+  const safeBase = safeFileSegment(baseName || "newtbuilder-episode-package");
+  let packageName = safeBase;
+  let index = 2;
+  while (existsSync(path.join(parentPath, packageName))) {
+    packageName = `${safeBase}-${index}`;
+    index += 1;
+  }
+  return packageName;
+}
+
+function collectLocalProjectUrls(value, urls = new Set()) {
+  if (!value) return urls;
+  if (typeof value === "string") {
+    if (value.startsWith("/uploads/") || value.startsWith("/outputs/")) urls.add(value);
+    return urls;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectLocalProjectUrls(item, urls);
+    return urls;
+  }
+  if (typeof value === "object") {
+    for (const item of Object.values(value)) collectLocalProjectUrls(item, urls);
+  }
+  return urls;
+}
+
+function packageRelativePathForLocalUrl(localUrl) {
+  const normalized = String(localUrl || "").replace(/\\/g, "/");
+  if (!normalized.startsWith("/uploads/") && !normalized.startsWith("/outputs/")) return "";
+  const parts = normalized
+    .replace(/^\/+/, "")
+    .split("/")
+    .map(safePackagePathSegment)
+    .filter(Boolean);
+  if (!parts.length || !["uploads", "outputs"].includes(parts[0])) return "";
+  return path.join(...parts);
+}
+
+function safePackagePathSegment(value) {
+  return (
+    String(value || "")
+      .trim()
+      .replace(/[^a-z0-9_.-]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 120) || "asset"
+  );
+}
+
+function rewritePackageLocalUrls(value, urlMap) {
+  if (!value) return value;
+  if (typeof value === "string") return urlMap.get(value) || value;
+  if (Array.isArray(value)) return value.map((item) => rewritePackageLocalUrls(item, urlMap));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, rewritePackageLocalUrls(item, urlMap)])
+    );
+  }
+  return value;
 }
 
 function latestFinalVideoOutput(episode) {
