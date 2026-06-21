@@ -15,6 +15,8 @@ import {
   FolderOpen,
   Gauge,
   Image,
+  LayoutGrid,
+  List,
   ListChecks,
   Lock,
   MonitorUp,
@@ -1148,6 +1150,27 @@ function sortEpisodesForShelf(episodes = []) {
   });
 }
 
+function sortEpisodesForDashboard(episodes = [], sortMode = "user") {
+  const list = Array.isArray(episodes) ? episodes : [];
+  if (sortMode === "date") {
+    return [...list].sort((a, b) => {
+      return (
+        newestTimestamp([b]) - newestTimestamp([a]) ||
+        String(a.title || "").localeCompare(String(b.title || ""))
+      );
+    });
+  }
+  if (sortMode === "title") {
+    return [...list].sort((a, b) => {
+      return (
+        String(a.title || "").localeCompare(String(b.title || ""), undefined, { numeric: true, sensitivity: "base" }) ||
+        newestTimestamp([b]) - newestTimestamp([a])
+      );
+    });
+  }
+  return sortEpisodesForShelf(list);
+}
+
 function friendlyDate(value) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return "Not saved yet";
@@ -1298,14 +1321,24 @@ function ShowDashboard({
   onDuplicateEpisode,
   onReorderEpisodes
 }) {
-  const orderedEpisodes = useMemo(() => sortEpisodesForShelf(episodes), [episodes]);
+  const [episodeViewMode, setEpisodeViewMode] = useState("thumbnails");
+  const [episodeSortMode, setEpisodeSortMode] = useState("user");
+  const orderedEpisodes = useMemo(() => sortEpisodesForDashboard(episodes, episodeSortMode), [episodes, episodeSortMode]);
   const [draggedEpisodeId, setDraggedEpisodeId] = useState("");
   const [dropTargetEpisodeId, setDropTargetEpisodeId] = useState("");
+  const dragEnabled = episodeSortMode === "user";
   const latestTime = newestTimestamp(episodes);
   const renderedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "final_video").length).length;
   const uploadedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "youtube_upload").some((output) => output.videoId)).length;
 
+  useEffect(() => {
+    if (dragEnabled) return;
+    setDraggedEpisodeId("");
+    setDropTargetEpisodeId("");
+  }, [dragEnabled]);
+
   function finishEpisodeDrop(targetEpisodeId, insertAfter = false) {
+    if (!dragEnabled) return;
     const draggedId = draggedEpisodeId;
     setDraggedEpisodeId("");
     setDropTargetEpisodeId("");
@@ -1348,18 +1381,46 @@ function ShowDashboard({
           <span className="eyebrow">Episodes</span>
           <h3>{episodes.length ? "Saved Episodes" : "No episodes yet"}</h3>
         </div>
-        <span>{latestTime ? `Last edited ${friendlyDate(latestTime)}` : "Fresh show"}</span>
+        <div className="episodeShelfControls">
+          <span>{latestTime ? `Last edited ${friendlyDate(latestTime)}` : "Fresh show"}</span>
+          <div className="episodeViewToggle" aria-label="Episode view">
+            <button
+              type="button"
+              className={episodeViewMode === "thumbnails" ? "active" : ""}
+              onClick={() => setEpisodeViewMode("thumbnails")}
+            >
+              <LayoutGrid size={15} />
+              Thumbnails
+            </button>
+            <button
+              type="button"
+              className={episodeViewMode === "list" ? "active" : ""}
+              onClick={() => setEpisodeViewMode("list")}
+            >
+              <List size={15} />
+              List
+            </button>
+          </div>
+          <label className="episodeSortControl">
+            <span>Sort</span>
+            <select value={episodeSortMode} onChange={(event) => setEpisodeSortMode(event.target.value)}>
+              <option value="user">User order</option>
+              <option value="date">Date</option>
+              <option value="title">Title</option>
+            </select>
+          </label>
+        </div>
       </div>
 
       {orderedEpisodes.length ? (
         <div
-          className="episodeCardGrid"
+          className={`episodeCardGrid ${episodeViewMode}`}
           onDragOver={(event) => {
-            if (!draggedEpisodeId) return;
+            if (!dragEnabled || !draggedEpisodeId) return;
             event.preventDefault();
           }}
           onDrop={(event) => {
-            if (!draggedEpisodeId) return;
+            if (!dragEnabled || !draggedEpisodeId) return;
             event.preventDefault();
             finishEpisodeDrop("");
           }}
@@ -1373,29 +1434,34 @@ function ShowDashboard({
             const isDropTarget = dropTargetEpisodeId === episode.id && draggedEpisodeId !== episode.id;
             return (
               <article
-                className={`episodeCard ${isDragging ? "dragging" : ""} ${isDropTarget ? "dropTarget" : ""}`}
+                className={`episodeCard ${episodeViewMode === "list" ? "listRow" : ""} ${isDragging ? "dragging" : ""} ${isDropTarget ? "dropTarget" : ""}`}
                 key={episode.id}
-                draggable={!busy}
+                draggable={!busy && dragEnabled}
                 onDragStart={(event) => {
+                  if (!dragEnabled) return;
                   setDraggedEpisodeId(episode.id);
                   event.dataTransfer.effectAllowed = "move";
                   event.dataTransfer.setData("text/plain", episode.id);
                 }}
                 onDragEnter={() => {
-                  if (draggedEpisodeId && draggedEpisodeId !== episode.id) setDropTargetEpisodeId(episode.id);
+                  if (dragEnabled && draggedEpisodeId && draggedEpisodeId !== episode.id) setDropTargetEpisodeId(episode.id);
                 }}
                 onDragOver={(event) => {
-                  if (!draggedEpisodeId || draggedEpisodeId === episode.id) return;
+                  if (!dragEnabled || !draggedEpisodeId || draggedEpisodeId === episode.id) return;
                   event.preventDefault();
                   event.dataTransfer.dropEffect = "move";
                   setDropTargetEpisodeId(episode.id);
                 }}
                 onDrop={(event) => {
-                  if (!draggedEpisodeId) return;
+                  if (!dragEnabled || !draggedEpisodeId) return;
                   event.preventDefault();
                   event.stopPropagation();
                   const rect = event.currentTarget.getBoundingClientRect();
-                  finishEpisodeDrop(episode.id, event.clientX > rect.left + rect.width / 2);
+                  const insertAfter =
+                    episodeViewMode === "list"
+                      ? event.clientY > rect.top + rect.height / 2
+                      : event.clientX > rect.left + rect.width / 2;
+                  finishEpisodeDrop(episode.id, insertAfter);
                 }}
                 onDragEnd={() => {
                   setDraggedEpisodeId("");

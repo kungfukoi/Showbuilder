@@ -259,6 +259,71 @@ main {
   padding: 10px 0 4px;
 }
 
+.episodeShelfControls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.episodeViewToggle {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-height: 36px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11110e;
+}
+
+.episodeViewToggle button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-width: 118px;
+  padding: 0 12px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  color: var(--muted);
+  background: transparent;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.episodeViewToggle button:last-child {
+  border-right: 0;
+}
+
+.episodeViewToggle button.active {
+  color: var(--jade);
+  background: rgba(109, 208, 165, 0.11);
+}
+
+.episodeSortControl {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.episodeSortControl select {
+  min-height: 36px;
+  min-width: 132px;
+  padding: 0 34px 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: #11110e;
+  font: inherit;
+  text-transform: none;
+}
+
 .dashboardHeader {
   align-items: center;
   padding: 8px 0 12px;
@@ -399,6 +464,51 @@ main {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 14px;
+}
+
+.episodeCardGrid.list {
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.episodeCard.listRow {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.episodeCard.listRow .episodeCardPreview {
+  width: 72px;
+  margin: 10px;
+  align-self: center;
+}
+
+.episodeCard.listRow .episodeCardBody {
+  min-width: 0;
+  padding: 12px 14px 12px 4px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.episodeCard.listRow .showCardTitleRow {
+  grid-column: 1 / 2;
+}
+
+.episodeCard.listRow .episodeCardStats {
+  grid-column: 1 / 2;
+  justify-content: flex-start;
+}
+
+.episodeCard.listRow .episodeYoutubeLink {
+  grid-column: 2 / 3;
+  grid-row: 1 / 2;
+  align-self: center;
+}
+
+.episodeCard.listRow .buttonRow {
+  grid-column: 2 / 3;
+  grid-row: 2 / 3;
+  justify-content: flex-end;
 }
 
 .overviewBand {
@@ -4498,6 +4608,16 @@ label:has(textarea:disabled) {
     justify-content: flex-start;
   }
 
+  .episodeShelfControls {
+    align-items: stretch;
+    justify-content: flex-start;
+  }
+
+  .episodeViewToggle,
+  .episodeSortControl select {
+    width: 100%;
+  }
+
   .settingsGroupHeader {
     align-items: start;
     flex-direction: column;
@@ -4555,10 +4675,33 @@ label:has(textarea:disabled) {
   .approvalGate,
   .approvalGate.compact,
   .characterRow,
+  .episodeCard.listRow,
   .productionLine,
   .insertProductionLine,
   .insertPreviewGrid {
     grid-template-columns: 1fr;
+  }
+
+  .episodeCard.listRow .episodeCardPreview {
+    width: clamp(120px, 37.5%, 150px);
+    margin: 14px auto 0;
+  }
+
+  .episodeCard.listRow .episodeCardBody {
+    padding: 14px;
+    grid-template-columns: 1fr;
+  }
+
+  .episodeCard.listRow .showCardTitleRow,
+  .episodeCard.listRow .episodeCardStats,
+  .episodeCard.listRow .episodeYoutubeLink,
+  .episodeCard.listRow .buttonRow {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .episodeCard.listRow .buttonRow {
+    justify-content: flex-start;
   }
 
   .insertShotControls {
