@@ -324,6 +324,28 @@ main {
   text-transform: none;
 }
 
+.episodeSortDirectionButton {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: #11110e;
+  font-size: 12px;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.episodeSortDirectionButton:hover {
+  color: var(--jade);
+  border-color: rgba(109, 208, 165, 0.36);
+  background: rgba(109, 208, 165, 0.08);
+}
+
 .dashboardHeader {
   align-items: center;
   padding: 8px 0 12px;
@@ -4614,7 +4636,8 @@ label:has(textarea:disabled) {
   }
 
   .episodeViewToggle,
-  .episodeSortControl select {
+  .episodeSortControl select,
+  .episodeSortDirectionButton {
     width: 100%;
   }
 

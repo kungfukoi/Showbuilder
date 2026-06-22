@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   BadgeCheck,
   Bot,
   Check,
@@ -644,7 +646,7 @@ function buildRenderReadiness({
   const missingVoices = dialogueLines.filter((line) => !String(line.voiceId || "").trim());
   const missingImages = lines.filter((line) => !String(line.assetId || "").trim());
   const missingMasks = groupedDialogue.filter(
-    (line) => lineExpectsSpeakerMask(line, assetById.get(line.assetId)) && !String(line.maskAssetId || "").trim()
+    (line) => !line.maskAutoApplyDisabled && lineExpectsSpeakerMask(line, assetById.get(line.assetId)) && !String(line.maskAssetId || "").trim()
   );
   const missingInsertVideos = insertLines.filter((line) => !line.videoTake?.localUrl && !line.videoTake?.proxyLocalUrl);
   const missingInsertTrims = insertLines.filter((line) => {
@@ -1150,22 +1152,22 @@ function sortEpisodesForShelf(episodes = []) {
   });
 }
 
-function sortEpisodesForDashboard(episodes = [], sortMode = "user") {
+function sortEpisodesForDashboard(episodes = [], sortMode = "user", sortDirection = "desc") {
   const list = Array.isArray(episodes) ? episodes : [];
+  const direction = sortDirection === "asc" ? "asc" : "desc";
   if (sortMode === "date") {
     return [...list].sort((a, b) => {
-      return (
-        newestTimestamp([b]) - newestTimestamp([a]) ||
-        String(a.title || "").localeCompare(String(b.title || ""))
-      );
+      const dateCompare = newestTimestamp([a]) - newestTimestamp([b]);
+      return (direction === "asc" ? dateCompare : -dateCompare) || String(a.title || "").localeCompare(String(b.title || ""));
     });
   }
   if (sortMode === "title") {
     return [...list].sort((a, b) => {
-      return (
-        String(a.title || "").localeCompare(String(b.title || ""), undefined, { numeric: true, sensitivity: "base" }) ||
-        newestTimestamp([b]) - newestTimestamp([a])
-      );
+      const titleCompare = String(a.title || "").localeCompare(String(b.title || ""), undefined, {
+        numeric: true,
+        sensitivity: "base"
+      });
+      return (direction === "asc" ? titleCompare : -titleCompare) || newestTimestamp([b]) - newestTimestamp([a]);
     });
   }
   return sortEpisodesForShelf(list);
@@ -1198,6 +1200,48 @@ function savedPanelOpen(panelState = {}, key = "", fallback = false) {
   if (!key) return Boolean(fallback);
   const value = panelState?.[key];
   return typeof value === "boolean" ? value : Boolean(fallback);
+}
+
+const panelStateStorageKey = "newtbuilder:panelState:v1";
+
+function normalizePanelState(panelState = {}) {
+  const normalized = {};
+  if (!panelState || typeof panelState !== "object") return normalized;
+  for (const [key, value] of Object.entries(panelState)) {
+    if (typeof value === "boolean") normalized[key] = value;
+  }
+  return normalized;
+}
+
+function readPanelStateStore() {
+  if (typeof window === "undefined" || !window.localStorage) return {};
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(panelStateStorageKey) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function readStoredPanelState(scopeKey = "") {
+  if (!scopeKey) return {};
+  return normalizePanelState(readPanelStateStore()[scopeKey]);
+}
+
+function writeStoredPanelState(scopeKey = "", panelState = {}) {
+  if (!scopeKey || typeof window === "undefined" || !window.localStorage) return;
+  try {
+    const store = readPanelStateStore();
+    window.localStorage.setItem(
+      panelStateStorageKey,
+      JSON.stringify({
+        ...store,
+        [scopeKey]: normalizePanelState(panelState)
+      })
+    );
+  } catch {
+    // Local persistence is best-effort; the episode draft still carries the saved state.
+  }
 }
 
 function episodePreviewImage(episode) {
@@ -1323,10 +1367,23 @@ function ShowDashboard({
 }) {
   const [episodeViewMode, setEpisodeViewMode] = useState("thumbnails");
   const [episodeSortMode, setEpisodeSortMode] = useState("user");
-  const orderedEpisodes = useMemo(() => sortEpisodesForDashboard(episodes, episodeSortMode), [episodes, episodeSortMode]);
+  const [episodeSortDirection, setEpisodeSortDirection] = useState("desc");
+  const orderedEpisodes = useMemo(
+    () => sortEpisodesForDashboard(episodes, episodeSortMode, episodeSortDirection),
+    [episodes, episodeSortMode, episodeSortDirection]
+  );
   const [draggedEpisodeId, setDraggedEpisodeId] = useState("");
   const [dropTargetEpisodeId, setDropTargetEpisodeId] = useState("");
   const dragEnabled = episodeSortMode === "user";
+  const directionalSort = episodeSortMode === "date" || episodeSortMode === "title";
+  const sortDirectionLabel =
+    episodeSortMode === "title"
+      ? episodeSortDirection === "asc"
+        ? "A to Z"
+        : "Z to A"
+      : episodeSortDirection === "asc"
+        ? "Oldest first"
+        : "Newest first";
   const latestTime = newestTimestamp(episodes);
   const renderedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "final_video").length).length;
   const uploadedCount = episodes.filter((episode) => episodeOutputsOfType(episode, "youtube_upload").some((output) => output.videoId)).length;
@@ -1349,6 +1406,12 @@ function ShowDashboard({
     const insertIndex = targetEpisodeId && targetIndex >= 0 ? targetIndex + (insertAfter ? 1 : 0) : nextIds.length;
     nextIds.splice(insertIndex, 0, draggedId);
     onReorderEpisodes?.(nextIds);
+  }
+
+  function changeEpisodeSortMode(mode) {
+    setEpisodeSortMode(mode);
+    if (mode === "title") setEpisodeSortDirection("asc");
+    if (mode === "date") setEpisodeSortDirection("desc");
   }
 
   if (!show) {
@@ -1403,12 +1466,24 @@ function ShowDashboard({
           </div>
           <label className="episodeSortControl">
             <span>Sort</span>
-            <select value={episodeSortMode} onChange={(event) => setEpisodeSortMode(event.target.value)}>
+            <select value={episodeSortMode} onChange={(event) => changeEpisodeSortMode(event.target.value)}>
               <option value="user">User order</option>
               <option value="date">Date</option>
               <option value="title">Title</option>
             </select>
           </label>
+          {directionalSort ? (
+            <button
+              type="button"
+              className="episodeSortDirectionButton"
+              onClick={() => setEpisodeSortDirection((value) => (value === "asc" ? "desc" : "asc"))}
+              title={`Sort ${sortDirectionLabel}`}
+              aria-label={`Sort ${sortDirectionLabel}`}
+            >
+              {episodeSortDirection === "asc" ? <ArrowUp size={16} /> : <ArrowDown size={16} />}
+              {sortDirectionLabel}
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -1548,6 +1623,8 @@ export default function App() {
   const [voicesSource, setVoicesSource] = useState("unavailable");
   const [maskEditorLineId, setMaskEditorLineId] = useState("");
   const [launchReadiness, setLaunchReadiness] = useState(null);
+  const [storedPanelStateScopeKey, setStoredPanelStateScopeKey] = useState("");
+  const [storedPanelState, setStoredPanelState] = useState({});
   const autosaveTimerRef = useRef(null);
   const autosaveInFlightRef = useRef(false);
   const finishingUploadInFlightRef = useRef(false);
@@ -1560,6 +1637,8 @@ export default function App() {
     () => episodes.find((episode) => episode.id === activeEpisodeId) || episodes[0] || null,
     [episodes, activeEpisodeId]
   );
+  const panelStateScopeKey =
+    activeShow?.id && activeEpisode?.id ? `${activeShow.id}:${activeEpisode.id}` : "";
   const activeGenerationProgress = useMemo(
     () => latestGenerationProgress(generationProgressItems),
     [generationProgressItems]
@@ -1577,6 +1656,11 @@ export default function App() {
     setEpisodeDraft(activeEpisode ? structuredClone(activeEpisode) : null);
     setLaunchReadiness(null);
   }, [activeEpisode?.id]);
+
+  useEffect(() => {
+    setStoredPanelStateScopeKey(panelStateScopeKey);
+    setStoredPanelState(readStoredPanelState(panelStateScopeKey));
+  }, [panelStateScopeKey]);
 
   useEffect(() => {
     const episodeId = activeEpisode?.id;
@@ -2101,10 +2185,24 @@ export default function App() {
 
   function updateEpisodePanelOpen(panelKey, isOpen) {
     if (!panelKey) return;
+    const nextOpen = Boolean(isOpen);
+    if (panelStateScopeKey) {
+      setStoredPanelStateScopeKey(panelStateScopeKey);
+      setStoredPanelState((prev) => {
+        const current = storedPanelStateScopeKey === panelStateScopeKey ? prev : readStoredPanelState(panelStateScopeKey);
+        if (current[panelKey] === nextOpen) return current;
+        const next = {
+          ...current,
+          [panelKey]: nextOpen
+        };
+        writeStoredPanelState(panelStateScopeKey, next);
+        return next;
+      });
+    }
     setEpisodeDraft((prev) => {
       if (!prev) return prev;
       const currentPanelState = prev.drafts?.ui?.panelState || {};
-      if (currentPanelState[panelKey] === Boolean(isOpen)) return prev;
+      if (currentPanelState[panelKey] === nextOpen) return prev;
       return {
         ...prev,
         drafts: {
@@ -2113,7 +2211,7 @@ export default function App() {
             ...(prev.drafts?.ui || {}),
             panelState: {
               ...currentPanelState,
-              [panelKey]: Boolean(isOpen)
+              [panelKey]: nextOpen
             }
           }
         }
@@ -2912,6 +3010,42 @@ export default function App() {
     }
   }
 
+  async function clearLineMask(line) {
+    if (!activeEpisode || !line?.id) return;
+    const baseEpisode = episodeDraft?.id === activeEpisode.id ? episodeDraft : activeEpisode;
+    const productionMapEditedAt = new Date().toISOString();
+    const productionMap = (baseEpisode.productionMap || []).map((item) =>
+      item.id === line.id
+        ? {
+            ...item,
+            maskAssetId: "",
+            needsMask: false,
+            maskAutoApplyDisabled: false,
+            maskRefreshToken: createLocalId("mask-refresh"),
+            invertMask: false,
+            videoStatus: "pending",
+            videoTake: null,
+            videoTakes: []
+          }
+        : item
+    );
+    setBusy(true);
+    try {
+      const episode = await request(`/api/episodes/${activeEpisode.id}/production-map`, {
+        method: "PATCH",
+        body: JSON.stringify({ productionMap, productionMapEditedAt })
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus(`Mask cleared for line ${line.index}. Auto mask is ready to regenerate.`);
+      setMaskEditorLineId("");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function setApproval(gateId, nextStatus = "approved") {
     if (!activeEpisode) return;
     setBusy(true);
@@ -3295,7 +3429,12 @@ export default function App() {
     preRenderGates.length === preRenderApprovalIds.size &&
     preRenderGates.every((gate) => gate.status === "approved" || gate.status === "auto");
   const drafts = episodeDraft?.id === activeEpisode?.id ? episodeDraft?.drafts || {} : activeEpisode?.drafts || {};
-  const uiPanelState = drafts.ui?.panelState || {};
+  const storedPanelStateForScope =
+    storedPanelStateScopeKey === panelStateScopeKey ? storedPanelState : readStoredPanelState(panelStateScopeKey);
+  const uiPanelState = {
+    ...(drafts.ui?.panelState || {}),
+    ...storedPanelStateForScope
+  };
   const activeAutomation = showDraft?.automation || {};
   const socialConfig = showDraft?.platforms?.social || activeShow?.platforms?.social || {};
   const promotionTemplates = normalizePromotionTemplates(socialConfig.templates);
@@ -4095,6 +4234,8 @@ export default function App() {
               automation={activeAutomation}
               safety={safety}
               approvals={approvals}
+              open={savedPanelOpen(uiPanelState, "approvals.automationRunbook")}
+              onOpenChange={(isOpen) => updateEpisodePanelOpen("approvals.automationRunbook", isOpen)}
               onApprove={setApproval}
             />
             <FinalReviewPanel
@@ -4189,6 +4330,7 @@ export default function App() {
           busy={busy}
           onClose={() => setMaskEditorLineId("")}
           onSave={saveDrawnMask}
+          onClear={clearLineMask}
         />
       )}
     </div>
@@ -4387,7 +4529,7 @@ function visibleThumbnailCandidates(outputs = []) {
   return (aiOutputs.length ? aiOutputs : outputs).slice(0, 3);
 }
 
-function AutomationRunbookPanel({ automation = {}, safety = {}, approvals = [], onApprove }) {
+function AutomationRunbookPanel({ automation = {}, safety = {}, approvals = [], open = false, onOpenChange, onApprove }) {
   const autoStages = automationControls.filter((stage) => automation[stage.key]);
   const privateUploadActive = Boolean(automation.uploadYoutube);
   const approvalGates = (Array.isArray(approvals) ? approvals : []).filter((gate) =>
@@ -4395,7 +4537,11 @@ function AutomationRunbookPanel({ automation = {}, safety = {}, approvals = [], 
   );
 
   return (
-    <details className="reviewDetails automationRunbookPanel">
+    <details
+      className="reviewDetails automationRunbookPanel"
+      open={open}
+      onToggle={(event) => onOpenChange?.(event.currentTarget.open)}
+    >
       <summary>
         <span>Automation Runbook</span>
         <Pill tone={autoStages.length ? "good" : "neutral"}>{autoStages.length} auto</Pill>
@@ -4438,10 +4584,16 @@ function AutomationRunbookPanel({ automation = {}, safety = {}, approvals = [], 
   );
 }
 
-function RenderGenerationPanel({ manifestOutput, manifestEntry }) {
+function RenderGenerationPanel({ manifestOutput, manifestEntry, open = false, onOpenChange }) {
+  const detailsProps = {
+    className: "renderGenerationPanel",
+    open,
+    onToggle: (event) => onOpenChange?.(event.currentTarget.open)
+  };
+
   if (!manifestOutput) {
     return (
-      <details className="renderGenerationPanel">
+      <details {...detailsProps}>
         <summary className="renderGenerationSummary">
           <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
           <div className="renderGenerationTitle">
@@ -4457,7 +4609,7 @@ function RenderGenerationPanel({ manifestOutput, manifestEntry }) {
 
   if (!manifestEntry || manifestEntry.status === "loading") {
     return (
-      <details className="renderGenerationPanel">
+      <details {...detailsProps}>
         <summary className="renderGenerationSummary">
           <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
           <div className="renderGenerationTitle">
@@ -4472,7 +4624,7 @@ function RenderGenerationPanel({ manifestOutput, manifestEntry }) {
 
   if (manifestEntry.status === "error") {
     return (
-      <details className="renderGenerationPanel">
+      <details {...detailsProps}>
         <summary className="renderGenerationSummary">
           <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
           <div className="renderGenerationTitle">
@@ -4490,7 +4642,7 @@ function RenderGenerationPanel({ manifestOutput, manifestEntry }) {
   if (!summary) return null;
 
   return (
-    <details className="renderGenerationPanel">
+    <details {...detailsProps}>
       <summary className="renderGenerationSummary">
         <ChevronRight className="renderGenerationChevron" size={17} aria-hidden="true" />
         <div className="renderGenerationTitle">
@@ -5034,6 +5186,8 @@ function FinalReviewPanel({
               <RenderGenerationPanel
                 manifestOutput={selectedReviewManifestOutput}
                 manifestEntry={selectedReviewManifestEntry}
+                open={savedPanelOpen(panelState, "approvals.renderGeneration")}
+                onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.renderGeneration", isOpen)}
               />
             ) : null}
           </div>
@@ -5052,8 +5206,10 @@ function FinalReviewPanel({
         baseFinalOutput={baseFinalOutput}
         finishedMasterOutput={finishedMasterOutput}
         layers={drafts.finishingLayers || []}
+        panelState={panelState}
         open={savedPanelOpen(panelState, "approvals.finishingLayers")}
         onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.finishingLayers", isOpen)}
+        onPanelOpenChange={onPanelOpenChange}
         busy={busy}
         busyAction={busyAction}
         integrations={integrations}
@@ -5143,8 +5299,10 @@ function FinalReviewPanel({
         youtubeDraft={drafts.youtube || {}}
         episodeTitle={episodeTitle}
         episodeDescription={episodeDescription}
+        panelState={panelState}
         open={savedPanelOpen(panelState, "approvals.youtubePublish")}
         onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.youtubePublish", isOpen)}
+        onPanelOpenChange={onPanelOpenChange}
         socialConfig={socialConfig}
         ready={packageReady}
         busy={busy}
@@ -5255,8 +5413,10 @@ function FinishingLayersPanel({
   baseFinalOutput,
   finishedMasterOutput,
   layers = [],
+  panelState = {},
   open = false,
   onOpenChange,
+  onPanelOpenChange,
   busy,
   busyAction,
   integrations = {},
@@ -6076,7 +6236,11 @@ function FinishingLayersPanel({
           <div className="emptyState compact">Render Final before adding finishing layers.</div>
         )}
 
-        <details className="finishingAudioLayerSection">
+        <details
+          className="finishingAudioLayerSection"
+          open={savedPanelOpen(panelState, "approvals.audioLayers")}
+          onToggle={(event) => onPanelOpenChange?.("approvals.audioLayers", event.currentTarget.open)}
+        >
           <summary>
             <span>Audio Layers</span>
             <Pill tone={audioLayerCount ? "neutral" : "warn"}>
@@ -6790,8 +6954,10 @@ function FinalPackagePanel({
   youtubeDraft,
   episodeTitle = "",
   episodeDescription = "",
+  panelState = {},
   open = false,
   onOpenChange,
+  onPanelOpenChange,
   socialConfig = {},
   ready,
   busy,
@@ -7208,6 +7374,8 @@ function FinalPackagePanel({
 
         <LaunchReadinessPanel
           readiness={launchReadiness}
+          open={savedPanelOpen(panelState, "approvals.launchReadiness")}
+          onOpenChange={(isOpen) => onPanelOpenChange?.("approvals.launchReadiness", isOpen)}
           busy={busy}
           busyAction={busyAction}
           onCheck={onCheckLaunchReadiness}
@@ -7367,7 +7535,11 @@ function FinalPackagePanel({
           </div>
         </div>
 
-        <details className="advancedYoutubeActions youtubePromotionPanel">
+        <details
+          className="advancedYoutubeActions youtubePromotionPanel"
+          open={savedPanelOpen(panelState, "approvals.youtubePromotion")}
+          onToggle={(event) => onPanelOpenChange?.("approvals.youtubePromotion", event.currentTarget.open)}
+        >
           <summary>
             <span>Promotion Prep</span>
             <Pill tone={promotionReady ? "good" : "neutral"}>{promotionReady ? "drafted" : "YouTube only"}</Pill>
@@ -7508,7 +7680,11 @@ function FinalPackagePanel({
           ) : null}
         </div>
 
-        <details className="advancedYoutubeActions">
+        <details
+          className="advancedYoutubeActions"
+          open={savedPanelOpen(panelState, "approvals.youtubeAdvanced")}
+          onToggle={(event) => onPanelOpenChange?.("approvals.youtubeAdvanced", event.currentTarget.open)}
+        >
           <summary>Advanced & files</summary>
           <div className="packageActions">
             <button className="secondaryButton" onClick={exportPackage} disabled={!ready || busy}>
@@ -7558,7 +7734,7 @@ function FinalPackagePanel({
   );
 }
 
-function LaunchReadinessPanel({ readiness, busy, busyAction, onCheck }) {
+function LaunchReadinessPanel({ readiness, open = false, onOpenChange, busy, busyAction, onCheck }) {
   const checkBusy = busyAction === "launch-readiness";
   const tone = readiness?.ready ? "good" : readiness ? "danger" : "neutral";
   const label = readiness?.ready ? "ready" : readiness ? "blocked" : "unchecked";
@@ -7585,7 +7761,11 @@ function LaunchReadinessPanel({ readiness, busy, busyAction, onCheck }) {
       </div>
 
       {readiness?.checks?.length ? (
-        <details className="launchReadinessDetails">
+        <details
+          className="launchReadinessDetails"
+          open={open}
+          onToggle={(event) => onOpenChange?.(event.currentTarget.open)}
+        >
           <summary>
             <span>QA checks</span>
             <Pill tone={readiness.ready ? "good" : "danger"}>
@@ -8090,7 +8270,8 @@ function ProductionLineRow({
     : `Use show default (${lipSyncModelLabel(inheritedLipSyncModel)})`;
   const insertUploadMode = isInsert && line.insertVideoMode === "upload";
   const showScriptEditor = !insertUploadMode;
-  const maskExpected = !isInsert && lineExpectsSpeakerMask(line, selectedAsset);
+  const maskExpected = !isInsert && !line.maskAutoApplyDisabled && lineExpectsSpeakerMask(line, selectedAsset);
+  const maskHint = !isInsert && !line.maskAutoApplyDisabled && selectedAsset ? speakerMaskSuggestionHint(line, selectedAsset) : "";
   const hasMask = Boolean(line.maskAssetId);
   const hasLineAudio = Boolean(line.audioTake?.localUrl);
   const hasLineVideo = Boolean(line.videoTake?.localUrl || line.videoTake?.proxyLocalUrl);
@@ -8264,11 +8445,14 @@ function ProductionLineRow({
             <Field label="Image">
               <select
                 value={line.assetId || ""}
-                onChange={(event) =>
+                onChange={(event) => {
+                  const assetId = event.target.value;
                   onUpdate(line.id, {
-                    assetId: event.target.value,
+                    assetId,
+                    assetAutoAssignDisabled: !assetId,
                     needsMask: false,
                     maskAssetId: "",
+                    maskAutoApplyDisabled: false,
                     invertMask: false,
                     lipSyncPromptOverride: "",
                     lipSyncInputPromptOverride: "",
@@ -8276,8 +8460,8 @@ function ProductionLineRow({
                     animationStrengthOverride: null,
                     videoStatus: "pending",
                     videoTake: null
-                  })
-                }
+                  });
+                }}
               >
                 <option value="">Choose image...</option>
                 {assetsForLine(line).map((asset) => (
@@ -8379,6 +8563,7 @@ function ProductionLineRow({
               format={format}
               hasMask={hasMask}
               maskNeeded={maskExpected && !hasMask}
+              maskHint={maskHint}
               busy={busy}
               onOpen={() => onOpenMaskEditor(line.id)}
             />
@@ -8450,7 +8635,7 @@ function ProductionLineRow({
   );
 }
 
-function ShotMaskCard({ imageAsset, maskAsset, format, hasMask, maskNeeded, busy, onOpen }) {
+function ShotMaskCard({ imageAsset, maskAsset, format, hasMask, maskNeeded, maskHint, busy, onOpen }) {
   const previewStyle = mediaAspectStyle(imageAsset) || mediaAspectStyle(format);
 
   return (
@@ -8468,17 +8653,20 @@ function ShotMaskCard({ imageAsset, maskAsset, format, hasMask, maskNeeded, busy
         <Pencil size={15} />
         {maskAsset ? "Edit Mask" : maskNeeded ? "Create Mask" : "Add Mask"}
       </button>
+      {!hasMask && maskHint ? <div className="maskSuggestionHint">{maskHint}</div> : null}
     </div>
   );
 }
 
-function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave }) {
+function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave, onClear }) {
   const canvasRef = useRef(null);
   const lastPointRef = useRef(null);
+  const dirtyRef = useRef(false);
   const [tool, setTool] = useState("brush");
   const [brushSize, setBrushSize] = useState(150);
   const [canvasReady, setCanvasReady] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
+  const [closeBusy, setCloseBusy] = useState(false);
   const canSuggestMask = canSuggestSpeakerMask(line, imageAsset);
   const suggestionHint = speakerMaskSuggestionHint(line, imageAsset);
 
@@ -8499,6 +8687,7 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
       } else {
         paintSuggestedSpeakerMask(canvas, { line, imageAsset });
       }
+      dirtyRef.current = false;
       if (!cancelled) setCanvasReady(true);
     };
     image.src = imageAsset.localUrl;
@@ -8514,6 +8703,7 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
     event.currentTarget.setPointerCapture?.(event.pointerId);
     const point = canvasPoint(event);
     lastPointRef.current = point;
+    dirtyRef.current = true;
     setIsDrawing(true);
     paintStroke(point, point);
   }
@@ -8568,7 +8758,10 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
 
   function clearMask() {
     const canvas = canvasRef.current;
-    if (canvas) clearCanvas(canvas);
+    if (canvas) {
+      clearCanvas(canvas);
+      dirtyRef.current = true;
+    }
   }
 
   function suggestMask() {
@@ -8577,12 +8770,37 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
     if (!suggestedSpeakerMaskRegion(canvas, { line, imageAsset })) return;
     clearCanvas(canvas);
     paintSuggestedSpeakerMask(canvas, { line, imageAsset });
+    dirtyRef.current = true;
   }
 
   function saveMask() {
     const canvas = canvasRef.current;
     if (!canvas || !canvasReady) return;
+    if (!canvasHasMaskPixels(canvas)) {
+      onClear?.(line);
+      return;
+    }
+    dirtyRef.current = false;
     onSave(line, exportMaskPng(canvas));
+  }
+
+  async function closeEditor() {
+    const canvas = canvasRef.current;
+    if (!dirtyRef.current || !canvas || !canvasReady) {
+      onClose?.();
+      return;
+    }
+    setCloseBusy(true);
+    try {
+      if (!canvasHasMaskPixels(canvas)) {
+        await onClear?.(line);
+        return;
+      }
+      dirtyRef.current = false;
+      await onSave?.(line, exportMaskPng(canvas));
+    } finally {
+      setCloseBusy(false);
+    }
   }
 
   return (
@@ -8595,7 +8813,7 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
               #{line.index} {line.speaker || "Speaker"}
             </h3>
           </div>
-          <button type="button" className="quietButton iconOnly" onClick={onClose} disabled={busy}>
+          <button type="button" className="quietButton iconOnly" onClick={closeEditor} disabled={busy || closeBusy}>
             <X size={18} />
           </button>
         </div>
@@ -8634,7 +8852,7 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
               onChange={(event) => setBrushSize(Number(event.target.value))}
             />
           </label>
-          <button type="button" className="quietButton" onClick={clearMask} disabled={busy || !canvasReady}>
+          <button type="button" className="quietButton" onClick={clearMask} disabled={busy || closeBusy || !canvasReady}>
             <Trash2 size={15} />
             Clear
           </button>
@@ -8642,13 +8860,13 @@ function MaskEditorModal({ line, imageAsset, maskAsset, busy, onClose, onSave })
             type="button"
             className="quietButton"
             onClick={suggestMask}
-            disabled={busy || !canvasReady || !canSuggestMask}
+            disabled={busy || closeBusy || !canvasReady || !canSuggestMask}
             title={canSuggestMask ? "Suggest a speaker matte from the shot asset tags" : "Suggested masks need a grouped MS/WS shot asset with two or more speaking tags"}
           >
             <WandSparkles size={15} />
             Suggest
           </button>
-          <button type="button" className="primaryButton" onClick={saveMask} disabled={busy || !canvasReady}>
+          <button type="button" className="primaryButton" onClick={saveMask} disabled={busy || closeBusy || !canvasReady}>
             <Save size={16} />
             Create Mask
           </button>
@@ -8797,11 +9015,11 @@ function speakerMaskSuggestionHint(line, imageAsset) {
   if (!["medium_two_shot", "wide_shot"].includes(shotRole)) return "";
   const roles = binding.roles || [];
   if (roles.length < 2) {
-    return "Auto-suggest needs an MS/WS shot asset with two or more speaking tags.";
+    return "Auto-mask needs an MS/WS shot asset with two or more speaking tags.";
   }
   const speakerRole = targetSpeakerMaskRole(line, imageAsset);
   if (!roles.includes(speakerRole)) {
-    return `Auto-suggest could not find ${speakerRole} in this shot asset's speaking tags.`;
+    return `Auto-mask could not find @${speakerRole} in this shot asset's speaking tags.`;
   }
   return "";
 }
@@ -8861,6 +9079,15 @@ function exportMaskPng(sourceCanvas) {
   }
   outputCtx.putImageData(output, 0, 0);
   return outputCanvas.toDataURL("image/png");
+}
+
+function canvasHasMaskPixels(canvas) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  for (let index = 3; index < data.length; index += 4) {
+    if (data[index] > 8) return true;
+  }
+  return false;
 }
 
 function LineInsertVideoReview({
@@ -9561,6 +9788,9 @@ function applyStoredSpeakerMasksToLines(lines = [], assets = []) {
     if (!canUseMask) {
       return { ...line, needsMask: false, maskAssetId: "", invertMask: false };
     }
+    if (line.maskAutoApplyDisabled) {
+      return { ...line, needsMask: false, maskAssetId: "", invertMask: false };
+    }
 
     const existingMask = maskById.get(line.maskAssetId);
     const matchingMask = speakerMaskMatchesLine(existingMask, line)
@@ -9590,9 +9820,12 @@ function lineExpectsSpeakerMask(line, asset) {
 
 function speakerMaskMatchesLine(maskAsset, line) {
   if (!maskAsset || !line) return false;
+  const lineRefreshToken = String(line.maskRefreshToken || "").trim();
+  const assetRefreshToken = String(maskAsset.metadata?.maskRefreshToken || "").trim();
   return (
     String(maskAsset.metadata?.sourceImageAssetId || "") === String(line.assetId || "") &&
-    String(maskAsset.metadata?.speakerMaskKey || "") === speakerMaskReuseKey(line)
+    String(maskAsset.metadata?.speakerMaskKey || "") === speakerMaskReuseKey(line) &&
+    (lineRefreshToken ? assetRefreshToken === lineRefreshToken : !assetRefreshToken)
   );
 }
 
@@ -9651,8 +9884,8 @@ function normalizeSpeakingTag(value) {
         .split(/[,\s]+/)
         .map((part) => part.trim().replace(/^@/, ""))
         .filter(Boolean);
-  const first = fallback[0] || "";
-  return first ? `@${first.slice(0, 48)}` : "";
+  const roles = [...new Set(fallback.map((tag) => speakerMaskRole(tag)).filter(Boolean))].slice(0, 8);
+  return roles.map((role) => `@${role.toLowerCase().slice(0, 48)}`).join(" ");
 }
 
 function shotRolePrefixForRole(role) {

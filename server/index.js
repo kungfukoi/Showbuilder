@@ -31,7 +31,10 @@ const jobsPath = path.join(dataDir, "jobs.json");
 const voicesPath = path.join(dataDir, "voices-cache.json");
 const youtubeAuthPath = path.join(dataDir, "youtube-oauth.json");
 const port = Number(process.env.PORT || 3334);
-const execFileAsync = promisify(execFile);
+const execFileRawAsync = promisify(execFile);
+function execFileAsync(command, args = [], options = {}) {
+  return execFileRawAsync(command, args, { windowsHide: true, ...options });
+}
 const publishingEnabled = String(process.env.NEWTBUILDER_ENABLE_PUBLISHING || "").toLowerCase() === "true";
 const configuredShortsThumbnailFrameSeconds = Number(process.env.YOUTUBE_SHORTS_THUMBNAIL_SECONDS || 0.75);
 const shortsThumbnailFrameSeconds = Number.isFinite(configuredShortsThumbnailFrameSeconds)
@@ -52,6 +55,15 @@ const youtubeReadScope = "https://www.googleapis.com/auth/youtube.readonly";
 const youtubeOAuthStates = new Map();
 let comfyUiAutoStartPromise = null;
 const comfyUiProgressEntries = new Map();
+const ffmpegPath = resolveMediaToolCommand("FFMPEG_PATH", "ffmpeg", [
+  path.join(rootDir, "node_modules", "ffmpeg-static", process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg"),
+  "C:/dev/tools/ffmpeg-8.1.1-essentials_build/bin/ffmpeg.exe",
+  "C:/dev/Newt_Node/node_modules/ffmpeg-static/ffmpeg.exe"
+]);
+const ffprobePath = resolveMediaToolCommand("FFPROBE_PATH", "ffprobe", [
+  "C:/dev/tools/ffmpeg-8.1.1-essentials_build/bin/ffprobe.exe",
+  path.join(path.dirname(ffmpegPath), process.platform === "win32" ? "ffprobe.exe" : "ffprobe")
+]);
 
 const app = express();
 
@@ -450,15 +462,15 @@ app.delete("/api/shows/:id", async (req, res) => {
 
   const episodes = await readEpisodes();
   const deletedEpisodes = episodes.filter((episode) => episode.showId === current.id);
+  const nextEpisodes = episodes.filter((episode) => episode.showId !== current.id);
   for (const episode of deletedEpisodes) {
     for (const asset of episode.assets || []) {
-      await deleteStoredUpload(asset.storedFileName);
+      await deleteStoredUploadIfUnreferenced(asset.storedFileName, nextEpisodes);
     }
   }
 
   const nextShows = shows.filter((show) => show.id !== current.id);
   const safeShows = nextShows.length ? nextShows : [defaultShow()];
-  const nextEpisodes = episodes.filter((episode) => episode.showId !== current.id);
   await writeShows(safeShows);
   await writeEpisodes(nextEpisodes);
   res.json({
@@ -553,7 +565,7 @@ app.post("/api/episodes/:id/duplicate", async (req, res) => {
   }
 
   const show = shows.find((item) => item.id === current.showId) || shows[0];
-  const duplicate = duplicateEpisodeForNextScript({
+  const duplicate = await duplicateEpisodeForNextScript({
     episode: current,
     show,
     episodes: episodes.filter((item) => item.showId === current.showId),
@@ -900,8 +912,6 @@ app.delete("/api/episodes/:id/assets/:assetId", async (req, res) => {
     return res.status(404).json({ error: "Asset not found." });
   }
 
-  await deleteStoredUpload(asset.storedFileName);
-
   const updated = normalizeEpisode({
     ...current,
     approvals: resetRenderApproval(current.approvals, "Episode asset changed after render review."),
@@ -910,7 +920,9 @@ app.delete("/api/episodes/:id/assets/:assetId", async (req, res) => {
     jobLog: appendLog(current.jobLog, `Deleted asset: ${asset.fileName}`),
     updatedAt: new Date().toISOString()
   });
-  await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+  const nextEpisodes = [updated, ...episodes.filter((item) => item.id !== updated.id)];
+  await deleteStoredUploadIfUnreferenced(asset.storedFileName, nextEpisodes);
+  await writeEpisodes(nextEpisodes);
   res.json(updated);
 });
 
@@ -1354,7 +1366,12 @@ app.post("/api/episodes/:id/dialogue-lines/:lineId/generate-video", async (req, 
   const nextMap = (current.productionMap || []).map((line, index) =>
     normalizeProductionLine(index === lineIndex ? { ...line, ...requestedLine, id: req.params.lineId } : line, index)
   );
-  const line = nextMap[lineIndex];
+  let generationEpisode = normalizeEpisode({
+    ...current,
+    productionMap: nextMap
+  });
+  let generationMap = nextMap;
+  let line = nextMap[lineIndex];
   if (line.lineType === "insert") {
     return res.status(400).json({ error: "Insert lines use the insert video generator instead." });
   }
@@ -1364,12 +1381,13 @@ app.post("/api/episodes/:id/dialogue-lines/:lineId/generate-video", async (req, 
 
   try {
     await mkdir(tempDir, { recursive: true });
+    generationEpisode = await ensureAutomaticSpeakerMasksForEpisode(generationEpisode, show);
+    generationMap = generationEpisode.productionMap || nextMap;
+    line = generationMap[lineIndex] || line;
+
     const manifest = buildRenderManifest({
       previewId: `dialogue-video-${runId}`,
-      episode: {
-        ...current,
-        productionMap: nextMap
-      },
+      episode: generationEpisode,
       show,
       createdAt: new Date().toISOString()
     });
@@ -1403,26 +1421,26 @@ app.post("/api/episodes/:id/dialogue-lines/:lineId/generate-video", async (req, 
       const providerConfig = lipSyncProviderConfig(provider, { line: manifestLine, manifest });
       const message = `${providerConfig.label} is not configured for line ${line.index}. ${lipSyncProviderUnavailableMessage(provider, manifestLine, manifest)}`;
       const updated = normalizeEpisode({
-        ...current,
-        productionMap: nextMap.map((item, index) =>
+        ...generationEpisode,
+        productionMap: generationMap.map((item, index) =>
           index === lineIndex
             ? normalizeProductionLine({ ...item, videoStatus: "failed", videoError: message }, index)
             : normalizeProductionLine(item, index)
         ),
-        jobLog: appendLog(current.jobLog, `Shot video not started for line ${line.index}: ${message}`),
+        jobLog: appendLog(generationEpisode.jobLog, `Shot video not started for line ${line.index}: ${message}`),
         updatedAt: new Date().toISOString()
       });
       await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
       return res.status(409).json({ error: message, episode: updated, line: updated.productionMap[lineIndex] });
     }
 
-    await renderLipSyncClipsForManifest({ episode: current, manifest, tempDir, forceRegenerate: true });
+    await renderLipSyncClipsForManifest({ episode: generationEpisode, manifest, tempDir, forceRegenerate: true });
     const videoTake = normalizeVideoTake(manifestLine.lipSyncTake || manifestLine.videoTake);
     if (!videoTake?.localUrl) {
       throw new Error(`Line ${line.index} did not produce a shot video.`);
     }
 
-    const productionMap = nextMap.map((item, index) =>
+    const productionMap = generationMap.map((item, index) =>
       index === lineIndex
         ? normalizeProductionLine(
             {
@@ -1439,17 +1457,17 @@ app.post("/api/episodes/:id/dialogue-lines/:lineId/generate-video", async (req, 
         : normalizeProductionLine(item, index)
     );
     const updated = normalizeEpisode({
-      ...current,
-      approvals: resetRenderApproval(current.approvals, `Line ${line.index} shot video changed after render review.`),
+      ...generationEpisode,
+      approvals: resetRenderApproval(generationEpisode.approvals, `Line ${line.index} shot video changed after render review.`),
       productionMap,
-      jobLog: appendLog(current.jobLog, `Shot video generated for line ${line.index}.`),
+      jobLog: appendLog(generationEpisode.jobLog, `Shot video generated for line ${line.index}.`),
       updatedAt: new Date().toISOString()
     });
     await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
     res.json({ episode: updated, line: updated.productionMap[lineIndex] });
   } catch (error) {
     const message = cleanErrorMessage(error);
-    const productionMap = nextMap.map((item, index) =>
+    const productionMap = generationMap.map((item, index) =>
       index === lineIndex
         ? normalizeProductionLine(
             {
@@ -1464,10 +1482,10 @@ app.post("/api/episodes/:id/dialogue-lines/:lineId/generate-video", async (req, 
         : normalizeProductionLine(item, index)
     );
     const updated = normalizeEpisode({
-      ...current,
-      approvals: resetRenderApproval(current.approvals, `Line ${line.index} shot video failed after render review.`),
+      ...generationEpisode,
+      approvals: resetRenderApproval(generationEpisode.approvals, `Line ${line.index} shot video failed after render review.`),
       productionMap,
-      jobLog: appendLog(current.jobLog, `Shot video failed for line ${line.index}: ${message}`),
+      jobLog: appendLog(generationEpisode.jobLog, `Shot video failed for line ${line.index}: ${message}`),
       updatedAt: new Date().toISOString()
     });
     await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
@@ -2598,7 +2616,7 @@ foreach ($id in $ids) {
   }
 }
 `;
-    await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    await execFileAsync(powershellCommand(), ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
       windowsHide: true,
       timeout: 30000
     });
@@ -2636,7 +2654,7 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
 }
 exit 2
 `;
-  return runFolderDialogCommand("powershell.exe", ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script]);
+  return runFolderDialogCommand(powershellCommand(), ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script]);
 }
 
 async function selectFolderWithMacDialog({ title, defaultPath }) {
@@ -2684,9 +2702,41 @@ function existingDirectoryPath(value) {
   return existsSync(resolved) ? resolved : "";
 }
 
+function powershellCommand() {
+  if (process.platform !== "win32") return "pwsh";
+  const configured = String(process.env.POWERSHELL_PATH || "").trim();
+  if (configured) return configured;
+  const candidates = [
+    "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+    "C:/Windows/Sysnative/WindowsPowerShell/v1.0/powershell.exe",
+    "powershell.exe"
+  ];
+  return candidates.find((candidate) => candidate === "powershell.exe" || existsSync(candidate)) || "powershell.exe";
+}
+
+function resolveMediaToolCommand(envKey, commandName, candidates = []) {
+  const configured = String(process.env[envKey] || "").trim();
+  if (configured) return configured;
+  const selected = candidates.find((candidate) => {
+    const text = String(candidate || "").trim();
+    return text && existsSync(path.resolve(text));
+  });
+  return selected || commandName;
+}
+
 function powershellStringLiteral(value) {
   return `'${String(value || "").replace(/'/g, "''")}'`;
 }
+
+app.use((error, _req, res, next) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+  const status = Number(error?.status || error?.statusCode || 500);
+  const message = cleanErrorMessage(error) || "NewtBuilder backend error.";
+  res.status(status >= 400 && status < 600 ? status : 500).json({ error: message });
+});
 
 globalThis.newtBuilderApiServer = http.createServer(app).listen(port, "127.0.0.1", () => {
   console.log(`NewtBuilder API listening on http://127.0.0.1:${port}`);
@@ -2766,13 +2816,67 @@ function parseJsonObject(value) {
 }
 
 async function deleteStoredUpload(storedFileName) {
-  const safeName = path.basename(String(storedFileName || ""));
-  if (!safeName) return;
+  const filePath = uploadPathForStoredFileName(storedFileName);
+  if (!filePath) return;
+  await rm(filePath, { force: true });
+}
 
+async function deleteStoredUploadIfUnreferenced(storedFileName, episodes = []) {
+  if (!uploadFileNameFromStored(storedFileName)) return;
+  if (storedUploadReferencedByEpisodes(storedFileName, episodes)) return;
+  await deleteStoredUpload(storedFileName);
+}
+
+function uploadPathForStoredFileName(storedFileName) {
+  const safeName = uploadFileNameFromStored(storedFileName);
+  if (!safeName) return "";
   const uploadsRoot = path.resolve(uploadsDir);
   const filePath = path.resolve(uploadsRoot, safeName);
-  if (!filePath.startsWith(`${uploadsRoot}${path.sep}`)) return;
-  await rm(filePath, { force: true });
+  return filePath.startsWith(`${uploadsRoot}${path.sep}`) ? filePath : "";
+}
+
+function uploadFileNameFromStored(storedFileName) {
+  return path.basename(String(storedFileName || "").trim());
+}
+
+function uploadFileNameFromAsset(asset = {}) {
+  const storedName = uploadFileNameFromStored(asset.storedFileName);
+  if (storedName) return storedName;
+  const localUrl = String(asset.localUrl || "").trim();
+  return localUrl.startsWith("/uploads/") ? path.basename(localUrl) : "";
+}
+
+function storedUploadReferencedByEpisodes(storedFileName, episodes = []) {
+  const targetName = uploadFileNameFromStored(storedFileName);
+  if (!targetName) return false;
+  return (Array.isArray(episodes) ? episodes : []).some((episode) =>
+    (episode.assets || []).some((asset) => uploadFileNameFromAsset(asset) === targetName)
+  );
+}
+
+async function cloneStoredUploadForDuplicate(asset = {}) {
+  const sourcePath = uploadPathForStoredFileName(asset.storedFileName) || localProjectFilePath(asset.localUrl);
+  if (!sourcePath || !existsSync(sourcePath)) return {};
+
+  const extension = path.extname(asset.fileName || asset.storedFileName || sourcePath) || ".bin";
+  const basename =
+    path
+      .basename(asset.fileName || asset.storedFileName || "asset", path.extname(asset.fileName || asset.storedFileName || ""))
+      .replace(/[^a-z0-9_-]+/gi, "-")
+      .slice(0, 80) || "asset";
+
+  for (let guard = 0; guard < 20; guard += 1) {
+    const storedFileName = `${Date.now()}-${Math.round(Math.random() * 1e9)}-${basename}${extension}`;
+    const targetPath = uploadPathForStoredFileName(storedFileName);
+    if (!targetPath || existsSync(targetPath)) continue;
+    await copyFile(sourcePath, targetPath);
+    return {
+      storedFileName,
+      localUrl: `/uploads/${storedFileName}`
+    };
+  }
+
+  return {};
 }
 
 function clearAssetFromProductionMap(productionMap = [], assetId) {
@@ -2807,6 +2911,8 @@ function applySpeakerMaskToMatchingLines(productionMap = [], targetLine, maskAss
         ...line,
         needsMask: true,
         maskAssetId,
+        maskAutoApplyDisabled: false,
+        maskRefreshToken: String(targetLine.maskRefreshToken || line.maskRefreshToken || "").trim(),
         invertMask: false
       },
       index
@@ -2851,9 +2957,12 @@ function speakerMaskMatchesLine(maskAsset, line) {
   ) {
     return false;
   }
+  const lineRefreshToken = String(line.maskRefreshToken || "").trim();
+  const assetRefreshToken = String(maskAsset.metadata?.maskRefreshToken || "").trim();
   return (
     cleanId(maskAsset.metadata?.sourceImageAssetId) === cleanId(line.assetId) &&
-    String(maskAsset.metadata?.speakerMaskKey || "") === speakerMaskReuseKey(line)
+    String(maskAsset.metadata?.speakerMaskKey || "") === speakerMaskReuseKey(line) &&
+    (lineRefreshToken ? assetRefreshToken === lineRefreshToken : !assetRefreshToken)
   );
 }
 
@@ -2868,6 +2977,7 @@ async function ensureAutomaticSpeakerMasksForEpisode(episode, show = null) {
   for (const line of productionMap) {
     const assetById = new Map(assets.map((asset) => [asset.id, asset]));
     const imageAsset = assetById.get(line.assetId);
+    if (line.maskAutoApplyDisabled) continue;
     if (!lineExpectsSpeakerMask(line, imageAsset)) continue;
 
     const selectedMask = assetById.get(line.maskAssetId);
@@ -3119,19 +3229,21 @@ function propagateShowFormatToEpisodes(episodes = [], show = {}) {
   return { episodes: propagatedEpisodes, changedCount };
 }
 
-function duplicateEpisodeForNextScript({ episode, show, episodes = [], title = "", sortOrder = null }) {
+async function duplicateEpisodeForNextScript({ episode, show, episodes = [], title = "", sortOrder = null }) {
   const source = normalizeEpisode(episode);
   const now = new Date().toISOString();
   const reusableAssets = source.assets.filter((asset) => asset.type !== "script");
   const assetIdMap = new Map(reusableAssets.map((asset) => [asset.id, randomUUID()]));
-  const assets = reusableAssets.map((asset) =>
-    normalizeAsset({
+  const assets = await Promise.all(reusableAssets.map(async (asset) => {
+    const clonedUpload = await cloneStoredUploadForDuplicate(asset);
+    return normalizeAsset({
       ...asset,
+      ...clonedUpload,
       id: assetIdMap.get(asset.id) || randomUUID(),
       metadata: remapDuplicateAssetMetadata(asset.metadata, assetIdMap),
       createdAt: now
-    })
-  );
+    });
+  }));
   const automation = {
     ...automationDefaults,
     ...source.automation
@@ -3387,16 +3499,18 @@ function createProductionMap({ scriptText, show, format = show?.shortFormat, ass
       activeCastRoles: [...activeCastRoles],
       previousSpeakerType: previousDialogueSpeakerType
     });
-    const assetId =
-      previous?.assetId ||
-      bestAssetForProductionLine({
-        assets,
-        character,
-        speaker: line.speaker,
-        shotRole,
-        speakerType,
-        desiredRoles
-      });
+    const assetId = previous?.assetId
+      ? previous.assetId
+      : previous?.assetAutoAssignDisabled
+        ? ""
+        : bestAssetForProductionLine({
+            assets,
+            character,
+            speaker: line.speaker,
+            shotRole,
+            speakerType,
+            desiredRoles
+          });
     const canReusePreviousMask = !isInsert && previous?.assetId && previous.assetId === assetId;
     const maskAssetId = canReusePreviousMask ? previous.maskAssetId : "";
     const needsMask = Boolean(maskAssetId);
@@ -3417,7 +3531,10 @@ function createProductionMap({ scriptText, show, format = show?.shortFormat, ass
         animationStrengthOverride: previous?.animationStrengthOverride ?? null,
         shotRole,
         assetId,
+        assetAutoAssignDisabled: !assetId && Boolean(previous?.assetAutoAssignDisabled),
         maskAssetId,
+        maskAutoApplyDisabled: Boolean(previous?.maskAutoApplyDisabled),
+        maskRefreshToken: String(previous?.maskRefreshToken || "").trim(),
         needsMask,
         invertMask: false,
         notes: previous?.notes || "",
@@ -3611,7 +3728,10 @@ function normalizeProductionLine(line, index = 0) {
     animationStrengthOverride: normalizeOptionalAnimationStrength(line.animationStrengthOverride),
     shotRole: sanitizeShotRole(line.shotRole || "character_one_shot"),
     assetId: cleanId(line.assetId),
+    assetAutoAssignDisabled: Boolean(line.assetAutoAssignDisabled),
     maskAssetId,
+    maskAutoApplyDisabled: Boolean(line.maskAutoApplyDisabled),
+    maskRefreshToken: compactText(String(line.maskRefreshToken || "").trim(), 80),
     needsMask: Boolean(line.needsMask || maskAssetId),
     invertMask: Boolean(line.invertMask),
     audioStatus: sanitizeAudioStatus(line.audioStatus),
@@ -3703,6 +3823,9 @@ function applyStoredSpeakerMasks(productionMap = [], assets = []) {
     const canUseMask = lineCanUseSpeakerMask(normalized, imageAsset);
     const expectsMask = lineExpectsSpeakerMask(normalized, imageAsset);
     if (!canUseMask) {
+      return normalizeProductionLine({ ...normalized, needsMask: false, maskAssetId: "", invertMask: false }, index);
+    }
+    if (normalized.maskAutoApplyDisabled) {
       return normalizeProductionLine({ ...normalized, needsMask: false, maskAssetId: "", invertMask: false }, index);
     }
 
@@ -3969,7 +4092,7 @@ function shotRolePrefixForRole(role) {
 }
 
 function assetSpeakingRoles(asset) {
-  return parseCharacterTagRoles(asset?.metadata?.speakingTag || asset?.metadata?.characterTags).slice(0, 1);
+  return parseCharacterTagRoles(asset?.metadata?.speakingTag || asset?.metadata?.characterTags);
 }
 
 function parseCharacterTagRoles(value) {
@@ -3992,8 +4115,10 @@ function sanitizeSpeakingTag(value) {
         .split(/[,\s]+/)
         .map((part) => part.trim().replace(/^@/, ""))
         .filter(Boolean);
-  const first = fallback[0] || "";
-  return first ? `@${first.slice(0, 48)}` : "";
+  return uniqueRoleList(fallback)
+    .slice(0, 8)
+    .map((role) => `@${role.slice(0, 48)}`)
+    .join(" ");
 }
 
 function shotFilenameBinding(fileName) {
@@ -4546,7 +4671,14 @@ function preRenderBlockedGate(approvals = []) {
 
 async function createLocalPreview({ previewId, episode, show, reuseOnly = false, renderVideo = true }) {
   const createdAt = new Date().toISOString();
-  const manifest = buildRenderManifest({ previewId, episode, show, createdAt });
+  const manifest = buildRenderManifest({
+    previewId,
+    episode,
+    show,
+    createdAt,
+    reuseExistingVideoTakes: true,
+    preferLatestVideoTakes: true
+  });
   const audioDir = path.join(outputsDir, "audio", previewId);
   const manifestDir = path.join(outputsDir, "render-manifests");
   const tempDir = path.join(outputsDir, "tmp", previewId);
@@ -4789,7 +4921,7 @@ async function createFinalRender({ episode, show, regenerateVideos = true }) {
   };
 }
 
-function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistingVideoTakes = false }) {
+function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistingVideoTakes = false, preferLatestVideoTakes = false }) {
   const format = normalizeShortFormat({
     ...(show?.shortFormat || {}),
     ...(episode.format || {})
@@ -4816,7 +4948,8 @@ function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistin
     const videoTake = reusableVideoTakeForLine(normalized, imageAsset, endImageAsset, format, maskAsset, {
       show,
       character,
-      reuseExistingVideoTake: reuseExistingVideoTakes
+      reuseExistingVideoTake: reuseExistingVideoTakes,
+      preferLatestVideoTake: preferLatestVideoTakes
     });
     const durationSeconds =
       normalized.lineType === "insert"
@@ -4867,6 +5000,9 @@ function buildRenderManifest({ previewId, episode, show, createdAt, reuseExistin
             assetId: imageAsset.id,
             fileName: imageAsset.fileName,
             localUrl: imageAsset.localUrl,
+            shotRole: effectiveAssetShotRole(imageAsset),
+            speakingTag: imageAsset.metadata?.speakingTag || imageAsset.metadata?.characterTags || "",
+            speakingRoles: assetSpeakingRoles(imageAsset),
             lipSyncModel: visualLipSyncModel,
             lipSyncPrompt: visualLipSyncPrompt,
             animationStrength: visualAnimationStrength
@@ -5033,6 +5169,9 @@ async function renderLipSyncClipsForManifest({
     const localUrl = `/outputs/${outputFolder}/${episode.id}/${fileName}`;
     const cachedDuration = existsSync(filePath) ? await probeDuration(filePath) : 0;
     const masked = Boolean(line.needsMask && line.maskPath);
+    const infiniteTalkMultiPerson = infiniteTalkMultiPersonPlanForLine(line);
+    const useInfiniteTalkMultiPerson = provider === "infinitalk" && infiniteTalkMultiPerson.enabled;
+    const useHardMaskComposite = masked && !useInfiniteTalkMultiPerson;
     let durationSeconds = cachedDuration;
     let remoteUrl = "";
     let cached = !forceRegenerate && cachedDuration > 0;
@@ -5043,7 +5182,13 @@ async function renderLipSyncClipsForManifest({
           throw new Error(`${providerLabel} clip for line ${line.index} is not cached. ${lipSyncProviderUnavailableMessage(provider, line, manifest)}`);
         }
         const rawPath = path.join(rawDir, `${lineLabel}-${signatureHash}-raw.mp4`);
-        const lipSyncInputPath = masked
+        if (provider === "infinitalk" && masked && infiniteTalkMaskMode() === "multi" && !useInfiniteTalkMultiPerson) {
+          throw new Error(
+            `InfiniteTalk multi-person masking could not start for line ${line.index}: ${infiniteTalkMultiPerson.reason}. ` +
+              "Use a medium/wide shot asset with exactly two speaking tags such as @mary @bob, or set NEWTBUILDER_INFINITALK_MASK_MODE=composite to use the old still-composite mask."
+          );
+        }
+        const lipSyncInputPath = useHardMaskComposite
           ? await prepareLipSyncInputImage({ line, tempDir, signatureHash })
           : line.imagePath;
         const lipSyncAudioPath = lipSyncMinimumAudioSeconds(provider) > 0
@@ -5058,7 +5203,8 @@ async function renderLipSyncClipsForManifest({
           format: manifest.format,
           tempDir,
           rawPath,
-          manifest
+          manifest,
+          infiniteTalkMultiPerson: useInfiniteTalkMultiPerson ? infiniteTalkMultiPerson : null
         });
         const localResultPath = localVideoPath(result);
         if (localResultPath) {
@@ -5077,7 +5223,7 @@ async function renderLipSyncClipsForManifest({
           await downloadRemoteFile(remoteUrl, rawPath, `${providerLabel} lip-sync clip`);
         }
         const rawDurationSeconds = await probeDuration(rawPath);
-        if (masked) {
+        if (useHardMaskComposite) {
           await compositeLipSyncClipWithMask({
             lipSyncPath: rawPath,
             stillPath: line.imagePath,
@@ -5134,6 +5280,8 @@ async function renderLipSyncClipsForManifest({
         resolution: outputResolution,
         aspectRatio: manifest.format.aspectRatio || "",
         masked,
+        hardMaskComposite: useHardMaskComposite,
+        infiniteTalkMultiPerson: useInfiniteTalkMultiPerson ? infiniteTalkMultiPerson : null,
         invertMask: Boolean(line.invertMask),
         expressiveBodyMotion: Boolean(line.expressiveBodyMotion),
         animationStrength: animationStrengthForLine(line)
@@ -5233,7 +5381,7 @@ async function renderPreviewVideo({ previewId, manifest, mixPath }) {
   const audioInputIndex = linesWithMedia.length;
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       ...mediaInputArgs,
@@ -5338,7 +5486,7 @@ async function renderFinalVideo({ renderId, manifest, mixPath }) {
   const audioInputIndex = linesWithMedia.length;
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       ...mediaInputArgs,
@@ -6694,7 +6842,7 @@ async function prepareOpenAiCueDirectorAudio(audioPath) {
   await mkdir(tempDir, { recursive: true });
   try {
     await execFileAsync(
-      process.env.FFMPEG_PATH || "ffmpeg",
+      ffmpegPath,
       [
         "-y",
         "-i",
@@ -7557,7 +7705,7 @@ async function exportFinishedMaster({ episode, show, layers = [] }) {
     outputPath
   ];
 
-  await execFileAsync(process.env.FFMPEG_PATH || "ffmpeg", args, {
+  await execFileAsync(ffmpegPath, args, {
     timeout: 300000,
     maxBuffer: 30 * 1024 * 1024
   });
@@ -7847,7 +7995,7 @@ async function buildLaunchReadiness({ episode, show }) {
   const missingImages = lines.filter((line) => !String(line.assetId || "").trim());
   const assetById = new Map(assets.map((asset) => [asset.id, asset]));
   const missingMasks = groupedDialogue.filter(
-    (line) => lineExpectsSpeakerMask(line, assetById.get(line.assetId)) && !String(line.maskAssetId || "").trim()
+    (line) => !line.maskAutoApplyDisabled && lineExpectsSpeakerMask(line, assetById.get(line.assetId)) && !String(line.maskAssetId || "").trim()
   );
   const missingInsertVideos = insertLines.filter((line) => !line.videoTake?.localUrl && !line.videoTake?.proxyLocalUrl);
   const badInsertTrims = insertLines.filter((line) => {
@@ -8462,7 +8610,7 @@ async function prepareShortsThumbnailUploadVideo({ videoPath, thumbnailPath, tem
   ].join(";");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -8802,7 +8950,7 @@ async function prepareYouTubeThumbnail({ thumbnailPath, tempDir }) {
   const qualities = [3, 5, 7, 9, 12];
   for (const quality of qualities) {
     await execFileAsync(
-      process.env.FFMPEG_PATH || "ffmpeg",
+      ffmpegPath,
       [
         "-y",
         "-i",
@@ -8947,7 +9095,7 @@ async function renderThumbnailCandidate({ sourcePath, outputPath, framePath, tex
   ].join(",");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-ss",
@@ -8977,7 +9125,7 @@ async function extractThumbnailReferenceFrame({ sourcePath, outputPath, timestam
   ].join(",");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-ss",
@@ -9050,7 +9198,7 @@ async function thumbnailUsedImageAssetIds(episode) {
 
 async function prepareThumbnailReferenceImage({ sourcePath, outputPath }) {
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -9289,7 +9437,7 @@ function finalStillFitFilters({ width, height }) {
 async function probeDuration(filePath) {
   try {
     const { stdout } = await execFileAsync(
-      process.env.FFPROBE_PATH || "ffprobe",
+      ffprobePath,
       ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", filePath],
       { timeout: 30000, maxBuffer: 1024 * 1024 }
     );
@@ -9302,7 +9450,7 @@ async function probeDuration(filePath) {
 async function probeHasAudio(filePath) {
   try {
     const { stdout } = await execFileAsync(
-      process.env.FFPROBE_PATH || "ffprobe",
+      ffprobePath,
       [
         "-v",
         "error",
@@ -9325,7 +9473,7 @@ async function probeHasAudio(filePath) {
 async function probeMediaDimensions(filePath) {
   try {
     const { stdout } = await execFileAsync(
-      process.env.FFPROBE_PATH || "ffprobe",
+      ffprobePath,
       [
         "-v",
         "error",
@@ -9640,7 +9788,7 @@ function reusableAudioTakeForLine(line) {
 }
 
 function reusableVideoTakeForLine(line, imageAsset, endImageAsset, format, maskAsset = null, context = {}) {
-  const take = normalizeVideoTake(line.videoTake);
+  const take = context.preferLatestVideoTake ? latestExistingVideoTakeForLine(line) : normalizeVideoTake(line.videoTake);
   if (!take) return null;
   if (take.source === "user-upload") return videoTakeFilePath(take) ? take : null;
   if (context.reuseExistingVideoTake && videoTakeFilePath(take)) return take;
@@ -9661,6 +9809,9 @@ function reusableVideoTakeForLine(line, imageAsset, endImageAsset, format, maskA
             assetId: imageAsset.id,
             fileName: imageAsset.fileName,
             localUrl: imageAsset.localUrl,
+            shotRole: effectiveAssetShotRole(imageAsset),
+            speakingTag: imageAsset.metadata?.speakingTag || imageAsset.metadata?.characterTags || "",
+            speakingRoles: assetSpeakingRoles(imageAsset),
             lipSyncModel: visualLipSyncModel,
             lipSyncPrompt: visualLipSyncPrompt,
             animationStrength: visualAnimationStrength
@@ -9710,6 +9861,24 @@ function reusableVideoTakeForLine(line, imageAsset, endImageAsset, format, maskA
   };
   if (take.signature !== lineVideoSignature(signatureLine, format)) return null;
   return videoTakeFilePath(take) ? take : null;
+}
+
+function latestExistingVideoTakeForLine(line) {
+  const candidates = normalizeVideoTakes(line?.videoTakes, line?.videoTake)
+    .map((take, index) => ({
+      take,
+      index,
+      timestamp: videoTakeGeneratedTimestamp(take)
+    }))
+    .filter(({ take }) => Boolean(videoTakeFilePath(take)));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.timestamp - a.timestamp || a.index - b.index);
+  return candidates[0].take;
+}
+
+function videoTakeGeneratedTimestamp(take) {
+  const timestamp = Date.parse(String(take?.generatedAt || ""));
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function audioTakeFilePath(take) {
@@ -10768,9 +10937,64 @@ function infiniteTalkSeed() {
   return Number.isFinite(seed) ? Math.round(seed) : null;
 }
 
+function infiniteTalkMaskMode() {
+  const value = String(process.env.NEWTBUILDER_INFINITALK_MASK_MODE || "multi").trim().toLowerCase();
+  if (["multi", "multiperson", "multi-person"].includes(value)) return "multi";
+  if (["composite", "mask", "single"].includes(value)) return "composite";
+  return "multi";
+}
+
+function infiniteTalkMultiPersonPlanForLine(line) {
+  const shotRole = String(line?.image?.shotRole || line?.shotRole || "").trim();
+  const roles = uniqueRoleList(
+    Array.isArray(line?.image?.speakingRoles) && line.image.speakingRoles.length
+      ? line.image.speakingRoles
+      : parseCharacterTagRoles(line?.image?.speakingTag || "")
+  );
+  const speakerRole = speakerTypeFor(line?.speaker);
+  const speakerIndex = roles.indexOf(speakerRole);
+  const enabled =
+    infiniteTalkMaskMode() === "multi" &&
+    Boolean(line?.needsMask && line?.maskPath) &&
+    ["medium_two_shot", "wide_shot"].includes(shotRole) &&
+    roles.length === 2 &&
+    speakerIndex >= 0;
+
+  return {
+    enabled,
+    audioType: "para",
+    personRoles: roles.slice(0, 2),
+    speakerRole,
+    speakerIndex,
+    shotRole,
+    reason: enabled
+      ? ""
+      : !line?.needsMask || !line?.maskPath
+        ? "line is not using a speaker mask"
+        : !["medium_two_shot", "wide_shot"].includes(shotRole)
+          ? "shot is not a medium two-shot or wide shot"
+          : roles.length !== 2
+            ? "shot asset must have exactly two speaking tags"
+            : speakerIndex < 0
+              ? "line speaker is not present in the shot asset speaking tags"
+              : "InfiniteTalk multi-person mode is disabled"
+  };
+}
+
+function shouldUseInfiniteTalkMultiPerson(line, provider) {
+  return sanitizeLipSyncModel(provider) === "infinitalk" && infiniteTalkMultiPersonPlanForLine(line).enabled;
+}
+
+function comfyUiInfiniteTalkModelNameForLine(line) {
+  const plan = infiniteTalkMultiPersonPlanForLine(line);
+  if (!plan.enabled) return String(process.env.COMFYUI_INFINITALK_SINGLE_MODEL || "").trim();
+  return String(process.env.COMFYUI_INFINITALK_MULTI_MODEL || "InfiniteTalk\\Wan2_1-InfiniteTalk-Multi_fp8_e4m3fn_scaled_KJ.safetensors").trim();
+}
+
 function lipSyncProviderSignatureOptions(provider, line, format = {}) {
   if (provider === "infinitalk") {
     const backend = infiniteTalkBackendForLine(line);
+    const multiPerson = infiniteTalkMultiPersonPlanForLine(line);
     const options = {
       backend,
       numFrames: infiniteTalkNumFrames(line),
@@ -10781,9 +11005,11 @@ function lipSyncProviderSignatureOptions(provider, line, format = {}) {
       acceleration: infiniteTalkAcceleration(),
       seed: infiniteTalkSeed(),
       comfyUiWorkflow: backend === "comfyui" ? comfyUiInfiniteTalkWorkflowPath() : "",
-      comfyUiMapping: backend === "comfyui" ? compactText(process.env.COMFYUI_INFINITALK_MAPPING_JSON || "", 500) : ""
+      comfyUiMapping: backend === "comfyui" ? compactText(process.env.COMFYUI_INFINITALK_MAPPING_JSON || "", 500) : "",
+      multiPerson
     };
-    if (backend === "comfyui") options.audioCfgScale = animationStrengthForLine(line);
+    if (backend === "comfyui") options.comfyUiMultiModel = comfyUiInfiniteTalkModelNameForLine(line);
+    if (backend === "comfyui") options.audioCfgScale = multiPerson.enabled ? 1 : animationStrengthForLine(line);
     return options;
   }
   return {};
@@ -10794,7 +11020,7 @@ function lineLipSyncSignature(line, format = {}, options = {}) {
   const provider = options.provider || lipSyncModelForLine(line);
   const model = options.modelId || lipSyncProviderConfig(provider, { line }).modelId;
   return JSON.stringify({
-    compositeVersion: 7,
+    compositeVersion: provider === "infinitalk" ? 8 : 7,
     provider,
     model,
     providerOptions: lipSyncProviderSignatureOptions(provider, line, format),
@@ -10845,7 +11071,7 @@ async function prepareLipSyncInputImage({ line, tempDir, signatureHash }) {
   ].join(";");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -10879,7 +11105,7 @@ async function prepareLipSyncMaskImage({ line, tempDir, signatureHash }) {
   ].join(";");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -10913,7 +11139,7 @@ async function prepareLipSyncAudio({ line, tempDir, signatureHash, provider = "k
   const outputPath = path.join(tempDir, `${lineLabel}-${provider}-audio.wav`);
   const padDuration = Math.max(0.2, requiredDuration - sourceDuration + 0.2);
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -10931,14 +11157,146 @@ async function prepareLipSyncAudio({ line, tempDir, signatureHash, provider = "k
   return outputPath;
 }
 
-async function runLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest }) {
+async function prepareInfiniteTalkMultiPersonAudioSlots({ line, audioPath, tempDir, signatureHash, plan }) {
+  const speakerIndex = Number(plan?.speakerIndex);
+  if (![0, 1].includes(speakerIndex)) {
+    throw new Error(`InfiniteTalk multi-person audio needs speaker index 0 or 1 for line ${line.index}.`);
+  }
+  const sourceDuration = audioPath ? await probeDuration(audioPath) : 0;
+  const durationSeconds = Math.max(
+    0.35,
+    Number(sourceDuration || 0),
+    Number(line.audio?.durationSeconds || line.audioTake?.durationSeconds || line.durationSeconds || 0),
+    infiniteTalkRequiredAudioSeconds(line)
+  );
+  const lineLabel = `line-${String(line.index).padStart(3, "0")}-${signatureHash}`;
+  const silencePath = path.join(tempDir, `${lineLabel}-infinitalk-silent-person-${speakerIndex === 0 ? "2" : "1"}.wav`);
+  await writeSilentSpeechWav({ filePath: silencePath, durationSeconds });
+  return {
+    audio1Path: speakerIndex === 0 ? audioPath : silencePath,
+    audio2Path: speakerIndex === 1 ? audioPath : silencePath,
+    durationSeconds
+  };
+}
+
+async function prepareInfiniteTalkMultiPersonMasks({ line, tempDir, signatureHash, plan, width, height }) {
+  if (!line.maskPath) {
+    throw new Error(`InfiniteTalk multi-person masks need a speaker mask for line ${line.index}.`);
+  }
+  const speakerIndex = Number(plan?.speakerIndex);
+  if (![0, 1].includes(speakerIndex)) {
+    throw new Error(`InfiniteTalk multi-person masks need speaker index 0 or 1 for line ${line.index}.`);
+  }
+  const targetWidth = Math.max(16, Math.round(Number(width) || 720));
+  const targetHeight = Math.max(16, Math.round(Number(height) || 1280));
+  const lineLabel = `line-${String(line.index).padStart(3, "0")}-${signatureHash}`;
+  const activePath = path.join(tempDir, `${lineLabel}-infinitalk-speaker-mask.png`);
+  const otherPath = path.join(tempDir, `${lineLabel}-infinitalk-other-mask.png`);
+  const backgroundPath = path.join(tempDir, `${lineLabel}-infinitalk-background-mask.png`);
+
+  await writeFittedSpeakerMask({
+    sourcePath: line.maskPath,
+    outputPath: activePath,
+    width: targetWidth,
+    height: targetHeight,
+    invert: line.invertMask
+  });
+  await writeInfiniteTalkRoleLaneMask({
+    outputPath: otherPath,
+    width: targetWidth,
+    height: targetHeight,
+    roleIndex: speakerIndex === 0 ? 1 : 0
+  });
+  await writeInfiniteTalkBackgroundMask({
+    maskAPath: activePath,
+    maskBPath: otherPath,
+    outputPath: backgroundPath
+  });
+
+  return speakerIndex === 0
+    ? [activePath, otherPath, backgroundPath]
+    : [otherPath, activePath, backgroundPath];
+}
+
+async function writeFittedSpeakerMask({ sourcePath, outputPath, width, height, invert = false }) {
+  const maskChain = renderMaskCleanupFilter({ invert });
+  await execFileAsync(
+    ffmpegPath,
+    [
+      "-y",
+      "-i",
+      sourcePath,
+      "-vf",
+      `${maskChain},scale=${width}:${height}:force_original_aspect_ratio=increase:flags=neighbor,crop=${width}:${height}:x=(in_w-out_w)/2:y=(in_h-out_h)/2,format=gray,setsar=1`,
+      "-frames:v",
+      "1",
+      "-update",
+      "1",
+      outputPath
+    ],
+    { timeout: 90000, maxBuffer: 12 * 1024 * 1024 }
+  );
+}
+
+async function writeInfiniteTalkRoleLaneMask({ outputPath, width, height, roleIndex }) {
+  const halfWidth = Math.max(1, Math.floor(width / 2));
+  const insetX = Math.max(0, Math.round(halfWidth * 0.1));
+  const insetY = Math.max(0, Math.round(height * 0.1));
+  const boxX = roleIndex === 0 ? insetX : halfWidth + insetX;
+  const boxY = insetY;
+  const boxWidth = Math.max(1, halfWidth - insetX * 2);
+  const boxHeight = Math.max(1, height - insetY * 2);
+  await execFileAsync(
+    ffmpegPath,
+    [
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      `color=c=black:s=${width}x${height}:d=0.1`,
+      "-vf",
+      `drawbox=x=${boxX}:y=${boxY}:w=${boxWidth}:h=${boxHeight}:color=white:t=fill,format=gray,setsar=1`,
+      "-frames:v",
+      "1",
+      "-update",
+      "1",
+      outputPath
+    ],
+    { timeout: 90000, maxBuffer: 12 * 1024 * 1024 }
+  );
+}
+
+async function writeInfiniteTalkBackgroundMask({ maskAPath, maskBPath, outputPath }) {
+  await execFileAsync(
+    ffmpegPath,
+    [
+      "-y",
+      "-i",
+      maskAPath,
+      "-i",
+      maskBPath,
+      "-filter_complex",
+      "[0:v]format=gray[a];[1:v]format=gray[b];[a][b]blend=all_mode=lighten[union];[union]negate,format=gray,setsar=1[out]",
+      "-map",
+      "[out]",
+      "-frames:v",
+      "1",
+      "-update",
+      "1",
+      outputPath
+    ],
+    { timeout: 90000, maxBuffer: 12 * 1024 * 1024 }
+  );
+}
+
+async function runLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest, infiniteTalkMultiPerson = null }) {
   if (provider === "infinitalk") {
     const backend = infiniteTalkBackendForLine(line, manifest);
     if (backend === "local") {
       return runLocalInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath });
     }
     if (backend === "comfyui") {
-      return runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest });
+      return runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest, infiniteTalkMultiPerson });
     }
   }
   return runFalLipSyncProvider({ provider, imagePath, audioPath, prompt, line, format, tempDir });
@@ -11042,7 +11400,7 @@ async function runLocalInfiniteTalk({ imagePath, audioPath, prompt, line, tempDi
   }
 }
 
-async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest }) {
+async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, format, tempDir, rawPath, manifest, infiniteTalkMultiPerson = null }) {
   const workflowPath = comfyUiInfiniteTalkWorkflowPath();
   if (!workflowPath || !existsSync(workflowPath)) {
     throw new Error("ComfyUI InfiniteTalk is selected, but COMFYUI_INFINITALK_WORKFLOW does not point to an API-format workflow JSON file.");
@@ -11072,23 +11430,40 @@ async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, form
       message: `Preparing ComfyUI inputs for line ${line.index}.`
     });
 
+    const multiPerson = infiniteTalkMultiPerson?.enabled ? infiniteTalkMultiPerson : null;
     const masked = Boolean(line.maskPath && line.imagePath);
-    const workflowMaskSupported = masked && comfyUiCanMapImageFileInput(graph, "mask", comfyUiMaskInputNames(), comfyUiMaskInputPredicate);
+    const workflowMaskSupported = !multiPerson && masked && comfyUiCanMapImageFileInput(graph, "mask", comfyUiMaskInputNames(), comfyUiMaskInputPredicate);
     const primaryImagePath = workflowMaskSupported ? line.imagePath : imagePath;
-    const imageName = await copyComfyUiInputFile(primaryImagePath, `${prefix}-image`);
-    const audioName = await copyComfyUiInputFile(audioPath, `${prefix}-audio`);
-    const maskInputPath = workflowMaskSupported ? await prepareLipSyncMaskImage({ line, tempDir, signatureHash: prefix }) : "";
-    const maskName = maskInputPath ? await copyComfyUiInputFile(maskInputPath, `${prefix}-mask`) : "";
-    const sourceImageName = workflowMaskSupported ? imageName : "";
     const dimensions = parseResolution(format?.resolution, format?.aspectRatio);
     const width = Number(format?.width || dimensions.width || 720);
     const height = Number(format?.height || dimensions.height || 1280);
+    const imageName = await copyComfyUiInputFile(primaryImagePath, `${prefix}-image`);
+    const audioSlots = multiPerson
+      ? await prepareInfiniteTalkMultiPersonAudioSlots({ line, audioPath, tempDir, signatureHash: prefix, plan: multiPerson })
+      : { audio1Path: audioPath, audio2Path: "", durationSeconds: 0 };
+    const audioName = await copyComfyUiInputFile(audioSlots.audio1Path, `${prefix}-audio-p1`);
+    const audio2Name = audioSlots.audio2Path ? await copyComfyUiInputFile(audioSlots.audio2Path, `${prefix}-audio-p2`) : "";
+    const refTargetMaskNames = multiPerson
+      ? (
+          await Promise.all(
+            (await prepareInfiniteTalkMultiPersonMasks({ line, tempDir, signatureHash: prefix, plan: multiPerson, width, height })).map((maskPath, index) =>
+              copyComfyUiInputFile(maskPath, `${prefix}-ref-mask-${index + 1}`)
+            )
+          )
+        )
+      : [];
+    const maskInputPath = workflowMaskSupported ? await prepareLipSyncMaskImage({ line, tempDir, signatureHash: prefix }) : "";
+    const maskName = maskInputPath ? await copyComfyUiInputFile(maskInputPath, `${prefix}-mask`) : "";
+    const sourceImageName = workflowMaskSupported ? imageName : "";
     const seed = infiniteTalkSeed();
-    const audioCfgScale = animationStrengthForLine(line);
+    const audioCfgScale = multiPerson ? 1 : animationStrengthForLine(line);
 
     const mappedInputs = applyComfyUiWorkflowInputs(graph, {
       imageName,
       audioName,
+      audio2Name,
+      refTargetMaskNames,
+      multiAudioType: multiPerson ? multiPerson.audioType : "",
       maskName,
       sourceImageName,
       prompt: prompt || ".",
@@ -11098,7 +11473,8 @@ async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, form
       numFrames: infiniteTalkNumFrames(line),
       audioCfgScale,
       seed,
-      filenamePrefix: prefix
+      filenamePrefix: prefix,
+      infiniteTalkMultiPerson: multiPerson
     });
 
     const clientId = randomUUID();
@@ -11155,8 +11531,15 @@ async function runComfyUiInfiniteTalk({ imagePath, audioPath, prompt, line, form
       workflow: workflowPath,
       audio_cfg_scale: audioCfgScale,
       masked,
+      hard_mask_composite: false,
+      multi_person: Boolean(multiPerson),
+      multi_person_roles: multiPerson?.personRoles || [],
+      multi_person_speaker_index: multiPerson ? multiPerson.speakerIndex : null,
       workflow_mask_supported: workflowMaskSupported,
       workflow_mask_input: Boolean(mappedInputs.mask),
+      workflow_audio_2_input: Boolean(mappedInputs.audio2),
+      workflow_ref_target_masks_input: Boolean(mappedInputs.refTargetMasks),
+      multi_audio_type: multiPerson ? multiPerson.audioType : "",
       width,
       height
     };
@@ -11234,6 +11617,8 @@ function applyComfyUiWorkflowInputs(graph, values) {
   const mapped = {
     image: false,
     audio: false,
+    audio2: false,
+    refTargetMasks: false,
     mask: false,
     sourceImage: false
   };
@@ -11251,6 +11636,16 @@ function applyComfyUiWorkflowInputs(graph, values) {
       (node) => comfyUiNodeText(node).includes("audio")
     )
   });
+  if (values.audio2Name) {
+    mapped.audio2 = applyComfyUiSecondAudioInput(graph, values.audio2Name);
+    applyComfyUiStringInputs(graph, "multiAudioType", values.multiAudioType || "para", ["multi_audio_type", "audio_type"]);
+  }
+  if (Array.isArray(values.refTargetMaskNames) && values.refTargetMaskNames.length) {
+    mapped.refTargetMasks = applyComfyUiRefTargetMasksInput(graph, values.refTargetMaskNames);
+  }
+  if (values.infiniteTalkMultiPerson) {
+    applyComfyUiInfiniteTalkModelSelection(graph, values.infiniteTalkMultiPerson);
+  }
   if (values.sourceImageName) {
     mapped.sourceImage = applyComfyUiImageFileInput(
       graph,
@@ -11298,6 +11693,134 @@ function applyComfyUiWorkflowInputs(graph, values) {
   }
   applyComfyUiStringInputs(graph, "filenamePrefix", values.filenamePrefix, ["filename_prefix"]);
   return mapped;
+}
+
+function applyComfyUiSecondAudioInput(graph, audio2Name) {
+  const loaderId = addComfyUiLoadAudioNode(graph, audio2Name);
+  const targets = Object.entries(graph)
+    .filter(([, node]) => {
+      const text = comfyUiNodeText(node);
+      return text.includes("multitalk") && text.includes("wav2vec");
+    })
+    .map(([id, node]) => ({ id, node }));
+  if (targets.length !== 1) {
+    const listed = targets.map((target) => target.id).join(", ") || "none found";
+    throw new Error(`ComfyUI InfiniteTalk multi-person mode needs exactly one MultiTalk wav2vec node for audio_2 mapping (${listed}).`);
+  }
+  targets[0].node.inputs.audio_2 = [loaderId, 0];
+  return true;
+}
+
+function applyComfyUiRefTargetMasksInput(graph, maskNames = []) {
+  const names = maskNames.map((name) => String(name || "").trim()).filter(Boolean);
+  if (names.length < 2) {
+    throw new Error("ComfyUI InfiniteTalk multi-person mode needs at least two reference target masks.");
+  }
+  const targets = Object.entries(graph)
+    .filter(([, node]) => {
+      const text = comfyUiNodeText(node);
+      return text.includes("multitalk") && text.includes("wav2vec");
+    })
+    .map(([id, node]) => ({ id, node }));
+  if (targets.length !== 1) {
+    const listed = targets.map((target) => target.id).join(", ") || "none found";
+    throw new Error(`ComfyUI InfiniteTalk multi-person mode needs exactly one MultiTalk wav2vec node for ref_target_masks mapping (${listed}).`);
+  }
+
+  const maskRefs = names.map((name, index) => [addComfyUiLoadImageMaskNode(graph, name, `NewtBuilder Ref Mask ${index + 1}`), 0]);
+  const batchRef = [addComfyUiMaskBatchMultiNode(graph, maskRefs), 0];
+  targets[0].node.inputs.ref_target_masks = batchRef;
+  return true;
+}
+
+function addComfyUiLoadImageMaskNode(graph, imageName, title = "NewtBuilder Ref Mask") {
+  const id = nextComfyUiNodeId(graph);
+  graph[id] = {
+    class_type: "LoadImageMask",
+    inputs: {
+      image: String(imageName || ""),
+      channel: "red"
+    },
+    _meta: {
+      title
+    }
+  };
+  return id;
+}
+
+function addComfyUiMaskBatchMultiNode(graph, maskRefs = []) {
+  const id = nextComfyUiNodeId(graph);
+  const inputs = {
+    inputcount: maskRefs.length
+  };
+  maskRefs.forEach((maskRef, index) => {
+    inputs[`mask_${index + 1}`] = maskRef;
+  });
+  graph[id] = {
+    class_type: "MaskBatchMulti",
+    inputs,
+    _meta: {
+      title: "NewtBuilder Ref Mask Batch"
+    }
+  };
+  return id;
+}
+
+function addComfyUiLoadAudioNode(graph, audioName) {
+  const source = Object.values(graph).find((node) => String(node?.class_type || "").toLowerCase() === "loadaudio");
+  const id = nextComfyUiNodeId(graph);
+  graph[id] = source
+    ? {
+        ...JSON.parse(JSON.stringify(source)),
+        inputs: {
+          ...(source.inputs || {}),
+          audio: String(audioName || "")
+        },
+        _meta: {
+          ...(source._meta || {}),
+          title: "NewtBuilder Person 2 Audio"
+        }
+      }
+    : {
+        class_type: "LoadAudio",
+        inputs: {
+          audio: String(audioName || "")
+        },
+        _meta: {
+          title: "NewtBuilder Person 2 Audio"
+        }
+      };
+  return id;
+}
+
+function nextComfyUiNodeId(graph) {
+  const maxId = Object.keys(graph || {}).reduce((max, id) => {
+    const value = Number(id);
+    return Number.isFinite(value) ? Math.max(max, value) : max;
+  }, 0);
+  return String(maxId + 1);
+}
+
+function applyComfyUiInfiniteTalkModelSelection(graph, lineOrPlan) {
+  const modelName = comfyUiInfiniteTalkModelNameForLine({
+    needsMask: true,
+    maskPath: "mask",
+    image: {
+      shotRole: lineOrPlan?.shotRole || "medium_two_shot",
+      speakingRoles: lineOrPlan?.personRoles || []
+    },
+    speaker: lineOrPlan?.speakerRole || lineOrPlan?.personRoles?.[lineOrPlan?.speakerIndex || 0] || ""
+  });
+  if (!modelName) return false;
+  const targets = Object.entries(graph)
+    .filter(([, node]) => comfyUiNodeText(node).includes("multitalkmodelloader"))
+    .map(([id, node]) => ({ id, node }));
+  if (targets.length !== 1) {
+    const listed = targets.map((target) => target.id).join(", ") || "none found";
+    throw new Error(`ComfyUI InfiniteTalk multi-person mode needs exactly one MultiTalkModelLoader node (${listed}).`);
+  }
+  targets[0].node.inputs.model = modelName;
+  return true;
 }
 
 function comfyUiMaskInputNames() {
@@ -11805,7 +12328,7 @@ async function normalizeLipSyncClip({ sourcePath, outputPath, fps, width, height
         ]
       : ["setsar=1"];
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -11854,7 +12377,7 @@ async function compositeLipSyncClipWithMask({ lipSyncPath, stillPath, maskPath, 
   ].join(";");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -11924,6 +12447,7 @@ async function generateDrawnSpeakerMaskForLine({ line, imagePath, maskDataUrl })
       kind: "speaker-drawn-mask",
       sourceImageAssetId: line.image?.assetId || line.assetId || "",
       speakerMaskKey: speakerMaskReuseKey(line),
+      maskRefreshToken: String(line.maskRefreshToken || "").trim(),
       speaker: String(line.speaker || "").trim(),
       characterId: cleanId(line.characterId),
       postProcessVersion: "drawn-speaker-mask-v1"
@@ -11962,6 +12486,7 @@ async function generateAutomaticSpeakerMaskForLine({ line, imageAsset, show }) {
       kind: "speaker-auto-mask",
       sourceImageAssetId: line.assetId || "",
       speakerMaskKey: speakerMaskReuseKey(line),
+      maskRefreshToken: String(line.maskRefreshToken || "").trim(),
       speaker: String(line.speaker || "").trim(),
       speakerRole: targetSpeakerRoleForLine(line, imageAsset),
       characterId: cleanId(line.characterId),
@@ -12322,7 +12847,7 @@ async function renderAutomaticSpeakerMask({ outputPath, dimensions, region }) {
   const boxHeight = Math.max(1, Math.round(region.height * height));
   const feather = boundedEnvNumber("NEWTBUILDER_AUTO_MASK_FEATHER_PX", 1.75, 0, 12);
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-f",
@@ -12392,7 +12917,7 @@ async function normalizeDrawnMask({ maskPath, imagePath, outputPath }) {
   ].join(";");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -12560,7 +13085,7 @@ async function downloadRemoteFile(url, filePath, label = "remote file") {
 
 async function writeVideoProxy({ sourcePath, outputPath }) {
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -12730,7 +13255,7 @@ async function cleanSpeechSourceToWav({ sourcePath, outputPath, timeout }) {
   ].join(",");
 
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-i",
@@ -12762,7 +13287,7 @@ async function writeEpisodeSpeechMix({ filePath, lines, tempDir }) {
       .join("\n")}\n`
   );
   await execFileAsync(
-    process.env.FFMPEG_PATH || "ffmpeg",
+    ffmpegPath,
     [
       "-y",
       "-f",
@@ -13401,3 +13926,4 @@ function labelForShotRole(role) {
     general: "General Asset"
   }[role] || "General Asset";
 }
+
