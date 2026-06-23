@@ -9,7 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
-import { copyFile, mkdir, readFile, rm, writeFile, stat } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, writeFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -63,6 +63,10 @@ const ffmpegPath = resolveMediaToolCommand("FFMPEG_PATH", "ffmpeg", [
 const ffprobePath = resolveMediaToolCommand("FFPROBE_PATH", "ffprobe", [
   "C:/dev/tools/ffmpeg-8.1.1-essentials_build/bin/ffprobe.exe",
   path.join(path.dirname(ffmpegPath), process.platform === "win32" ? "ffprobe.exe" : "ffprobe")
+]);
+const realEsrganPath = resolveMediaToolCommand("REALESRGAN_NCNN_PATH", "realesrgan-ncnn-vulkan", [
+  "C:/dev/tools/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan.exe",
+  path.join(rootDir, "tools", "realesrgan-ncnn-vulkan", process.platform === "win32" ? "realesrgan-ncnn-vulkan.exe" : "realesrgan-ncnn-vulkan")
 ]);
 
 const app = express();
@@ -1710,6 +1714,38 @@ app.post("/api/episodes/:id/final-render", async (req, res) => {
     });
     await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
     res.status(400).json({ error: message, episode: updated, job });
+  }
+});
+
+app.post("/api/episodes/:id/upscale-video", async (req, res) => {
+  const episodes = await readEpisodes();
+  const current = episodes.find((item) => item.id === req.params.id);
+  if (!current) {
+    return res.status(404).json({ error: "Episode not found." });
+  }
+
+  try {
+    const upscaled = await upscaleVideoForEpisode({ episode: current, options: req.body || {} });
+    const updated = normalizeEpisode({
+      ...current,
+      outputs: [upscaled.output, ...(current.outputs || []).filter((output) => output.id !== upscaled.output.id)],
+      jobLog: appendLog(
+        current.jobLog,
+        `Upscaled video with Real-ESRGAN ${upscaled.output.model || ""}: ${upscaled.output.resolution || upscaled.output.name}.`
+      ),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.json({ episode: updated, output: upscaled.output, sourceOutput: upscaled.sourceOutput });
+  } catch (error) {
+    const message = cleanErrorMessage(error);
+    const updated = normalizeEpisode({
+      ...current,
+      jobLog: appendLog(current.jobLog, `Video upscale failed: ${message}`),
+      updatedAt: new Date().toISOString()
+    });
+    await writeEpisodes([updated, ...episodes.filter((item) => item.id !== updated.id)]);
+    res.status(400).json({ error: message, episode: updated });
   }
 });
 
@@ -5687,11 +5723,321 @@ async function generateAiThumbnailCandidates({ episode, show, thumbnailBrief = {
 function latestVideoOutputForThumbnail(episode) {
   const outputs = Array.isArray(episode.outputs) ? episode.outputs : [];
   return (
+    outputs.find((output) => output.type === "upscaled_video" && outputFilePath(output)) ||
     outputs.find((output) => output.type === "finished_master" && outputFilePath(output)) ||
     outputs.find((output) => output.type === "final_video" && outputFilePath(output)) ||
     outputs.find((output) => output.type === "preview_video" && outputFilePath(output)) ||
     null
   );
+}
+
+function latestVideoOutputForUpscale(episode, sourceOutputId = "") {
+  const outputs = Array.isArray(episode.outputs) ? episode.outputs : [];
+  const requestedId = cleanId(sourceOutputId);
+  if (requestedId) {
+    const requested = outputs.find((output) => output.id === requestedId && outputFilePath(output));
+    if (requested) return requested;
+  }
+  return (
+    outputs.find((output) => output.type === "finished_master" && outputFilePath(output)) ||
+    outputs.find((output) => output.type === "final_video" && outputFilePath(output)) ||
+    outputs.find((output) => output.type === "preview_video" && outputFilePath(output)) ||
+    null
+  );
+}
+
+async function upscaleVideoForEpisode({ episode, options = {} }) {
+  const sourceOutput = latestVideoOutputForUpscale(episode, options.sourceOutputId);
+  const sourcePath = outputFilePath(sourceOutput);
+  if (!sourcePath) {
+    throw new Error("Build a preview or final render before upscaling.");
+  }
+  if (!existsSync(realEsrganPath)) {
+    throw new Error(`Real-ESRGAN is not installed at ${realEsrganPath}. Set REALESRGAN_NCNN_PATH to the executable path.`);
+  }
+
+  const sourceDimensions = await probeMediaDimensions(sourcePath);
+  const target = sanitizeUpscaleTargetResolution(options.targetResolution || process.env.NEWTBUILDER_UPSCALE_DEFAULT_TARGET, sourceDimensions);
+  const model = sanitizeUpscaleModel(options.model || process.env.NEWTBUILDER_UPSCALE_DEFAULT_MODEL);
+  const scale = upscaleScaleForTarget(sourceDimensions, target, model);
+  const runId = randomUUID();
+  const outputDir = path.join(outputsDir, "upscaled-videos", episode.id);
+  const tempDir = path.join(outputsDir, "tmp", `upscale-${runId}`);
+  const fileName = `${safeFileSegment(episode.title)}-${runId.slice(0, 8)}-${target.width}x${target.height}-upscaled.mp4`;
+  const outputPath = path.join(outputDir, fileName);
+  const progressContext = upscaleProgressContext({ episode, sourceOutput, target, model });
+
+  setComfyUiProgress(progressContext, {
+    status: "queued",
+    phase: "preparing",
+    percent: 2,
+    message: `Preparing ${target.width} x ${target.height} Real-ESRGAN upscale from ${sourceOutput?.name || sourceOutput?.fileName || "the latest video"}.`
+  });
+
+  await Promise.all([mkdir(outputDir, { recursive: true }), mkdir(tempDir, { recursive: true })]);
+  try {
+    await runRealEsrganVideoUpscale({
+      sourcePath,
+      outputPath,
+      tempDir,
+      target,
+      model,
+      scale,
+      progressContext
+    });
+    completeComfyUiProgress(progressContext, {
+      phase: "complete",
+      message: `Upscaled video ready at ${target.width} x ${target.height}.`
+    });
+  } catch (error) {
+    failComfyUiProgress(progressContext, error, {
+      message: "Upscale failed."
+    });
+    throw error;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+
+  const actualDimensions = await probeMediaDimensions(outputPath);
+  const width = actualDimensions.width || target.width;
+  const height = actualDimensions.height || target.height;
+  return {
+    sourceOutput,
+    output: {
+      id: `${runId}-upscaled-video`,
+      type: "upscaled_video",
+      name: `${target.width} x ${target.height} Real-ESRGAN upscale`,
+      fileName,
+      localUrl: `/outputs/upscaled-videos/${episode.id}/${fileName}`,
+      width,
+      height,
+      resolution: `${width}x${height}`,
+      durationSeconds: await probeDuration(outputPath),
+      provider: "Real-ESRGAN ncnn Vulkan",
+      model,
+      scale,
+      sourceOutputId: sourceOutput.id || "",
+      sourceOutputType: sourceOutput.type || "",
+      sourceLocalUrl: sourceOutput.localUrl || "",
+      createdAt: new Date().toISOString()
+    }
+  };
+}
+
+async function runRealEsrganVideoUpscale({ sourcePath, outputPath, tempDir, target, model, scale, progressContext = null }) {
+  const inputFramesDir = path.join(tempDir, "frames");
+  const upscaledFramesDir = path.join(tempDir, "upscaled");
+  await Promise.all([mkdir(inputFramesDir, { recursive: true }), mkdir(upscaledFramesDir, { recursive: true })]);
+
+  const fps = await probeVideoFrameRate(sourcePath);
+  if (progressContext) {
+    setComfyUiProgress(progressContext, {
+      status: "running",
+      phase: "extracting_frames",
+      percent: 6,
+      message: "Extracting source video frames for upscale."
+    });
+  }
+  await execFileAsync(
+    ffmpegPath,
+    [
+      "-y",
+      "-i",
+      sourcePath,
+      "-vsync",
+      "0",
+      path.join(inputFramesDir, "frame%08d.png")
+    ],
+    { timeout: 30 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 }
+  );
+  const sourceFrameCount = await countFrameFiles(inputFramesDir);
+  if (!sourceFrameCount) {
+    throw new Error("Upscale failed because ffmpeg did not extract any source frames.");
+  }
+  if (progressContext) {
+    setComfyUiProgress(progressContext, {
+      status: "running",
+      phase: "upscaling_frames",
+      percent: 12,
+      value: 0,
+      max: sourceFrameCount,
+      message: `Extracted ${sourceFrameCount} frames. Starting Real-ESRGAN ${model}.`
+    });
+  }
+
+  await runRealEsrganFramesWithProgress({
+    inputFramesDir,
+    upscaledFramesDir,
+    model,
+    scale,
+    progressContext,
+    frameCount: sourceFrameCount
+  });
+
+  const hasAudio = await probeHasAudio(sourcePath);
+  const fitFilters = [
+    `scale=${target.width}:${target.height}:force_original_aspect_ratio=increase`,
+    `crop=${target.width}:${target.height}:x=(in_w-out_w)/2:y=(in_h-out_h)/2`,
+    "setsar=1",
+    "format=yuv420p"
+  ].join(",");
+  const args = [
+    "-y",
+    "-framerate",
+    fps.toFixed(6),
+    "-i",
+    path.join(upscaledFramesDir, "frame%08d.png"),
+    "-i",
+    sourcePath,
+    "-vf",
+    fitFilters,
+    "-map",
+    "0:v:0"
+  ];
+  if (hasAudio) args.push("-map", "1:a:0", "-c:a", "copy");
+  args.push("-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-shortest", outputPath);
+  if (progressContext) {
+    setComfyUiProgress(progressContext, {
+      status: "running",
+      phase: "rebuilding_video",
+      percent: 92,
+      value: sourceFrameCount,
+      max: sourceFrameCount,
+      message: "Rebuilding the upscaled MP4 and preserving the source audio."
+    });
+  }
+  await execFileAsync(ffmpegPath, args, {
+    timeout: 45 * 60 * 1000,
+    maxBuffer: 32 * 1024 * 1024
+  });
+  if (progressContext) {
+    setComfyUiProgress(progressContext, {
+      status: "running",
+      phase: "verifying_output",
+      percent: 98,
+      message: "Verifying the upscaled video output."
+    });
+  }
+}
+
+async function runRealEsrganFramesWithProgress({ inputFramesDir, upscaledFramesDir, model, scale, progressContext, frameCount }) {
+  const timeoutMs = boundedEnvNumber("NEWTBUILDER_UPSCALE_TIMEOUT_MS", 2 * 60 * 60 * 1000, 60000, 12 * 60 * 60 * 1000);
+  const args = [
+    "-i",
+    inputFramesDir,
+    "-o",
+    upscaledFramesDir,
+    "-m",
+    path.join(path.dirname(realEsrganPath), "models"),
+    "-n",
+    model,
+    "-s",
+    String(scale),
+    "-f",
+    "png"
+  ];
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(realEsrganPath, args, {
+      cwd: path.dirname(realEsrganPath),
+      windowsHide: true
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let lastDone = 0;
+
+    const updateProgress = async (force = false) => {
+      if (!progressContext || settled) return;
+      const done = Math.max(lastDone, await countFrameFiles(upscaledFramesDir));
+      if (!force && done === lastDone) return;
+      lastDone = done;
+      const percent = Math.min(90, Math.max(14, Math.round(14 + (done / Math.max(frameCount, 1)) * 76)));
+      setComfyUiProgress(progressContext, {
+        status: "running",
+        phase: "upscaling_frames",
+        percent,
+        value: done,
+        max: frameCount,
+        message: `Upscaled ${done} of ${frameCount} frames with Real-ESRGAN ${model}.`
+      });
+    };
+
+    const clear = () => {
+      settled = true;
+      clearInterval(progressTimer);
+      clearTimeout(timeoutTimer);
+    };
+
+    const fail = (error) => {
+      clear();
+      reject(error);
+    };
+
+    const progressTimer = setInterval(() => {
+      updateProgress().catch(() => {});
+    }, 1000);
+    const timeoutTimer = setTimeout(() => {
+      child.kill();
+      fail(new Error(`Real-ESRGAN upscale timed out after ${Math.round(timeoutMs / 60000)} minutes.`));
+    }, timeoutMs);
+
+    child.stdout?.on("data", (chunk) => {
+      stdout = tailProcessText(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = tailProcessText(stderr, chunk);
+    });
+    child.once("error", fail);
+    child.once("close", async (code) => {
+      if (settled) return;
+      await updateProgress(true).catch(() => {});
+      clear();
+      if (code !== 0) {
+        reject(new Error(`Real-ESRGAN exited with code ${code}.${stderr || stdout ? ` ${compactText(stderr || stdout, 500)}` : ""}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function countFrameFiles(dir) {
+  try {
+    const entries = await readdir(dir);
+    return entries.filter((entry) => /\.(png|jpe?g|webp)$/i.test(entry)).length;
+  } catch {
+    return 0;
+  }
+}
+
+function tailProcessText(existing, chunk, maxLength = 6000) {
+  const next = `${existing || ""}${String(chunk || "")}`;
+  return next.length > maxLength ? next.slice(-maxLength) : next;
+}
+
+function sanitizeUpscaleModel(value) {
+  const normalized = String(value || "").trim();
+  if (["realesrgan-x4plus", "realesrgan-x4plus-anime"].includes(normalized)) return normalized;
+  return "realesr-animevideov3";
+}
+
+function sanitizeUpscaleTargetResolution(value, sourceDimensions = {}) {
+  const match = normalizeResolutionValue(value).match(/^(\d+)x(\d+)$/);
+  if (match) {
+    return { width: Number(match[1]), height: Number(match[2]) };
+  }
+  const width = Math.max(16, Math.round(Number(sourceDimensions.width || 0) * 2));
+  const height = Math.max(16, Math.round(Number(sourceDimensions.height || 0) * 2));
+  return { width, height };
+}
+
+function upscaleScaleForTarget(sourceDimensions = {}, target = {}, model = "") {
+  if (["realesrgan-x4plus", "realesrgan-x4plus-anime"].includes(model)) return 4;
+  const sourceWidth = Math.max(1, Number(sourceDimensions.width) || 1);
+  const sourceHeight = Math.max(1, Number(sourceDimensions.height) || 1);
+  const ratio = Math.max(Number(target.width || 0) / sourceWidth, Number(target.height || 0) / sourceHeight, 2);
+  return Math.min(4, Math.max(2, Math.ceil(ratio)));
 }
 
 function outputFilePath(output) {
@@ -7949,6 +8295,7 @@ function rewritePackageLocalUrls(value, urlMap) {
 function latestFinalVideoOutput(episode) {
   const outputs = Array.isArray(episode.outputs) ? episode.outputs : [];
   return (
+    outputs.find((output) => output.type === "upscaled_video" && outputFilePath(output)) ||
     outputs.find((output) => output.type === "finished_master" && outputFilePath(output)) ||
     baseFinalVideoOutput(episode)
   );
@@ -9447,6 +9794,42 @@ async function probeDuration(filePath) {
   }
 }
 
+async function probeVideoFrameRate(filePath) {
+  try {
+    const { stdout } = await execFileAsync(
+      ffprobePath,
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate",
+        "-of",
+        "json",
+        filePath
+      ],
+      { timeout: 30000, maxBuffer: 1024 * 1024 }
+    );
+    const stream = JSON.parse(stdout)?.streams?.[0] || {};
+    return parseFrameRateValue(stream.avg_frame_rate) || parseFrameRateValue(stream.r_frame_rate) || 25;
+  } catch {
+    return 25;
+  }
+}
+
+function parseFrameRateValue(value) {
+  const text = String(value || "").trim();
+  const fraction = text.match(/^(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)$/);
+  if (fraction) {
+    const numerator = Number(fraction[1]);
+    const denominator = Number(fraction[2]);
+    return denominator > 0 ? Math.max(0.1, Math.min(240, numerator / denominator)) : 0;
+  }
+  const number = Number(text);
+  return Number.isFinite(number) && number > 0 ? Math.max(0.1, Math.min(240, number)) : 0;
+}
+
 async function probeHasAudio(filePath) {
   try {
     const { stdout } = await execFileAsync(
@@ -10177,6 +10560,24 @@ function comfyUiProgressContext({ manifest = {}, line = {}, filenamePrefix = "" 
   };
 }
 
+function upscaleProgressContext({ episode = {}, sourceOutput = {}, target = {}, model = "" } = {}) {
+  return {
+    episodeId: String(episode?.id || "").trim(),
+    episodeTitle: String(episode?.title || "").trim(),
+    renderId: String(sourceOutput?.id || "upscale").trim(),
+    lineId: "upscale",
+    lineIndex: 0,
+    speaker: "",
+    provider: "upscale",
+    backend: "realesrgan",
+    filenamePrefix: "",
+    sourceOutputId: String(sourceOutput?.id || "").trim(),
+    sourceOutputName: String(sourceOutput?.name || sourceOutput?.fileName || "").trim(),
+    targetResolution: target?.width && target?.height ? `${target.width}x${target.height}` : "",
+    model: String(model || "").trim()
+  };
+}
+
 function setComfyUiProgress(context = {}, patch = {}) {
   const key = comfyUiProgressKey(context);
   const existing = comfyUiProgressEntries.get(key) || {};
@@ -10192,6 +10593,10 @@ function setComfyUiProgress(context = {}, patch = {}) {
     provider: String(context.provider || existing.provider || "infinitalk").trim(),
     backend: String(context.backend || existing.backend || "comfyui").trim(),
     filenamePrefix: String(context.filenamePrefix || existing.filenamePrefix || "").trim(),
+    sourceOutputId: String(context.sourceOutputId || existing.sourceOutputId || "").trim(),
+    sourceOutputName: String(context.sourceOutputName || existing.sourceOutputName || "").trim(),
+    targetResolution: String(context.targetResolution || existing.targetResolution || "").trim(),
+    model: String(context.model || existing.model || "").trim(),
     startedAt: existing.startedAt || now,
     updatedAt: now,
     status: String(patch.status || existing.status || "starting").trim(),

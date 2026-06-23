@@ -795,7 +795,14 @@ function generationProgressPercent(item) {
 }
 
 function generationProgressLineLabel(item) {
+  if (item?.provider === "upscale") return "Upscale";
   return item?.lineIndex ? `Line ${item.lineIndex}${item.speaker ? ` ${item.speaker}` : ""}` : "ComfyUI";
+}
+
+function generationProgressSourceLabel(item) {
+  if (item?.provider === "upscale") return "Upscale Progress";
+  if (item?.backend === "comfyui" || item?.provider === "infinitalk") return "ComfyUI Progress";
+  return "Generation Progress";
 }
 
 function generationProgressTitle(item) {
@@ -2576,6 +2583,31 @@ export default function App() {
     }
   }
 
+  async function upscaleVideo(upscaleSettings = {}) {
+    if (!activeEpisode) return;
+    setBusyAction("upscale-video");
+    setBusy(true);
+    try {
+      const { episode, output } = await request(`/api/episodes/${activeEpisode.id}/upscale-video`, {
+        method: "POST",
+        body: JSON.stringify(upscaleSettings || {})
+      });
+      setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+      setEpisodeDraft(structuredClone(episode));
+      setStatus(`Upscaled video ready: ${output?.name || output?.fileName || "Real-ESRGAN output"}.`);
+    } catch (error) {
+      if (error.payload?.episode) {
+        const episode = error.payload.episode;
+        setEpisodes((prev) => [episode, ...prev.filter((item) => item.id !== episode.id)]);
+        setEpisodeDraft(structuredClone(episode));
+      }
+      setStatus(error.message);
+    } finally {
+      setBusyAction("");
+      setBusy(false);
+    }
+  }
+
   async function selectThumbnail(thumbnail) {
     if (!activeEpisode || !thumbnail?.id) return;
     setBusy(true);
@@ -3463,8 +3495,9 @@ export default function App() {
   const baseFinalOutput = finalOutputs[0] || null;
   const finishedMasterOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "finished_master");
   const finishedMasterOutput = finishedMasterOutputs[0] || null;
+  const upscaledVideoOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "upscaled_video");
   const finalOutput =
-    [...finishedMasterOutputs, ...finalOutputs].sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a))[0] ||
+    [...upscaledVideoOutputs, ...finishedMasterOutputs, ...finalOutputs].sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a))[0] ||
     null;
   const manifestOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "render_manifest");
   const finalManifestOutputs = (activeEpisode?.outputs || []).filter((output) => output.type === "final_render_manifest");
@@ -4247,6 +4280,7 @@ export default function App() {
               finalOutput={finalOutput}
               baseFinalOutput={baseFinalOutput}
               finishedMasterOutput={finishedMasterOutput}
+              upscaledVideoOutputs={upscaledVideoOutputs}
               previewOutputs={previewOutputs}
               finalOutputs={finalOutputs}
               finishedMasterOutputs={finishedMasterOutputs}
@@ -4284,6 +4318,7 @@ export default function App() {
               onGenerateFinishingMusic={generateFinishingMusic}
               onGenerateFinishingLaughTrack={generateFinishingLaughTrack}
               onGenerateFinishingApplauseTrack={generateFinishingApplauseTrack}
+              onUpscaleVideo={upscaleVideo}
               onGenerateThumbnails={generateThumbnails}
               onSelectThumbnail={selectThumbnail}
               onSavePublishingDraft={savePublishingDraft}
@@ -4722,6 +4757,7 @@ function FinalReviewPanel({
   finalOutput,
   baseFinalOutput,
   finishedMasterOutput,
+  upscaledVideoOutputs = [],
   previewOutputs,
   finalOutputs,
   finishedMasterOutputs = [],
@@ -4760,6 +4796,7 @@ function FinalReviewPanel({
   onGenerateFinishingMusic,
   onGenerateFinishingLaughTrack,
   onGenerateFinishingApplauseTrack,
+  onUpscaleVideo,
   onGenerateThumbnails,
   onSelectThumbnail,
   onSavePublishingDraft,
@@ -4773,6 +4810,7 @@ function FinalReviewPanel({
   const hasOutputs =
     finalOutputs.length ||
     finishedMasterOutputs.length ||
+    upscaledVideoOutputs.length ||
     previewOutputs.length ||
     finalManifestOutputs.length ||
     manifestOutputs.length ||
@@ -4785,6 +4823,7 @@ function FinalReviewPanel({
   const outputCount =
     finalOutputs.length +
     finishedMasterOutputs.length +
+    upscaledVideoOutputs.length +
     previewOutputs.length +
     finalManifestOutputs.length +
     manifestOutputs.length +
@@ -4799,8 +4838,10 @@ function FinalReviewPanel({
     busyAction === "regenerate-audio" ||
     busyAction === "build-preview" ||
     busyAction === "rebuild-final" ||
-    busyAction === "render-final";
+    busyAction === "render-final" ||
+    busyAction === "upscale-video";
   const thumbnailBusy = busyAction === "thumbnails";
+  const upscaleBusy = busyAction === "upscale-video";
   const progressPercent = generationProgressPercent(generationProgress);
   const showGenerationProgress = Boolean(generationProgress && (renderBusy || busyAction?.startsWith("dialogue-video:") || generationProgressIsActive(generationProgress)));
   const selectedThumbnailId = drafts.selectedThumbnailOutputId || thumbnailOutputs.find((thumb) => thumb.isSelected)?.id || "";
@@ -4829,10 +4870,19 @@ function FinalReviewPanel({
   const [finalReviewIndex, setFinalReviewIndex] = useState(0);
   const [loadedReviewDimensions, setLoadedReviewDimensions] = useState(null);
   const [finalManifestCache, setFinalManifestCache] = useState({});
+  const defaultUpscaleTarget = selectedFormat.aspectRatio === "16:9" ? "1920x1080" : "1080x1920";
+  const upscaleResolutionOptions = formatResolutionOptions[selectedFormat.aspectRatio] || formatResolutionOptions["9:16"];
+  const [upscaleSettings, setUpscaleSettings] = useState({
+    targetResolution: defaultUpscaleTarget,
+    model: "realesr-animevideov3"
+  });
 
   const finalReviewOutputs = useMemo(
-    () => [...finishedMasterOutputs, ...finalOutputs].sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a)),
-    [finishedMasterOutputs, finalOutputs]
+    () =>
+      [...upscaledVideoOutputs, ...finishedMasterOutputs, ...finalOutputs].sort(
+        (a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a)
+      ),
+    [upscaledVideoOutputs, finishedMasterOutputs, finalOutputs]
   );
   const finalManifestKey = useMemo(
     () => finalManifestOutputs.map((output) => output.localUrl).filter(Boolean).join("|"),
@@ -4903,6 +4953,10 @@ function FinalReviewPanel({
   const selectedReviewManifestEntry = selectedReviewManifestOutput?.localUrl
     ? finalManifestCache[selectedReviewManifestOutput.localUrl]
     : null;
+  const latestUpscaledOutput =
+    [...upscaledVideoOutputs].sort((a, b) => outputCreatedAtValue(b) - outputCreatedAtValue(a))[0] || null;
+  const upscaleSourceOutput = finishedMasterOutput || baseFinalOutput || previewOutput || null;
+  const canUpscaleVideo = Boolean(upscaleSourceOutput?.localUrl);
 
   useEffect(() => {
     setThumbnailBrief(thumbnailBriefDefaults);
@@ -4954,6 +5008,15 @@ function FinalReviewPanel({
   }, [reviewVideoToken]);
 
   useEffect(() => {
+    setUpscaleSettings((prev) => ({
+      ...prev,
+      targetResolution: upscaleResolutionOptions.some((option) => option.value === prev.targetResolution)
+        ? prev.targetResolution
+        : defaultUpscaleTarget
+    }));
+  }, [defaultUpscaleTarget, upscaleResolutionOptions]);
+
+  useEffect(() => {
     if (reviewVideoMode === "preview" && !previewOutput) setReviewVideoMode("auto");
     if (reviewVideoMode === "final" && !selectedFinalOutput) setReviewVideoMode("auto");
   }, [selectedFinalOutput, previewOutput, reviewVideoMode]);
@@ -4987,6 +5050,18 @@ function FinalReviewPanel({
     setFinalReviewIndex(0);
     setReviewRefreshToken((value) => value + 1);
     await onRebuildFinal();
+    setFinalReviewIndex(0);
+    setReviewRefreshToken((value) => value + 1);
+  }
+
+  async function handleUpscaleVideo() {
+    setReviewVideoMode("final");
+    setFinalReviewIndex(0);
+    setReviewRefreshToken((value) => value + 1);
+    await onUpscaleVideo?.({
+      targetResolution: upscaleSettings.targetResolution || defaultUpscaleTarget,
+      model: upscaleSettings.model || "realesr-animevideov3"
+    });
     setFinalReviewIndex(0);
     setReviewRefreshToken((value) => value + 1);
   }
@@ -5076,7 +5151,7 @@ function FinalReviewPanel({
         <div className={`generationProgress ${generationProgress?.status || ""}`}>
           <div className="generationProgressHeader">
             <div>
-              <span className="eyebrow">ComfyUI Progress</span>
+              <span className="eyebrow">{generationProgressSourceLabel(generationProgress)}</span>
               <strong>{generationProgressTitle(generationProgress)}</strong>
             </div>
             <span>{progressPercent > 0 ? `${progressPercent}%` : generationProgress?.status || "running"}</span>
@@ -5222,6 +5297,69 @@ function FinalReviewPanel({
       />
 
       <details
+        className="reviewDetails upscaleReviewPanel"
+        open={savedPanelOpen(panelState, "approvals.upscale")}
+        onToggle={(event) => handleSavedPanelToggle("approvals.upscale", event)}
+      >
+        <summary>
+          <span className="summaryTitleWithIcon">
+            Upscale
+            {upscaleBusy ? <RefreshCw className="spin renderRunningIcon" size={16} aria-label="Upscale running" /> : null}
+          </span>
+          <Pill tone={latestUpscaledOutput ? "good" : canUpscaleVideo ? "neutral" : "warn"}>
+            {latestUpscaledOutput ? latestUpscaledOutput.resolution || "ready" : canUpscaleVideo ? "ready" : "needed"}
+          </Pill>
+        </summary>
+        <div className="upscaleReviewBody">
+          <div className="upscaleSettingsGrid">
+            <Field label="Source">
+              <input value={upscaleSourceOutput?.name || upscaleSourceOutput?.fileName || "Render a preview or final first"} readOnly />
+            </Field>
+            <Field label="Target">
+              <select
+                value={upscaleSettings.targetResolution}
+                onChange={(event) => setUpscaleSettings((prev) => ({ ...prev, targetResolution: event.target.value }))}
+              >
+                {upscaleResolutionOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Model">
+              <select
+                value={upscaleSettings.model}
+                onChange={(event) => setUpscaleSettings((prev) => ({ ...prev, model: event.target.value }))}
+              >
+                <option value="realesr-animevideov3">Real-ESRGAN AnimeVideo v3</option>
+                <option value="realesrgan-x4plus-anime">Real-ESRGAN x4 anime</option>
+                <option value="realesrgan-x4plus">Real-ESRGAN x4 plus</option>
+              </select>
+            </Field>
+            <button className="secondaryButton" onClick={handleUpscaleVideo} disabled={!canUpscaleVideo || busy}>
+              <MonitorUp size={16} />
+              Generate Upscale
+            </button>
+          </div>
+          {latestUpscaledOutput ? (
+            <a className="upscaleOutputCard" href={latestUpscaledOutput.localUrl} target="_blank" rel="noreferrer">
+              <MonitorUp size={16} />
+              <span>
+                <strong>{latestUpscaledOutput.name || latestUpscaledOutput.fileName}</strong>
+                <small>
+                  {latestUpscaledOutput.resolution || ""}
+                  {latestUpscaledOutput.durationSeconds ? ` - ${formatSeconds(latestUpscaledOutput.durationSeconds)}` : ""}
+                </small>
+              </span>
+            </a>
+          ) : (
+            <div className="emptyState compact">No upscaled video yet.</div>
+          )}
+        </div>
+      </details>
+
+      <details
         className="reviewDetails thumbnailReviewPanel"
         open={savedPanelOpen(panelState, "approvals.thumbnail")}
         onToggle={(event) => handleSavedPanelToggle("approvals.thumbnail", event)}
@@ -5336,6 +5474,12 @@ function FinalReviewPanel({
               <a key={video.id} href={video.localUrl} target="_blank" rel="noreferrer">
                 <Film size={16} />
                 <span>{video.name || "Finished master"}</span>
+              </a>
+            ))}
+            {upscaledVideoOutputs.slice(0, 2).map((video) => (
+              <a key={video.id} href={video.localUrl} target="_blank" rel="noreferrer">
+                <MonitorUp size={16} />
+                <span>{video.name || "Upscaled video"}</span>
               </a>
             ))}
             {finalOutputs.map((video, index) => (

@@ -4239,6 +4239,50 @@ label:has(textarea:disabled) {
   background: #181814;
 }
 
+.upscaleReviewBody {
+  display: grid;
+  gap: 12px;
+}
+
+.upscaleSettingsGrid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(150px, 0.34fr) minmax(220px, 0.5fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.upscaleOutputCard {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(116, 221, 166, 0.32);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(28, 55, 40, 0.38);
+  text-decoration: none;
+}
+
+.upscaleOutputCard span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.upscaleOutputCard strong,
+.upscaleOutputCard small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upscaleOutputCard small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
 .timelineScale {
   display: grid;
   grid-template-columns: 44px minmax(0, 1fr);
@@ -4582,6 +4626,7 @@ label:has(textarea:disabled) {
   .musicBriefGrid,
   .laughTrackBriefGrid,
   .laughTrackPlacementControls,
+  .upscaleSettingsGrid,
   .finishingPreviewGrid {
     grid-template-columns: 1fr;
   }
